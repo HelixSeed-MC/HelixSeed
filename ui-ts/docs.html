@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HelixScript Documentation</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #080808;
+        --panel: #101010;
+        --line: #262626;
+        --line-soft: #1a1a1a;
+        --text: #e4e4e4;
+        --muted: #a5a5a5;
+        --subtle: #737373;
+        --accent: #8cc8ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        min-height: 100%;
+        margin: 0;
+        background:
+          linear-gradient(#111111 1px, transparent 1px),
+          linear-gradient(90deg, #111111 1px, transparent 1px),
+          var(--bg);
+        background-size: 28px 28px;
+        color: var(--text);
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+      }
+
+      body {
+        padding: 18px;
+      }
+
+      .doc-shell {
+        max-width: 960px;
+        margin: 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(13, 13, 13, 0.97);
+        box-shadow: 0 18px 54px rgba(0, 0, 0, 0.45);
+        overflow: hidden;
+      }
+
+      .doc-title {
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--line-soft);
+        background: #111111;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 520;
+        letter-spacing: 0;
+      }
+
+      .doc-title p {
+        max-width: 760px;
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      main {
+        padding: 22px;
+      }
+
+      section + section {
+        margin-top: 26px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line-soft);
+      }
+
+      h2 {
+        margin: 0 0 10px;
+        font-size: 15px;
+        font-weight: 520;
+      }
+
+      p,
+      ol,
+      ul {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      li + li {
+        margin-top: 6px;
+      }
+
+      code,
+      pre {
+        font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+      }
+
+      code {
+        color: var(--accent);
+        font-size: 12px;
+      }
+
+      pre {
+        margin: 10px 0 12px;
+        padding: 13px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #090909;
+        color: #d8d8d8;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="doc-shell">
+      <header class="doc-title">
+        <h1>HelixScript Field Guide</h1>
+        <p>HelixScript is the beginner-friendly language for describing what seeds HelixSeed should search. The app compiles this script into the scanner query internally.</p>
+        <p style="margin-top:10px;font-size:12px;"><a href="guide.html" style="color:#8cc8ff;text-decoration:none;border-bottom:1px dashed #8cc8ff;">← Back to the User Guide</a></p>
+      </header>
+      <main>
+        <section>
+          <h2>1. Start With The Basic Shape</h2>
+          <ol>
+            <li>Use <code>anchor</code> to choose the main point, usually <code>origin</code>.</li>
+            <li>Use <code>logic and</code> when every rule must match.</li>
+            <li>Use <code>find</code> to add structure rules.</li>
+            <li>Press Run in HelixSeed. The app compiles HelixScript before launching the native scanner.</li>
+          </ol>
+        </section>
+
+        <section>
+          <h2>2. Minimal Scan</h2>
+          <pre><code>anchor origin
+logic and
+
+find village as v1 within 64 of origin strict</code></pre>
+          <p>This searches for a village within 64 blocks of origin. <code>v1</code> is the rule id and can be reused by later commands.</p>
+        </section>
+
+        <section>
+          <h2>3. Variables</h2>
+          <pre><code>let structure = village
+let radius = 64
+
+find $structure as v1 within $radius of origin strict</code></pre>
+          <p>Variables are inserted with <code>$name</code>. Use them for values you expect to tweak often, like radius, structure names, or mode choices.</p>
+          <p>Numeric assignments accept simple math: <code>+ - * / %</code>, parentheses, and the helpers <code>min</code>, <code>max</code>, <code>abs</code>, <code>floor</code>, <code>ceil</code>, <code>round</code>.</p>
+          <pre><code>let base = 64
+let wide = base * 2
+let snug = max(32, base - 16)</code></pre>
+          <p>Use <code>const name = value</code> when you want the assignment to stay locked. <code>set</code> is an alias for <code>let</code>.</p>
+        </section>
+
+        <section>
+          <h2>4. Lists</h2>
+          <pre><code>let biomes = [plains, meadow, cherry_grove]
+let radii = [64, 96, 128]
+
+biome origin y 80 radius 128 allow $biomes</code></pre>
+          <p>Lists are written with square brackets. Items can be names, numbers, or quoted strings. <code>$biomes</code> by itself joins the items with commas, which is exactly what biome filters and other comma lists expect.</p>
+          <pre><code>let biomes = [plains, meadow]
+
+# .length, .first, .last and [index] read individual pieces
+find village as v1 within ${radii[0]} of origin strict
+assert $biomes.length &gt; 0 message need at least one biome</code></pre>
+          <p>Use <code>list contains item</code> in conditions for membership checks. The same operator works on plain strings as a substring test.</p>
+          <pre><code>if $biomes contains plains
+  biome origin y 64 radius 64 allow plains
+end</code></pre>
+        </section>
+
+        <section>
+          <h2>5. For Loops</h2>
+          <pre><code>for radius in [64, 96, 128]
+  find village as v_$radius within $radius of origin strict
+end</code></pre>
+          <p>A <code>for &lt;name&gt; in &lt;list&gt;</code> block repeats its body once per item, binding the item to <code>$name</code>. The list can be an inline literal or a previously declared variable.</p>
+          <pre><code>let biomes = [plains, meadow, cherry_grove]
+
+for biome in biomes
+  biome origin y 80 radius 128 allow $biome
+end</code></pre>
+          <p>Loops unroll at compile time, so each iteration produces independent commands — handy for generating one rule per structure or one biome filter per area.</p>
+        </section>
+
+        <section>
+          <h2>6. Conditions</h2>
+          <pre><code>let radius = 96
+let structure = village
+
+if radius &gt;= 64 and structure is village
+  find $structure as v1 within $radius of origin strict
+else
+  find village as v1 within 32 of origin placement
+end</code></pre>
+          <p>Conditions support <code>and</code>, <code>or</code>, <code>not</code>, <code>is</code>, <code>is not</code>, <code>contains</code>, <code>==</code>, <code>!=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, and <code>&lt;=</code>.</p>
+          <pre><code>if radius &gt;= 96
+  find village as v1 within $radius of origin strict
+elif radius &gt;= 48
+  find village as v1 within $radius of origin placement
+else
+  stop
+end</code></pre>
+          <p>Chain branches with <code>elif &lt;cond&gt;</code> (or <code>else if &lt;cond&gt;</code>). Only the first matching branch runs. <code>else</code> must come last.</p>
+          <p>Inside an <code>if</code>/<code>elif</code>/<code>else</code>/<code>skip</code> block, use <code>continue</code> (optionally <code>continue if &lt;cond&gt;</code>) to early-exit just the current branch, or <code>pause</code> (optionally <code>pause if &lt;cond&gt;</code>) to bail out of every enclosing block back to the top level. <code>stop</code> still ends compilation entirely.</p>
+        </section>
+
+        <section>
+          <h2>7. Rule Field Lookups</h2>
+          <pre><code>find village as v1 within 45 of origin strict
+
+if $radius of v1 == 45 and $structure of v1 is village
+  find ruined_portal as rp1 within 96 of constraint:v1 strict
+end</code></pre>
+          <p>Use <code>$field of id</code> when a condition needs to read a specific rule. Supported fields are <code>radius</code>, <code>structure</code>, <code>mode</code>, <code>anchor</code>, and <code>id</code>. The referenced rule must appear before the <code>if</code>.</p>
+          <pre><code>find village as v1 within 64 of origin placement optional
+if v1 == found
+  find ruined_portal as v2 within 64 of constraint:v1 placement
+  skip
+end</code></pre>
+          <p><code>found</code> is a <em>runtime</em> per-seed check: it asks whether the scanner actually located that structure in the current seed. Mark a <code>find</code> as <code>optional</code> so its absence does not reject the seed by itself — without <code>optional</code>, every seed must satisfy it, and the check is always trivially true.</p>
+          <p>Inside an <code>if &lt;id&gt; == found</code> block (also <code>!=</code>, joined by <code>and</code> / <code>or</code>), only three body forms are allowed and each lowers to a single fixed-form runtime opcode:</p>
+          <ul>
+            <li><code>skip</code> — reject this seed (no seed-level allocation, just a flag check)</li>
+            <li><code>stop</code> — halt the entire scan, same effect as pressing Stop in the UI</li>
+            <li>a single <code>find</code> line — conditionally require that structure only when the predicate is true</li>
+          </ul>
+          <p>Up to 31 rule ids can be referenced by <code>found</code> in one query. <code>elif</code>, <code>else</code>, nested <code>if</code>, or other statements inside an <code>if &lt;id&gt; == found</code> block are rejected at compile time.</p>
+        </section>
+
+        <section>
+          <h2>8. Structure Rules</h2>
+          <pre><code>find village as v1 within 64 of origin strict
+find ruined_portal as rp1 within 96 of constraint:v1 strict
+find trial_chambers as tc1 within 256 of spawn placement</code></pre>
+          <p><code>strict</code> asks for exact validation. <code>placement</code> is faster but less exact. Anchors can be <code>origin</code>, <code>spawn</code>, or <code>constraint:id</code>.</p>
+        </section>
+
+        <section>
+          <h2>9. Biome Filters</h2>
+          <pre><code>biome origin y 64 radius 128 allow plains,meadow,cherry_grove</code></pre>
+          <p>Biome filters check an area around a point. Use comma-separated or space-separated biome names after <code>allow</code>.</p>
+        </section>
+
+        <!-- Loot Filters section disabled. The parser still accepts the loot command, but it is no longer documented or surfaced in the UI.
+        <section>
+          <h2>10. Loot Filters</h2>
+          <pre><code>loot v1 from village require emerald:3,diamond:1</code></pre>
+          <p>Loot filters attach required items to a structure rule. Counts default to 1 if omitted.</p>
+        </section>
+        -->
+
+        <section>
+          <h2>10. Output</h2>
+          <pre><code>output
+output raw
+output both
+output lift64
+output world64</code></pre>
+          <p>Use <code>output</code> by itself to print found seeds in the normal raw seed mode. Use a mode after it when you need lifted 64-bit output or both raw and lifted values.</p>
+        </section>
+
+        <section>
+          <h2>11. Functions</h2>
+          <pre><code>function nearby_portal(anchor_id, portal_id, radius)
+  find ruined_portal as $portal_id within $radius of constraint:$anchor_id strict
+end
+
+find village as v1 within 64 of origin strict
+nearby_portal(v1, rp1, 96)</code></pre>
+          <p>Functions are compile-time helpers. They expand before HelixSeed launches the scanner, so they are good for reusable query patterns without adding runtime overhead.</p>
+        </section>
+
+        <section>
+          <h2>12. Scan Control</h2>
+          <pre><code>scan
+  start 0
+  count 1000000
+  batch balanced
+  max_print 20
+  progress 1
+end
+
+assert $radius of v1 &gt; 0 message v1 radius must be positive
+skip if $mode of v1 is placement
+  find ruined_portal as rp1 within 96 of constraint:v1 strict
+end
+stop if $radius of v1 &gt; 512</code></pre>
+          <p><code>scan</code> sets runtime options from the script. <code>assert</code> fails fast, <code>skip if</code> skips a block when true, and <code>stop if</code> stops compiling the rest of the script.</p>
+        </section>
+
+        <section>
+          <h2>13. Performance Block</h2>
+          <pre><code>performance
+  workers 0
+  execution auto
+  stage auto
+  cap adaptive
+  surrogate balanced
+  fixed_cap 128
+end</code></pre>
+          <p>Keep these values on <code>auto</code> unless you are profiling. Use the Telemetry tab to compare changes.</p>
+        </section>
+
+        <section>
+          <h2>14. Layout &amp; Indentation</h2>
+          <p>HelixScript is line-based: every command is a single line, and whitespace at the start of a line is ignored. Indenting block bodies is encouraged for readability but never required.</p>
+          <pre><code># both of these compile to the same thing
+if radius &gt;= 64
+  find village as v1 within $radius of origin strict
+end
+
+if radius &gt;= 64
+find village as v1 within $radius of origin strict
+end</code></pre>
+          <p>Use <code>#</code> or <code>//</code> to start a comment, and tab or two-space indents inside blocks if you find them easier to read.</p>
+        </section>
+
+        <section>
+          <h2>15. Block Menu</h2>
+          <p>The block menu beside the editor inserts common script pieces: Variable, List, For, If, Assert, Skip, Stop, Output, Function, Scan, Find, Biome, and Performance. Click a block, then edit the placeholders.</p>
+        </section>
+
+        <section>
+          <h2>16. Common Mistakes</h2>
+          <ul>
+            <li>Define variables before using <code>$variable</code>.</li>
+            <li>Close every <code>if</code>, <code>for</code>, <code>skip</code>, <code>scan</code>, <code>function</code>, and <code>performance</code> block with <code>end</code>.</li>
+            <li>Use rule ids like <code>v1</code> with <code>constraint:v1</code> anchors.</li>
+            <li>Use lowercase names with underscores for structures and biomes.</li>
+            <li>For loop variables can be reused (<code>for r in radii</code>), but they must be plain <code>let</code> names — not <code>const</code> ones.</li>
+          </ul>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

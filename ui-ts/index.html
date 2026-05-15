@@ -1,0 +1,357 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HelixSeed</title>
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-logo" src="./assets/HelixSeed.png" alt="" />
+          <div>
+            <h1>HelixSeed</h1>
+            <p id="backend-status">Native backend: checking...</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="black-button primary" data-action="run"><i data-lucide="play"></i><span>Run</span></button>
+          <button class="black-button" data-action="pause" disabled><i data-lucide="pause"></i><span>Pause</span></button>
+          <button class="black-button" data-action="snapshot" disabled><i data-lucide="camera"></i><span>Snapshot</span></button>
+          <button class="black-button danger" data-action="stop" disabled><i data-lucide="square"></i><span>Stop</span></button>
+          <button class="icon-button" data-action="open-repo" title="Open app root"><i data-lucide="folder-open"></i></button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="left-rail">
+          <div class="panel compact">
+            <div class="panel-title"><i data-lucide="radar"></i><span>Scan</span></div>
+            <div class="form-grid two">
+              <label>Mode
+                <div class="dropdown-control" data-dropdown data-options="placement|strict|mixed">
+                  <input type="hidden" data-setting="scanMode" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">strict</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>MC Version<input data-setting="mcVersion" /></label>
+              <label>Start Seed<input data-setting="start" placeholder="random" /></label>
+              <label>Count<input data-setting="count" /></label>
+              <label>Batch<input data-setting="batchSize" /></label>
+              <label>Max Print<input data-setting="maxPrint" /></label>
+              <label>Progress Sec<input data-setting="progressInterval" /></label>
+              <label>Verified TXT<input data-setting="saveTxt" placeholder="optional path" /></label>
+              <label>Output
+                <div class="dropdown-control" data-dropdown data-options="raw|lift64|both|world64">
+                  <input type="hidden" data-setting="outputMode" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">raw</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>Upper16<input data-setting="upper16" /></label>
+              <label>Java Accuracy
+                <div class="dropdown-control" data-dropdown data-options="auto|off|strict">
+                  <input type="hidden" data-setting="javaValidation" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">auto</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>Anchor
+                <div class="dropdown-control" data-dropdown data-options="origin|spawn">
+                  <input type="hidden" data-setting="defaultAnchor" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">origin</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+            </div>
+            <label class="check-row"><input type="checkbox" data-setting="printClosest" /> Print closest matches</label>
+            <label class="check-row"><input type="checkbox" data-setting="terminalMode" /> Terminal mode</label>
+          </div>
+
+          <div class="panel compact">
+            <div class="panel-title"><i data-lucide="gauge"></i><span>Performance</span></div>
+            <div class="form-grid two">
+              <label>Execution
+                <div class="dropdown-control" data-dropdown data-options="auto|scalar|simd-x4|simd-x8|max-throughput">
+                  <input type="hidden" data-setting="executionMode" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">auto</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>Stage A
+                <div class="dropdown-control" data-dropdown data-options="auto|single|multi|cpu-a5|gpu-off">
+                  <input type="hidden" data-setting="stageAMode" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">auto</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>GPU Pipe
+                <div class="dropdown-control" data-dropdown data-options="auto|async|sync">
+                  <input type="hidden" data-setting="gpuPipeline" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">auto</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>Surrogate
+                <div class="dropdown-control" data-dropdown data-options="balanced|off|aggressive|ultra|turbo|lightspeed">
+                  <input type="hidden" data-setting="strictSurrogate" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">balanced</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>Workers<input data-setting="strictWorkers" /></label>
+              <label>Queue Cap<input data-setting="mixedQueueCapacity" /></label>
+              <label>Cap
+                <div class="dropdown-control" data-dropdown data-options="adaptive|fixed|none">
+                  <input type="hidden" data-setting="candidateCapMode" />
+                  <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">adaptive</button>
+                  <div class="dropdown-menu" role="listbox"></div>
+                </div>
+              </label>
+              <label>Fixed Cap<input data-setting="fixedCap" /></label>
+            </div>
+            <label class="check-row"><input type="checkbox" data-setting="mixedAdaptiveThrottling" /> Adaptive mixed throttling</label>
+          </div>
+
+          <div class="panel compact">
+            <div class="panel-title"><i data-lucide="star"></i><span>Presets</span></div>
+            <small style="display:block;margin:4px 0 6px;color:#737373;font-size:11px;">Search</small>
+            <div class="button-grid">
+              <button class="black-button small" data-action="preset-starter">Starter</button>
+              <button class="black-button small" data-action="preset-trial">Trial</button>
+              <button class="black-button small" data-action="preset-ancient">Ancient</button>
+            </div>
+            <small style="display:block;margin:10px 0 6px;color:#737373;font-size:11px;">Performance</small>
+            <div class="button-grid">
+              <button class="black-button small" data-action="preset-max-performance" title="Push every engine knob to its fastest setting">Max Performance</button>
+              <button class="black-button small" data-action="preset-smart-mode" title="Switch to mixed mode and apply Max Performance">Smart Mode</button>
+            </div>
+          </div>
+
+        </section>
+
+        <section class="main-deck">
+          <div class="tabbar" role="tablist" aria-label="Workspace">
+            <button class="tab-button active" data-tab-target="builder" type="button"><i data-lucide="blocks"></i><span>Builder</span></button>
+            <button class="tab-button" data-tab-target="query" type="button"><i data-lucide="file-json"></i><span>Query</span></button>
+            <button class="tab-button" data-tab-target="results" type="button"><i data-lucide="list-checks"></i><span>Results</span></button>
+            <button class="tab-button" data-tab-target="telemetry" type="button"><i data-lucide="activity"></i><span>Telemetry</span></button>
+            <button class="tab-button" data-tab-target="docs" type="button"><i data-lucide="book-open"></i><span>Documentation</span></button>
+            <button class="tab-button kofi-tab" type="button" data-action="open-kofi" title="Click once to confirm, then click again to open Ko-fi">
+              <img src="./assets/kofi-mug.webp" alt="" />
+              <span>Ko-fi</span>
+            </button>
+          </div>
+
+          <div class="tab-panel active" data-tab-panel="builder">
+            <div class="panel rules-panel">
+              <div class="panel-header">
+                <div class="panel-title"><i data-lucide="route"></i><span>Constraints</span></div>
+                <button class="black-button small" data-action="add-constraint"><i data-lucide="plus"></i><span>Add</span></button>
+              </div>
+              <div class="grid-table constraints-table">
+                <div class="grid-head">ID</div>
+                <div class="grid-head">Structure</div>
+                <div class="grid-head">Anchor</div>
+                <div class="grid-head">Radius</div>
+                <div class="grid-head">Mode</div>
+                <div class="grid-head"></div>
+                <div id="constraints-body" class="grid-body full"></div>
+              </div>
+            </div>
+
+            <div class="split-row">
+              <div class="panel">
+                <div class="panel-header">
+                  <div class="panel-title"><i data-lucide="map"></i><span>Biome filters</span></div>
+                  <button class="black-button small" data-action="add-biome"><i data-lucide="plus"></i><span>Add</span></button>
+                </div>
+                <div class="grid-table biome-table">
+                  <div class="grid-head">Point</div>
+                  <div class="grid-head">Y</div>
+                  <div class="grid-head">Radius</div>
+                  <div class="grid-head">Allowed</div>
+                  <div class="grid-head"></div>
+                  <div id="biomes-body" class="grid-body full"></div>
+                </div>
+              </div>
+
+              <!-- Loot filters disabled in UI; underlying renderer/compiler/native code remains.
+              <div class="panel">
+                <div class="panel-header">
+                  <div class="panel-title"><i data-lucide="package-check"></i><span>Loot filters</span></div>
+                  <button class="black-button small" data-action="add-loot"><i data-lucide="plus"></i><span>Add</span></button>
+                </div>
+                <div class="grid-table loot-table">
+                  <div class="grid-head">Constraint</div>
+                  <div class="grid-head">Source</div>
+                  <div class="grid-head">Required items</div>
+                  <div class="grid-head"></div>
+                  <div id="loot-body" class="grid-body full"></div>
+                </div>
+              </div>
+              -->
+              <div id="loot-body" hidden></div>
+            </div>
+          </div>
+
+          <div class="tab-panel query-tab" data-tab-panel="query">
+            <div class="panel command-panel">
+              <div class="panel-header">
+                <div class="panel-title"><i data-lucide="terminal"></i><span>Command</span></div>
+                <div class="inline-actions">
+                  <button class="icon-button" data-action="copy-command" title="Copy command"><i data-lucide="copy"></i></button>
+                  <button class="icon-button" data-action="refresh-script" title="Refresh script from builder"><i data-lucide="refresh-cw"></i></button>
+                  <button class="icon-button" data-action="apply-script" title="Apply script to builder"><i data-lucide="upload"></i></button>
+                </div>
+              </div>
+              <pre id="command-preview" class="command-preview"></pre>
+              <label class="check-row"><input type="checkbox" id="use-script-source" /> Run the script editor directly</label>
+            </div>
+
+            <div class="panel json-panel">
+              <div class="panel-header">
+                <div class="panel-title"><i data-lucide="braces"></i><span>HelixScript</span></div>
+                <div class="inline-actions">
+                  <button class="icon-button" data-action="autocomplete-script" title="Autocomplete script"><i data-lucide="sparkles"></i></button>
+                </div>
+              </div>
+              <textarea id="query-editor" spellcheck="false"></textarea>
+              <div class="script-workbench">
+                <aside class="script-block-menu" aria-label="HelixScript blocks">
+                  <button type="button" data-script-block="variable"><span>Variable</span><small>let radius = 64</small></button>
+                  <button type="button" data-script-block="list"><span>List</span><small>let biomes = [a, b]</small></button>
+                  <button type="button" data-script-block="for"><span>For</span><small>iterate over a list</small></button>
+                  <button type="button" data-script-block="if"><span>If</span><small>if radius &gt;= 64</small></button>
+                  <button type="button" data-script-block="assert"><span>Assert</span><small>require a condition</small></button>
+                  <button type="button" data-script-block="skip"><span>Skip</span><small>skip current branch</small></button>
+                  <button type="button" data-script-block="stop"><span>Stop</span><small>stop compiling</small></button>
+                  <button type="button" data-script-block="output"><span>Output</span><small>seed mode</small></button>
+                  <button type="button" data-script-block="function"><span>Function</span><small>reusable block</small></button>
+                  <button type="button" data-script-block="scan"><span>Scan</span><small>runtime settings</small></button>
+                  <button type="button" data-script-block="find"><span>Find</span><small>structure rule</small></button>
+                  <button type="button" data-script-block="biome"><span>Biome</span><small>biome filter</small></button>
+                  <!-- <button type="button" data-script-block="loot"><span>Loot</span><small>loot filter</small></button> -->
+
+                  <button type="button" data-script-block="performance"><span>Performance</span><small>engine settings</small></button>
+                </aside>
+                <div id="query-editor-host" class="query-editor-host"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-panel results-tab" data-tab-panel="results">
+            <div class="panel output-panel">
+              <div class="panel-header">
+                <div class="panel-title"><i data-lucide="activity"></i><span>Output</span></div>
+                <button class="icon-button" data-action="clear-output" title="Clear output"><i data-lucide="trash-2"></i></button>
+              </div>
+              <div class="progress-shell">
+                <div class="progress-top">
+                  <span id="run-status">Idle</span>
+                  <span id="progress-rate">-- seeds/sec</span>
+                </div>
+                <div class="progress-track"><div id="progress-fill"></div></div>
+              </div>
+              <div class="metrics-grid">
+                <div><span id="metric-processed">0 / 0</span><small>processed</small></div>
+                <div><span id="metric-placement-rate">0/s</span><small>placement/s</small></div>
+                <div><span id="metric-strict-rate">0/s</span><small>strict/s</small></div>
+                <div><span id="metric-verified-rate">0/s</span><small>verified/s</small></div>
+                <div><span id="metric-queue">0 / 0</span><small>queue</small></div>
+                <div><span id="metric-survivors">0</span><small>stage A</small></div>
+                <div><span id="metric-valid">0</span><small>valid</small></div>
+                <div><span id="metric-java">0</span><small>java rejects</small></div>
+                <div><span id="metric-route">auto</span><small>route</small></div>
+                <div><span id="metric-time">0.000s</span><small>strict/java</small></div>
+              </div>
+              <div class="found-box">
+                <div class="found-header">
+                  <div>
+                    <span>Found seeds</span>
+                    <small id="found-filter-count">0 shown / 0 total</small>
+                  </div>
+                  <div class="seed-filter" aria-label="Filter found seeds">
+                    <button type="button" class="active" data-result-filter="all">All</button>
+                    <button type="button" data-result-filter="placement">Placement</button>
+                    <button type="button" data-result-filter="strict">Strict verified</button>
+                  </div>
+                </div>
+                <div id="found-list" class="found-list"></div>
+              </div>
+              <pre id="terminal-output" class="terminal-output"></pre>
+            </div>
+          </div>
+
+          <div class="tab-panel telemetry-tab" data-tab-panel="telemetry">
+            <div class="telemetry-layout">
+              <div class="panel telemetry-graph-panel">
+                <div class="panel-header">
+                  <div class="panel-title"><i data-lucide="activity"></i><span>Pipeline Telemetry</span></div>
+                  <div class="telemetry-actions">
+                    <label class="telemetry-range" title="Rolling history window">
+                      <input id="telemetry-history" type="range" min="30000" max="120000" step="5000" value="60000" />
+                      <span id="telemetry-range-label" class="telemetry-range-value">60s</span>
+                    </label>
+                    <button class="icon-button" data-action="toggle-fps" title="Show FPS overlay"><i data-lucide="cpu"></i></button>
+                    <button class="icon-button" data-action="toggle-telemetry" title="Pause telemetry"><i data-lucide="pause"></i></button>
+                    <button class="icon-button" data-action="export-telemetry" title="Export telemetry snapshot"><i data-lucide="download"></i></button>
+                  </div>
+                </div>
+                <div class="telemetry-chart-shell">
+                  <canvas id="telemetry-rate-chart"></canvas>
+                  <div class="telemetry-overlay">
+                    <span id="telemetry-chart-label">0 seeds/sec</span>
+                    <span id="telemetry-window-label">60s rolling window</span>
+                  </div>
+                </div>
+                <div id="telemetry-legend" class="telemetry-legend"></div>
+              </div>
+
+              <div class="telemetry-side">
+                <div class="panel telemetry-stats-panel">
+                  <div class="panel-title telemetry-inline-title"><i data-lucide="gauge"></i><span>Throughput</span></div>
+                  <div class="telemetry-stat-grid">
+                    <div><span id="telemetry-current-rate">--</span><small>current</small></div>
+                    <div><span id="telemetry-average-rate">--</span><small>average</small></div>
+                    <div><span id="telemetry-peak-rate">--</span><small>peak</small></div>
+                    <div><span id="telemetry-processed">0</span><small>processed</small></div>
+                    <div><span id="telemetry-valid">0</span><small>valid seeds</small></div>
+                    <div><span id="telemetry-route">auto</span><small>route</small></div>
+                  </div>
+                </div>
+
+                <div class="panel telemetry-pipeline-panel">
+                  <div class="panel-title telemetry-inline-title"><i data-lucide="radar"></i><span>Pipeline Activity</span></div>
+                  <div class="telemetry-pipeline">
+                    <div class="pipeline-row"><span>Stage A rejects</span><strong id="telemetry-stage-a-rejects">0</strong></div>
+                    <div class="pipeline-row"><span>Stage B exact rejects</span><strong id="telemetry-stage-b-rejects">0</strong></div>
+                    <div class="pipeline-row"><span>Biome rejects</span><strong id="telemetry-biome-rejects">0</strong></div>
+                    <div class="pipeline-row"><span>Java rejects</span><strong id="telemetry-java-rejects">0</strong></div>
+                    <div class="pipeline-row"><span>Strict / Java time</span><strong id="telemetry-timing">0.000s / 0.000s</strong></div>
+                    <div class="pipeline-row"><span>Queue</span><strong id="telemetry-queue-size">0 / 0</strong></div>
+                    <div class="pipeline-row"><span>Queue saturation</span><strong id="telemetry-queue-saturation">0.0%</strong></div>
+                    <div class="pipeline-row"><span>Strict workers</span><strong id="telemetry-strict-workers">0</strong></div>
+                    <div class="pipeline-row"><span>Dropped survivors</span><strong id="telemetry-dropped-survivors">0</strong></div>
+                    <div class="pipeline-row"><span>Queue full events</span><strong id="telemetry-queue-full-events">0</strong></div>
+                    <div class="pipeline-row"><span>Queue push wait</span><strong id="telemetry-queue-push-wait">0.000ms</strong></div>
+                    <div class="pipeline-row"><span>GPU busy</span><strong id="telemetry-gpu-util">0.0%</strong></div>
+                  </div>
+                  <div class="telemetry-indicators">
+                    <span id="telemetry-scan-led" class="telemetry-led"></span>
+                    <span id="telemetry-gpu-led" class="telemetry-led"></span>
+                    <small>scan / GPU route</small>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/renderer/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,31 @@
+{
+  "name": "helixseed-ui",
+  "version": "0.1.0",
+  "description": "TypeScript desktop UI for HelixSeed.",
+  "main": "dist/main/main.js",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.main.json && vite build",
+    "stage:resources": "node scripts/stage-resources.mjs",
+    "start": "npm run build && electron .",
+    "dist:win": "npm run build && npm run stage:resources && node scripts/package-win.mjs"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.2",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lint": "^6.9.6",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.42.1",
+    "codemirror": "^6.0.2",
+    "lucide": "^0.468.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.0.0",
+    "@types/node": "^22.10.2",
+    "electron": "^33.3.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

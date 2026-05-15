@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HelixSeed User Guide</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #080808;
+        --panel: #101010;
+        --line: #262626;
+        --line-soft: #1a1a1a;
+        --text: #e4e4e4;
+        --muted: #a5a5a5;
+        --subtle: #737373;
+        --accent: #8cc8ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        min-height: 100%;
+        margin: 0;
+        background:
+          linear-gradient(#111111 1px, transparent 1px),
+          linear-gradient(90deg, #111111 1px, transparent 1px),
+          var(--bg);
+        background-size: 28px 28px;
+        color: var(--text);
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+      }
+
+      body {
+        padding: 18px;
+      }
+
+      .doc-shell {
+        max-width: 960px;
+        margin: 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(13, 13, 13, 0.97);
+        box-shadow: 0 18px 54px rgba(0, 0, 0, 0.45);
+        overflow: hidden;
+      }
+
+      .doc-title {
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--line-soft);
+        background: #111111;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 520;
+        letter-spacing: 0;
+      }
+
+      .doc-title p {
+        max-width: 760px;
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .doc-nav {
+        display: flex;
+        gap: 14px;
+        padding: 10px 22px;
+        border-bottom: 1px solid var(--line-soft);
+        background: #0c0c0c;
+        font-size: 12px;
+      }
+
+      .doc-nav a {
+        color: var(--accent);
+        text-decoration: none;
+        border-bottom: 1px dashed transparent;
+      }
+
+      .doc-nav a:hover {
+        border-bottom-color: var(--accent);
+      }
+
+      .doc-nav span {
+        color: var(--subtle);
+      }
+
+      main {
+        padding: 22px;
+      }
+
+      section + section {
+        margin-top: 26px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line-soft);
+      }
+
+      h2 {
+        margin: 0 0 10px;
+        font-size: 15px;
+        font-weight: 520;
+      }
+
+      h3 {
+        margin: 14px 0 6px;
+        font-size: 13px;
+        font-weight: 520;
+        color: var(--text);
+      }
+
+      p,
+      ol,
+      ul {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      li + li {
+        margin-top: 6px;
+      }
+
+      strong {
+        color: var(--text);
+        font-weight: 520;
+      }
+
+      code,
+      pre {
+        font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+      }
+
+      code {
+        color: var(--accent);
+        font-size: 12px;
+      }
+
+      pre {
+        margin: 10px 0 12px;
+        padding: 13px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #090909;
+        color: #d8d8d8;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      .preset-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        margin: 8px 0 4px;
+      }
+
+      .preset-card {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 12px 14px;
+        background: #0c0c0c;
+      }
+
+      .preset-card h3 {
+        margin: 0 0 6px;
+        color: var(--accent);
+      }
+
+      .preset-card p {
+        margin: 0;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      .callout {
+        margin: 10px 0;
+        padding: 10px 12px;
+        border-left: 3px solid var(--accent);
+        background: #0c0c0c;
+        border-radius: 0 6px 6px 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      kbd {
+        display: inline-block;
+        padding: 1px 6px;
+        border: 1px solid var(--line);
+        border-bottom-width: 2px;
+        border-radius: 4px;
+        background: #0c0c0c;
+        color: var(--text);
+        font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.3;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="doc-shell">
+      <header class="doc-title">
+        <h1>HelixSeed User Guide</h1>
+        <p>Welcome. This guide walks you through HelixSeed end-to-end — what it does, how to launch your first scan, what each tab is for, and which presets to reach for. When you are ready to write custom queries, head to the HelixScript reference.</p>
+      </header>
+      <nav class="doc-nav">
+        <a href="#what-is">What is HelixSeed</a>
+        <span>·</span>
+        <a href="#quick-start">Quick start</a>
+        <span>·</span>
+        <a href="#tour">App tour</a>
+        <span>·</span>
+        <a href="#presets">Presets</a>
+        <span>·</span>
+        <a href="#tips">Tips</a>
+        <span>·</span>
+        <a href="docs.html">HelixScript reference →</a>
+      </nav>
+      <main>
+        <section id="what-is">
+          <h2>1. What HelixSeed Does</h2>
+          <p>HelixSeed searches Minecraft world seeds for ones that contain the structures and biomes you want. It runs a fast GPU prefilter to throw away seeds that obviously do not match, then a strict CPU verification pass on the survivors so the seeds it reports really do contain what you asked for.</p>
+          <p>You describe what you want using either the <strong>Builder</strong> tab (point-and-click constraints) or the <strong>Query</strong> tab (a small scripting language called HelixScript). Both produce the same compiled query under the hood.</p>
+        </section>
+
+        <section id="quick-start">
+          <h2>2. Quick Start (5 Minutes)</h2>
+          <ol>
+            <li>Open HelixSeed. The first thing you see is the <strong>Builder</strong> tab.</li>
+            <li>In the <strong>Presets</strong> panel on the left, click <strong>Starter</strong>. This drops in a "village + nearby ruined portal" search.</li>
+            <li>Set <strong>Mode</strong> (top dropdown) to <strong>strict</strong>. Strict means HelixSeed only reports seeds that fully match.</li>
+            <li>Set <strong>Count</strong> to something small, like <code>1000000</code>, so the first run finishes quickly.</li>
+            <li>Press the <strong>Run</strong> button.</li>
+            <li>Switch to the <strong>Results</strong> tab. Found seeds appear there as you scan; click any seed to copy it to the clipboard.</li>
+          </ol>
+          <div class="callout">
+            <strong>Nothing happening?</strong> Open the <strong>Telemetry</strong> tab — if seeds-per-second is <code>0</code>, the scanner failed to launch. Check that <code>native\scanner_native.exe</code> exists in the install folder and that your GPU drivers are up to date.
+          </div>
+        </section>
+
+        <section id="tour">
+          <h2>3. App Tour</h2>
+
+          <h3>Sidebar (left)</h3>
+          <p>The sidebar holds <strong>Run controls</strong> (Run / Pause / Stop), <strong>Scan settings</strong> (mode, count, batch, output, version), and the <strong>Presets</strong> panel. Anything you can change here also has a HelixScript equivalent.</p>
+
+          <h3>Builder tab</h3>
+          <p>Add structure constraints (e.g. "village within 96 of origin") and biome filters (e.g. "must be cherry_grove near origin"). Each row has a <strong>mode</strong> dropdown:</p>
+          <ul>
+            <li><strong>strict</strong> — exactly verify the structure exists (slower, no false positives).</li>
+            <li><strong>placement</strong> — quick check that the structure <em>could</em> generate near there (faster, may report false positives).</li>
+            <li><strong>mixed</strong> — alias for strict at the per-constraint level. The <em>global</em> Mode dropdown is where mixed actually splits work.</li>
+          </ul>
+
+          <h3>Query tab</h3>
+          <p>This is the HelixScript editor. Builder rows compile to HelixScript automatically; you can edit the script directly and tick "Run the script editor directly" to bypass the builder. Use the block menu on the right to insert <code>find</code>, <code>biome</code>, <code>for</code>, <code>scan</code>, and other building blocks. Open the HelixScript reference for the full language details.</p>
+
+          <h3>Results tab</h3>
+          <p>Found seeds stream in here as the scanner discovers them. The filter bar lets you split <em>placement</em> survivors from <em>strict</em>-verified seeds when you run mixed mode. Click a seed to copy it.</p>
+
+          <h3>Telemetry tab</h3>
+          <p>Live charts of seeds-per-second, queue depth, GPU survivors, strict throughput, and Java-validation rejects. Use it to compare performance settings — change one knob, watch the rate move.</p>
+
+          <h3>Documentation tab</h3>
+          <p>Opens this guide in a separate window so you can keep it visible while you work. From here you can jump to the HelixScript reference for the scripting language details.</p>
+        </section>
+
+        <section id="presets">
+          <h2>4. Presets</h2>
+          <p>Presets are one-click starting points. Two kinds:</p>
+
+          <h3>Search presets (replace your constraints)</h3>
+          <div class="preset-grid">
+            <div class="preset-card">
+              <h3>Starter</h3>
+              <p>Village near origin plus a ruined portal close to that village. A reliable smoke test.</p>
+            </div>
+            <div class="preset-card">
+              <h3>Trial</h3>
+              <p>Trial chambers within 256 of origin. Uses placement mode so it screams through seeds.</p>
+            </div>
+            <div class="preset-card">
+              <h3>Ancient</h3>
+              <p>Ancient city within 512 of origin, plus a cherry grove / meadow biome filter.</p>
+            </div>
+          </div>
+
+          <h3>Performance presets (replace your engine settings)</h3>
+          <div class="preset-grid">
+            <div class="preset-card">
+              <h3>Max Performance</h3>
+              <p>Pushes every engine knob: max-throughput execution, multi-stage A, async GPU pipeline, lightspeed surrogate, max batch. Best for long unattended scans on a strong machine.</p>
+            </div>
+            <div class="preset-card">
+              <h3>Smart Mode</h3>
+              <p>Switches the global scan mode to <strong>mixed</strong> and applies Max Performance on top. The recommended "just go fast" setting — placement filters out junk seeds, strict only verifies the survivors.</p>
+            </div>
+          </div>
+          <div class="callout">
+            Performance presets only touch engine settings, not your constraints. Combine them with a search preset (or your own constraints) to scan immediately.
+          </div>
+        </section>
+
+        <section id="tips">
+          <h2>5. Tips</h2>
+          <ul>
+            <li><strong>Start small.</strong> Set <code>count</code> to a million for the first run so you know the scanner is healthy before you commit to a long search.</li>
+            <li><strong>Use Smart Mode</strong> when you do not care about the exact engine settings — it is the right answer 90% of the time.</li>
+            <li><strong>The Telemetry tab is your friend.</strong> If your CPU usage is low, try changing <em>execution mode</em> or <em>strict workers</em>. If the GPU survivor rate looks suspicious, change <em>strict surrogate</em> or move to mixed mode.</li>
+            <li><strong>Save your script.</strong> The Query tab is just text — copy it into a file, you can paste it back any time.</li>
+            <li><strong>Pause</strong> (<kbd>P</kbd>) to inspect telemetry without losing scan state. <strong>Stop</strong> halts entirely.</li>
+            <li><strong>Switch versions</strong> using the <em>MC version</em> field if you are searching for an older Minecraft version.</li>
+          </ul>
+        </section>
+
+        <section id="next">
+          <h2>6. Next Steps</h2>
+          <p>When you are ready to write custom queries — multi-structure conditions, loops over biomes, runtime <code>found</code> checks — read the <a href="docs.html">HelixScript reference</a>. It covers the full language, including the new list and for-loop features.</p>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

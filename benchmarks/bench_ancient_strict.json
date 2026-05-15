@@ -1,0 +1,14 @@
+﻿{
+  "version": 1,
+  "logic": "and",
+  "anchor": {"type": "origin"},
+  "constraints": [
+    {
+      "id": "ac1",
+      "structure": "ancient_city",
+      "mode": "strict",
+      "within": {"anchor": "origin", "radius": 50}
+    }
+  ],
+  "performance": {"strict_surrogate": "balanced"}
+}

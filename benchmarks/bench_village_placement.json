@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "logic": "and",
+  "anchor": {"type": "origin"},
+  "constraints": [
+    {
+      "id": "v1",
+      "structure": "village",
+      "mode": "placement",
+      "within": {"anchor": "origin", "radius": 50}
+    }
+  ],
+  "performance": {
+    "compiled_stage_a_mode": "single",
+    "strict_surrogate": "off"
+  }
+}

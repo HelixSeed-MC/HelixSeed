@@ -1,0 +1,14 @@
+﻿{
+  "version": 1,
+  "logic": "and",
+  "anchor": {"type": "origin"},
+  "constraints": [
+    {
+      "id": "om1",
+      "structure": "ocean_monument",
+      "mode": "strict",
+      "within": {"anchor": "origin", "radius": 200}
+    }
+  ],
+  "performance": {"strict_surrogate": "balanced"}
+}
