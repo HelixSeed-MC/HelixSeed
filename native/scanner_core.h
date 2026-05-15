@@ -44,6 +44,12 @@ enum {
     SCAN_EDGE_INWARD = 1,
 };
 
+enum {
+    SCAN_DIM_NETHER = -1,
+    SCAN_DIM_OVERWORLD = 0,
+    SCAN_DIM_END = 1,
+};
+
 typedef struct NativeRegionTerm {
     int32_t rx;
     int32_t rz;
@@ -83,6 +89,7 @@ typedef struct NativeQueryConstraintDesc {
     uint32_t prefilter_supported;
     uint32_t region_spacing_chunks;
     uint32_t strict_region_spacing_hint;
+    int32_t dimension;
     int32_t struct_id;
     uint32_t is_stronghold;
     uint32_t structure_in_presets;
@@ -100,6 +107,7 @@ typedef struct NativeQueryConstraintDesc {
 typedef struct NativeBiomeFilterDesc {
     uint32_t point_type;  // origin|spawn|dep|fixed
     int32_t point_dep_index;
+    int32_t dimension;
     int32_t y;
     int32_t radius;
     uint32_t sample_step;
@@ -116,6 +124,7 @@ typedef struct NativeSculptDesc {
     uint32_t center_type;  // origin|spawn|fixed
     int32_t center_x;
     int32_t center_z;
+    int32_t dimension;
     int32_t y;
     int32_t radius;
     int32_t step;

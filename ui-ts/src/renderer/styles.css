@@ -369,6 +369,21 @@ input:hover {
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.55);
 }
 
+.dropdown-search {
+  min-height: 30px;
+  margin: 0 0 3px;
+  padding: 0 9px;
+  border-radius: 4px;
+  background: #101010;
+}
+
+.dropdown-empty {
+  min-height: 28px;
+  padding: 7px 10px;
+  color: var(--subtle);
+  font-size: 12px;
+}
+
 .dropdown-control.open .dropdown-menu {
   display: grid;
   gap: 2px;
@@ -508,11 +523,11 @@ input:hover {
 }
 
 .constraints-table {
-  grid-template-columns: 92px minmax(150px, 1.1fr) minmax(150px, 1fr) 92px 118px 36px;
+  grid-template-columns: 82px minmax(150px, 1.1fr) 86px minmax(140px, 1fr) 82px 108px 36px;
 }
 
 .biome-table {
-  grid-template-columns: minmax(120px, 1fr) 70px 86px minmax(160px, 1.4fr) 36px;
+  grid-template-columns: minmax(120px, 1fr) 86px 66px 82px minmax(170px, 1.4fr) 36px;
 }
 
 .loot-table {

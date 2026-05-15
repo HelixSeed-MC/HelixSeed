@@ -306,6 +306,7 @@ const char* struct2str(int stype)
     case Trial_Chambers:    return "trial_chambers";
     case Fortress:          return "fortress";
     case Bastion:           return "bastion_remnant";
+    case Nether_Fossil:     return "nether_fossil";
     case End_City:          return "end_city";
     case End_Gateway:       return "end_gateway";
     }

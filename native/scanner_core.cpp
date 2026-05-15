@@ -48,7 +48,9 @@ constexpr int64_t REGION_X_MULT = 341873128712LL;
 constexpr int64_t REGION_Z_MULT = 132897987541LL;
 constexpr uint32_t INT32_SIGN = 0x80000000U;
 constexpr int32_t CHUNK_SIZE = 16;
+constexpr int32_t DIM_NETHER = -1;
 constexpr int32_t DIM_OVERWORLD = 0;
+constexpr int32_t DIM_END = 1;
 // Local mirrors of cubiomes MCVersion enum thresholds used by the fast spawn-area
 // prefilter. Keep these aligned with tmp_cubiomes_src/biomes.h.
 constexpr int32_t MC_VERSION_1_12 = 15;
@@ -427,8 +429,8 @@ static SCANNER_FORCE_INLINE bool direct_structure_attempt_within_radius(
 }
 
 static SCANNER_FORCE_INLINE bool structure_has_viability_check(int32_t struct_id) {
-    // Cubiomes currently rejects isViableStructurePos for trail ruins (id 22).
-    return struct_id >= 0 && struct_id != 22;
+    // Cubiomes currently rejects isViableStructurePos for trail ruins.
+    return struct_id >= 0 && struct_id != 23;
 }
 
 static SCANNER_FORCE_INLINE bool constraint_requires_exact_generator(const NativeQueryConstraintDesc &rc) {
@@ -450,13 +452,17 @@ static const char *debug_structure_name_from_id(int32_t struct_id) {
     case 9: return "woodland_mansion";
     case 10: return "pillager_outpost";
     case 11: return "ruined_portal";
+    case 12: return "ruined_portal_nether";
     case 13: return "ancient_city";
     case 14: return "buried_treasure";
     case 15: return "mineshaft";
     case 16: return "desert_well";
     case 17: return "geode";
-    case 22: return "trail_ruin";
-    case 23: return "trial_chambers";
+    case 18: return "fortress";
+    case 19: return "bastion_remnant";
+    case 20: return "end_city";
+    case 23: return "trail_ruin";
+    case 24: return "trial_chambers";
     default: return "unknown";
     }
 }
@@ -865,6 +871,10 @@ static SCANNER_FORCE_INLINE bool contains_biome_id(const std::vector<int32_t> &s
     return std::binary_search(sorted_ids.begin(), sorted_ids.end(), id);
 }
 
+static SCANNER_FORCE_INLINE bool valid_scan_dimension(int32_t dimension) {
+    return dimension == DIM_OVERWORLD || dimension == DIM_NETHER || dimension == DIM_END;
+}
+
 struct LegacyBiomePrepared {
     bool enabled = false;
     uint32_t point_type = SCAN_ANCHOR_ORIGIN;
@@ -888,6 +898,7 @@ struct CompiledBiomeGroupFilter {
 struct CompiledBiomeGroup {
     uint32_t point_type = SCAN_ANCHOR_ORIGIN;
     int32_t point_dep_index = -1;
+    int32_t dimension = DIM_OVERWORLD;
     int32_t point_x = 0;
     int32_t point_z = 0;
     int32_t y = 64;
@@ -1496,15 +1507,22 @@ static SCANNER_FORCE_INLINE uint64_t mix_cache_key64(uint64_t value) {
     return value;
 }
 
-static SCANNER_FORCE_INLINE uint64_t biome_direct_cache_key(int32_t x, int32_t y, int32_t z) {
+static SCANNER_FORCE_INLINE uint64_t biome_direct_cache_key(int32_t dimension, int32_t x, int32_t y, int32_t z) {
     uint64_t key = pack_xz_i32(x, z);
     key ^= static_cast<uint64_t>(static_cast<uint32_t>(y)) * 0x9e3779b185ebca87ULL;
+    key ^= static_cast<uint64_t>(static_cast<uint32_t>(dimension)) * 0x94d049bb133111ebULL;
     return mix_cache_key64(key);
 }
 
-static SCANNER_FORCE_INLINE uint64_t structure_direct_cache_key(int32_t struct_id, int32_t rx, int32_t rz) {
+static SCANNER_FORCE_INLINE uint64_t structure_direct_cache_key(
+    int32_t dimension,
+    int32_t struct_id,
+    int32_t rx,
+    int32_t rz
+) {
     uint64_t key = pack_xz_i32(rx, rz);
     key ^= static_cast<uint64_t>(static_cast<uint32_t>(struct_id)) * 0xd6e8feb86659fd93ULL;
+    key ^= static_cast<uint64_t>(static_cast<uint32_t>(dimension)) * 0x9e3779b185ebca87ULL;
     return mix_cache_key64(key);
 }
 
@@ -1512,11 +1530,12 @@ static SCANNER_FORCE_INLINE int cached_query_biome_at(
     const CubiApi &api,
     QueryScratch &scratch,
     void *g,
+    int32_t dimension,
     int32_t x,
     int32_t y,
     int32_t z
 ) {
-    const uint64_t key = biome_direct_cache_key(x, y, z);
+    const uint64_t key = biome_direct_cache_key(dimension, x, y, z);
     QueryScratch::BiomeDirectCacheEntry &entry =
         scratch.biome_cache[static_cast<size_t>(key) & (QueryScratch::kBiomeDirectCacheSize - 1U)];
     if (entry.epoch == scratch.cache_epoch && entry.key == key) {
@@ -1536,13 +1555,14 @@ static SCANNER_FORCE_INLINE bool cached_get_structure_pos_direct(
     const CubiApi &api,
     QueryScratch &scratch,
     int32_t struct_id,
+    int32_t dimension,
     int mc_version,
     uint64_t seed,
     int32_t rx,
     int32_t rz,
     CPos &out
 ) {
-    const uint64_t key = structure_direct_cache_key(struct_id, rx, rz);
+    const uint64_t key = structure_direct_cache_key(dimension, struct_id, rx, rz);
     QueryScratch::StructureDirectCacheEntry &entry =
         scratch.structure_cache[static_cast<size_t>(key) & (QueryScratch::kStructureDirectCacheSize - 1U)];
     if (entry.epoch == scratch.cache_epoch && entry.key == key && entry.pos_ready != 0U) {
@@ -1573,13 +1593,14 @@ static SCANNER_FORCE_INLINE bool cached_is_viable_structure_pos_direct(
     const CubiApi &api,
     QueryScratch &scratch,
     int32_t struct_id,
+    int32_t dimension,
     void *g_world,
     int32_t rx,
     int32_t rz,
     int32_t x,
     int32_t z
 ) {
-    const uint64_t key = structure_direct_cache_key(struct_id, rx, rz);
+    const uint64_t key = structure_direct_cache_key(dimension, struct_id, rx, rz);
     QueryScratch::StructureDirectCacheEntry &entry =
         scratch.structure_cache[static_cast<size_t>(key) & (QueryScratch::kStructureDirectCacheSize - 1U)];
     if (entry.epoch == scratch.cache_epoch && entry.key == key && entry.viable_ready != 0U) {
@@ -1748,9 +1769,7 @@ static SCANNER_FORCE_INLINE bool query_get_spawn(
         out_z = scratch.spawn_z;
         return true;
     }
-    if (g_world == nullptr) {
-        g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-    }
+    g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
     if (st.call_counters != nullptr) {
         ++st.call_counters->get_spawn_calls;
     }
@@ -1778,9 +1797,7 @@ static SCANNER_FORCE_INLINE bool query_get_spawn_estimate(
         out_z = scratch.spawn_estimate_z;
         return true;
     }
-    if (g_world == nullptr) {
-        g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-    }
+    g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
     if (st.call_counters != nullptr) {
         ++st.call_counters->estimate_spawn_calls;
     }
@@ -1851,22 +1868,21 @@ static SCANNER_FORCE_INLINE bool query_biome_matches_with_offsets_at_point(
     uint64_t seed,
     int mc_version,
     void *&g_world,
+    int32_t dimension,
     int32_t y,
     const std::vector<BiomeOffset> &offsets,
     const std::vector<int32_t> &allowed_sorted,
     int32_t point_x,
     int32_t point_z
 ) {
-    if (g_world == nullptr) {
-        g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-    }
+    g_world = ensure_generator(api, st, mc_version, seed, dimension);
     if (g_world == nullptr) {
         return false;
     }
     for (const BiomeOffset &o : offsets) {
         const int32_t x = point_x + o.dx;
         const int32_t z = point_z + o.dz;
-        const int bid = cached_query_biome_at(api, scratch, g_world, x, y, z);
+        const int bid = cached_query_biome_at(api, scratch, g_world, dimension, x, y, z);
         if (contains_biome_id(allowed_sorted, bid)) {
             return true;
         }
@@ -1895,6 +1911,7 @@ static SCANNER_FORCE_INLINE bool query_biome_filter_matches_at_point(
         seed,
         mc_version,
         g_world,
+        bf.desc.dimension,
         bf.desc.y,
         *bf.offsets,
         bf.allowed_sorted,
@@ -2126,13 +2143,13 @@ static SCANNER_FORCE_INLINE uint32_t collect_constraint_candidates_direct_no_pre
         }
 
         CPos pos{};
-        if (!cached_get_structure_pos_direct(api, scratch, rc.struct_id, mc_version, seed, rx, rz, pos)) {
+        if (!cached_get_structure_pos_direct(api, scratch, rc.struct_id, rc.dimension, mc_version, seed, rx, rz, pos)) {
             return false;
         }
         const int32_t x = pos.x;
         const int32_t z = pos.z;
         if (require_viability && structure_has_viability_check(rc.struct_id) &&
-            !cached_is_viable_structure_pos_direct(api, scratch, rc.struct_id, g_world, rx, rz, x, z)) {
+            !cached_is_viable_structure_pos_direct(api, scratch, rc.struct_id, rc.dimension, g_world, rx, rz, x, z)) {
             return false;
         }
         if (dist2_i64(x, z, anchor_x, anchor_z) > rc.candidate_radius_sq) {
@@ -2492,6 +2509,7 @@ static SCANNER_FORCE_INLINE uint32_t collect_constraint_candidates_strict_region
                 api,
                 scratch,
                 rc.struct_id,
+                rc.dimension,
                 mc_version,
                 seed,
                 region.rx,
@@ -2502,7 +2520,16 @@ static SCANNER_FORCE_INLINE uint32_t collect_constraint_candidates_strict_region
         const int32_t x = pos.x;
         const int32_t z = pos.z;
         if (structure_has_viability_check(rc.struct_id) &&
-            !cached_is_viable_structure_pos_direct(api, scratch, rc.struct_id, g_world, region.rx, region.rz, x, z)) {
+            !cached_is_viable_structure_pos_direct(
+                api,
+                scratch,
+                rc.struct_id,
+                rc.dimension,
+                g_world,
+                region.rx,
+                region.rz,
+                x,
+                z)) {
             continue;
         }
         if (dist2_i64(x, z, anchor_x, anchor_z) > rc.candidate_radius_sq) {
@@ -2705,10 +2732,8 @@ static SeedStatus evaluate_query_seed_fast_native_impl(
         return SeedStatus::reject;
     }
     void *g_world = nullptr;
-    auto ensure_world = [&]() -> void * {
-        if (g_world == nullptr) {
-            g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-        }
+    auto ensure_world = [&](int32_t dimension) -> void * {
+        g_world = ensure_generator(api, st, mc_version, seed, dimension);
         return g_world;
     };
 
@@ -2730,7 +2755,7 @@ static SeedStatus evaluate_query_seed_fast_native_impl(
         early_biome_checked = true;
         for (uint32_t bf_idx = 0; bf_idx < biome_filters.size(); ++bf_idx) {
             const QueryBiomePrepared &bf = biome_filters[bf_idx];
-            if (bf.desc.point_type == SCAN_ANCHOR_SPAWN) {
+            if (bf.desc.point_type == SCAN_ANCHOR_SPAWN && bf.desc.dimension == DIM_OVERWORLD) {
                 const int32_t spawn_search_radius = spawn_area_prefilter_search_radius(mc_version);
                 if (spawn_search_radius <= 0) {
                     continue;
@@ -2753,6 +2778,7 @@ static SeedStatus evaluate_query_seed_fast_native_impl(
                         seed,
                         mc_version,
                         g_world,
+                        bf.desc.dimension,
                         bf.desc.y,
                         spawn_area_offsets,
                         bf.allowed_sorted,
@@ -2869,7 +2895,7 @@ static SeedStatus evaluate_query_seed_fast_native_impl(
 
             void *collect_world = g_world;
             if (constraint_requires_exact_generator(rc)) {
-                collect_world = ensure_world();
+                collect_world = ensure_world(rc.dimension);
                 if (collect_world == nullptr) {
                     generator_failed = true;
                     return true;
@@ -3154,10 +3180,8 @@ static SeedStatus collect_query_details_native(
         return SeedStatus::reject;
     }
     void *g_world = nullptr;
-    auto ensure_world = [&]() -> void * {
-        if (g_world == nullptr) {
-            g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-        }
+    auto ensure_world = [&](int32_t dimension) -> void * {
+        g_world = ensure_generator(api, st, mc_version, seed, dimension);
         return g_world;
     };
 
@@ -3182,7 +3206,7 @@ static SeedStatus collect_query_details_native(
         auto process_anchor = [&](int32_t ax, int32_t az) {
             void *collect_world = g_world;
             if (constraint_requires_exact_generator(rc)) {
-                collect_world = ensure_world();
+                collect_world = ensure_world(rc.dimension);
                 if (collect_world == nullptr) {
                     generator_failed = true;
                     return;
@@ -3271,14 +3295,14 @@ static SeedStatus collect_query_details_native(
             if (bf.offsets == nullptr) {
                 return false;
             }
-            void *biome_world = ensure_world();
+            void *biome_world = ensure_world(desc.dimension);
             if (biome_world == nullptr) {
                 return false;
             }
             for (const BiomeOffset &o : *bf.offsets) {
                 const int32_t sx = px + o.dx;
                 const int32_t sz = pz + o.dz;
-                const int biome_id = cached_query_biome_at(api, scratch, biome_world, sx, desc.y, sz);
+                const int biome_id = cached_query_biome_at(api, scratch, biome_world, desc.dimension, sx, desc.y, sz);
                 if (!contains_biome_id(bf.allowed_sorted, biome_id)) {
                     continue;
                 }
@@ -3698,6 +3722,9 @@ static int validate_query_descriptors(
 
     for (uint32_t i = 0; i < constraint_count; ++i) {
         const NativeQueryConstraintDesc &c = constraints[i];
+        if (!valid_scan_dimension(c.dimension)) {
+            return -1;
+        }
         if (c.region_start > region_count || c.region_start + c.region_count > region_count) {
             return -1;
         }
@@ -3712,6 +3739,9 @@ static int validate_query_descriptors(
     }
     for (uint32_t i = 0; i < biome_filter_count; ++i) {
         const NativeBiomeFilterDesc &bf = biome_filters[i];
+        if (!valid_scan_dimension(bf.dimension)) {
+            return -1;
+        }
         if (bf.point_type != SCAN_ANCHOR_ORIGIN && bf.point_type != SCAN_ANCHOR_SPAWN &&
             bf.point_type != SCAN_ANCHOR_DEP && bf.point_type != SCAN_ANCHOR_FIXED) {
             return -1;
@@ -3780,6 +3810,7 @@ static std::vector<CompiledBiomeGroup> build_compiled_biome_groups(
         for (size_t i = 0; i < groups.size(); ++i) {
             const CompiledBiomeGroup &group = groups[i];
             if (group.point_type == bf.desc.point_type && group.point_dep_index == bf.desc.point_dep_index &&
+                group.dimension == bf.desc.dimension &&
                 group.point_x == bf.desc.point_x && group.point_z == bf.desc.point_z && group.y == bf.desc.y &&
                 group.sample_step == bf.desc.sample_step) {
                 group_idx = i;
@@ -3790,6 +3821,7 @@ static std::vector<CompiledBiomeGroup> build_compiled_biome_groups(
             CompiledBiomeGroup group{};
             group.point_type = bf.desc.point_type;
             group.point_dep_index = bf.desc.point_dep_index;
+            group.dimension = bf.desc.dimension;
             group.point_x = bf.desc.point_x;
             group.point_z = bf.desc.point_z;
             group.y = bf.desc.y;
@@ -4064,10 +4096,8 @@ static SeedStatus evaluate_query_seed_stage_b_constraints_compiled(
     const uint32_t constraint_count = static_cast<uint32_t>(plan.constraints.size());
 
     void *g_world = nullptr;
-    auto ensure_world = [&]() -> void * {
-        if (g_world == nullptr) {
-            g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-        }
+    auto ensure_world = [&](int32_t dimension) -> void * {
+        g_world = ensure_generator(api, st, mc_version, seed, dimension);
         return g_world;
     };
 
@@ -4129,7 +4159,7 @@ static SeedStatus evaluate_query_seed_stage_b_constraints_compiled(
 
             void *collect_world = g_world;
             if (constraint_requires_exact_generator(rc)) {
-                collect_world = ensure_world();
+                collect_world = ensure_world(rc.dimension);
                 if (collect_world == nullptr) {
                     generator_failed = true;
                     return true;
@@ -4215,6 +4245,7 @@ static bool evaluate_compiled_biome_group_at_anchor(
     const CubiApi &api,
     QueryScratch &scratch,
     void *g_world,
+    int32_t dimension,
     const CompiledBiomeGroup &group,
     const std::vector<QueryBiomePrepared> &prepared_filters,
     int32_t anchor_x,
@@ -4232,6 +4263,7 @@ static bool evaluate_compiled_biome_group_at_anchor(
             api,
             scratch,
             g_world,
+            dimension,
             anchor_x + offset.dx,
             group.y,
             anchor_z + offset.dz
@@ -4303,10 +4335,8 @@ static SeedStatus evaluate_query_seed_stage_c_biomes_compiled(
     }
     std::vector<uint8_t> filter_satisfied(plan.prepared_filters.size(), 0U);
     void *g_world = nullptr;
-    auto ensure_world = [&]() -> void * {
-        if (g_world == nullptr) {
-            g_world = ensure_generator(api, st, mc_version, seed, DIM_OVERWORLD);
-        }
+    auto ensure_world = [&](int32_t dimension) -> void * {
+        g_world = ensure_generator(api, st, mc_version, seed, dimension);
         return g_world;
     };
 
@@ -4315,7 +4345,8 @@ static SeedStatus evaluate_query_seed_stage_c_biomes_compiled(
             return evaluate_compiled_biome_group_at_anchor(
                 api,
                 scratch,
-                ensure_world(),
+                ensure_world(group.dimension),
+                group.dimension,
                 group,
                 plan.prepared_filters,
                 ax,

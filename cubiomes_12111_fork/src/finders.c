@@ -96,6 +96,7 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     s_fortress_115          = {        0, 16,  8, Fortress,         DIM_NETHER,0},
     s_fortress              = { 30084232, 27, 23, Fortress,         DIM_NETHER,0},
     s_bastion               = { 30084232, 27, 23, Bastion,          DIM_NETHER,0},
+    s_nether_fossil         = { 14357921,  2,  1, Nether_Fossil,    DIM_NETHER,0},
     s_end_city              = { 10387313, 20,  9, End_City,         DIM_END,0},
     // for the scattered return gateways
     s_end_gateway_115       = {    30000,  1,  1, End_Gateway,      DIM_END, 700},
@@ -164,6 +165,9 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
         return mc >= MC_1_0;
     case Bastion:
         *sconf = s_bastion;
+        return mc >= MC_1_16_1;
+    case Nether_Fossil:
+        *sconf = s_nether_fossil;
         return mc >= MC_1_16_1;
     case End_Gateway:
         if      (mc <= MC_1_15) *sconf = s_end_gateway_115;
@@ -236,6 +240,7 @@ int getStructurePos(int structureType, int mc, uint64_t seed, int regX, int regZ
     case Ancient_City:
     case Trail_Ruins:
     case Trial_Chambers:
+    case Nether_Fossil:
         *pos = getFeaturePos(sconf, seed, regX, regZ);
         return 1;
 
@@ -1391,7 +1396,10 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
         return mc >= MC_1_16_1;
 
     case Ruined_Portal_N:
-        return mc >= MC_1_16_1;
+        if (mc <= MC_1_15) return 0;
+        return (biomeID == nether_wastes || biomeID == soul_sand_valley ||
+                biomeID == warped_forest || biomeID == crimson_forest ||
+                biomeID == basalt_deltas);
 
     case Ancient_City:
         if (mc <= MC_1_18) return 0;
@@ -1481,6 +1489,10 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
         if (mc <= MC_1_15) return 0;
         return (biomeID == nether_wastes || biomeID == soul_sand_valley ||
                 biomeID == warped_forest || biomeID == crimson_forest);
+
+    case Nether_Fossil:
+        if (mc <= MC_1_15) return 0;
+        return biomeID == soul_sand_valley;
 
     case End_City:
         if (mc <= MC_1_8) return 0;
@@ -1664,6 +1676,17 @@ int isViableStructurePos(int structureType, Generator *g, int x, int z, uint32_t
             sampleZ = (chunkZ*32 + 2*sv.z + sv.sz-1) / 2 >> 2;
             if (g->mc >= MC_1_19_2)
                 sampleY = 33 >> 2; // nether biomes don't actually vary in Y
+        }
+        else if (structureType == Nether_Fossil)
+        {
+            // The vanilla structure samples a random block in the candidate
+            // chunk before terrain-searching downward. Cubiomes does not
+            // model that Nether column here, so mirror the random X/Z and
+            // keep the viability gate to the required soul_sand_valley biome.
+            uint64_t rng = chunkGenerateRnd(g->seed, chunkX, chunkZ);
+            sampleX = (chunkX * 16 + nextInt(&rng, 16)) >> 2;
+            sampleZ = (chunkZ * 16 + nextInt(&rng, 16)) >> 2;
+            sampleY = 32 >> 2;
         }
         else
         {
@@ -2314,6 +2337,32 @@ int getVariant(StructureVariant *r, int structType, int mc, uint64_t seed,
             }
         }
         return 1;
+
+    case Nether_Fossil:
+    {
+        static const unsigned char sizes[][3] = {
+            {4, 4, 5}, {5, 1, 5}, {3, 4, 2}, {3, 4, 1}, {2, 5, 1},
+            {7, 5, 5}, {4, 6, 5}, {3, 5, 1}, {3, 5, 5}, {3, 7, 1},
+            {5, 5, 7}, {4, 4, 3}, {4, 5, 6}, {7, 7, 6},
+        };
+        int offx = nextInt(&rng, 16);
+        int offz = nextInt(&rng, 16);
+        r->y = 32 + nextInt(&rng, 95);
+        r->rotation = nextInt(&rng, 4);
+        r->start = nextInt(&rng, 14);
+        sx = sizes[r->start][0];
+        sy = sizes[r->start][1];
+        sz = sizes[r->start][2];
+        r->sy = sy;
+        switch (r->rotation)
+        { // 0:0, 1:cw90, 2:cw180, 3:cw270=ccw90
+        case 0: r->x = offx;      r->z = offz;      r->sx = sx; r->sz = sz; break;
+        case 1: r->x = offx+1-sz; r->z = offz;      r->sx = sz; r->sz = sx; break;
+        case 2: r->x = offx+1-sx; r->z = offz+1-sz; r->sx = sx; r->sz = sz; break;
+        case 3: r->x = offx;      r->z = offz+1-sx; r->sx = sz; r->sz = sx; break;
+        }
+        return 1;
+    }
 
     case Ancient_City:
         r->rotation = nextInt(&rng, 4);

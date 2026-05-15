@@ -71,6 +71,7 @@ static bool g_debug_enabled = false;
     } while (0)
 
 constexpr uint64_t JAVA_MASK = ((1ULL << 48U) - 1ULL);
+constexpr uint64_t JAVA_DOMAIN = (JAVA_MASK + 1ULL);
 constexpr int64_t REGION_X_MULT = 341873128712LL;
 constexpr int64_t REGION_Z_MULT = 132897987541LL;
 constexpr int CHUNK_SIZE = 16;
@@ -109,6 +110,7 @@ struct StructureContext {
 struct ConstraintSpec {
     std::string cid;
     std::string structure;
+    std::string dimension = "overworld";
     std::string mode;
     std::string anchor;
     int radius = 0;
@@ -118,6 +120,7 @@ struct ConstraintSpec {
 
 struct BiomeFilterSpec {
     std::string point;
+    std::string dimension = "overworld";
     int y = 64;
     int radius = 0;
     std::vector<int32_t> allowed_ids;
@@ -139,6 +142,7 @@ struct SculptSpec {
     std::string pattern = "disk";
     std::string edge = "outward";
     std::string center = "origin";
+    std::string dimension = "overworld";
     int y = 64;
     int radius = 128;
     int step = 16;
@@ -160,6 +164,7 @@ struct QuerySpec {
     int version = 1;
     std::string logic = "and";
     std::string default_anchor = "origin";
+    std::string default_dimension = "overworld";
     std::vector<ConstraintSpec> constraints;
     std::vector<BiomeFilterSpec> biome_filters;
     std::vector<LootFilterSpec> loot_filters;
@@ -169,6 +174,7 @@ struct QuerySpec {
 
 struct QueryConstraintRuntime {
     ConstraintSpec spec;
+    int dimension = SCAN_DIM_OVERWORLD;
     bool prefilter_supported = false;
     bool exact_attempt_prefilter_supported = false;
     bool structure_in_presets = false;
@@ -2832,8 +2838,13 @@ static std::unordered_map<std::string, StructurePreset> build_structure_presets(
         {"ocean_ruin", {20, 8, 14357621, SCAN_SPREAD_LINEAR}},
         {"shipwreck", {24, 4, 165745295, SCAN_SPREAD_LINEAR}},
         {"ruined_portal", {40, 15, 34222645, SCAN_SPREAD_LINEAR}},
+        {"ruined_portal_nether", {40, 15, 34222645, SCAN_SPREAD_LINEAR}},
+        {"fortress", {27, 4, 30084232, SCAN_SPREAD_LINEAR}},
+        {"bastion_remnant", {27, 4, 30084232, SCAN_SPREAD_LINEAR}},
+        {"nether_fossil", {2, 1, 14357921, SCAN_SPREAD_LINEAR}},
         {"ocean_monument", {32, 5, 10387313, SCAN_SPREAD_TRIANGULAR}},
         {"woodland_mansion", {80, 20, 10387319, SCAN_SPREAD_TRIANGULAR}},
+        {"end_city", {20, 11, 10387313, SCAN_SPREAD_TRIANGULAR}},
         {"trial_chambers", {34, 12, 94251327, SCAN_SPREAD_LINEAR}},
     };
 }
@@ -2859,13 +2870,18 @@ static std::unordered_map<std::string, int> build_structure_ids() {
         {"woodland_mansion", 9},
         {"pillager_outpost", 10},
         {"ruined_portal", 11},
+        {"ruined_portal_nether", 12},
         {"ancient_city", 13},
         {"buried_treasure", 14},
         {"mineshaft", 15},
         {"desert_well", 16},
         {"geode", 17},
-        {"trail_ruin", 22},
-        {"trial_chambers", 23},
+        {"fortress", 18},
+        {"bastion_remnant", 19},
+        {"end_city", 20},
+        {"trail_ruin", 23},
+        {"trial_chambers", 24},
+        {"nether_fossil", 25},
         {"stronghold", -1},
     };
 }
@@ -2967,12 +2983,23 @@ static std::unordered_map<std::string, std::string> build_structure_aliases() {
         {"ocean_ruin", "ocean_ruin"},
         {"shipwreck", "shipwreck"},
         {"ruined_portal", "ruined_portal"},
+        {"ruined_portal_nether", "ruined_portal_nether"},
+        {"ruined_portal_n", "ruined_portal_nether"},
+        {"nether_ruined_portal", "ruined_portal_nether"},
+        {"fortress", "fortress"},
+        {"nether_fortress", "fortress"},
+        {"bastion", "bastion_remnant"},
+        {"bastion_remnant", "bastion_remnant"},
+        {"nether_fossil", "nether_fossil"},
+        {"fossil_nether", "nether_fossil"},
         {"ocean_monument", "ocean_monument"},
         {"monument", "ocean_monument"},
         {"quad_monument", "quad_ocean_monument"},
         {"quad_ocean_monument", "quad_ocean_monument"},
         {"woodland_mansion", "woodland_mansion"},
         {"mansion", "woodland_mansion"},
+        {"end_city", "end_city"},
+        {"end_cities", "end_city"},
         {"quad_desert_pyramid", "quad_desert_pyramid"},
         {"quad_desert_temple", "quad_desert_pyramid"},
         {"quad_igloo", "quad_igloo"},
@@ -3592,6 +3619,31 @@ static std::string parse_anchor_ref(const std::string &anchor) {
     throw std::runtime_error("Invalid anchor reference '" + anchor + "'. Use origin, spawn, fixed:x,z, or constraint:<id>.");
 }
 
+static std::string normalize_dimension_name(const std::string &dimension) {
+    const std::string key = normalize_key(dimension);
+    if (key.empty() || key == "overworld" || key == "world" || key == "surface") {
+        return "overworld";
+    }
+    if (key == "nether" || key == "the_nether" || key == "hell") {
+        return "nether";
+    }
+    if (key == "end" || key == "the_end") {
+        return "end";
+    }
+    throw std::runtime_error("Invalid dimension '" + dimension + "'. Use overworld, nether, or end.");
+}
+
+static int32_t dimension_id_from_name(const std::string &dimension) {
+    const std::string normalized = normalize_dimension_name(dimension);
+    if (normalized == "nether") {
+        return SCAN_DIM_NETHER;
+    }
+    if (normalized == "end") {
+        return SCAN_DIM_END;
+    }
+    return SCAN_DIM_OVERWORLD;
+}
+
 static std::string normalize_structure_name(const std::string &name) {
     const std::string key = normalize_key(name);
     const auto it = kStructureAliases.find(key);
@@ -3619,6 +3671,34 @@ static std::pair<std::string, uint32_t> resolve_structure_variant(const std::str
         return {"jungle_temple", 4U};
     }
     return {normalized, 1U};
+}
+
+static std::string default_dimension_for_structure(const std::string &structure) {
+    if (
+        structure == "fortress" || structure == "bastion_remnant" ||
+        structure == "ruined_portal_nether" || structure == "nether_fossil"
+    ) {
+        return "nether";
+    }
+    if (structure == "end_city") {
+        return "end";
+    }
+    return "overworld";
+}
+
+static bool structure_dimension_compatible(const std::string &structure, const std::string &dimension) {
+    const std::string dim = normalize_dimension_name(dimension);
+    if (structure == "fortress" || structure == "bastion_remnant" ||
+        structure == "ruined_portal_nether" || structure == "nether_fossil") {
+        return dim == "nether";
+    }
+    if (structure == "end_city") {
+        return dim == "end";
+    }
+    if (structure == "stronghold") {
+        return dim == "overworld";
+    }
+    return dim == "overworld";
 }
 
 static int resolve_mc_version(const std::string &version_text) {
@@ -4451,6 +4531,7 @@ static QueryRuntime build_query_runtime(const QuerySpec &spec) {
         QueryConstraintRuntime rc{};
         rc.spec = c;
         rc.prefilter_radius = prefilter_radii.at(c.cid);
+        rc.dimension = dimension_id_from_name(c.dimension);
         rc.candidate_radius_sq = static_cast<uint64_t>(c.radius) * static_cast<uint64_t>(c.radius);
         rc.root_radius_sq = static_cast<uint64_t>(rc.prefilter_radius) * static_cast<uint64_t>(rc.prefilter_radius);
         rc.candidate_chunk_radius = static_cast<uint32_t>(std::max(1, static_cast<int>(std::ceil(c.radius / 16.0)) + 2));
@@ -4901,6 +4982,9 @@ static QuerySpec parse_query_spec(
     } else if (anchor_obj != nullptr) {
         spec.default_anchor = parse_anchor_ref(json_to_string(anchor_obj, "origin"));
     }
+    spec.default_dimension = normalize_dimension_name(
+        json_to_string(json_get(raw, "dimension"), json_to_string(json_get(raw, "default_dimension"), "overworld"))
+    );
 
     const JsonValue *constraints_raw = json_get(raw, "constraints");
     if (constraints_raw != nullptr && !json_is_array(constraints_raw)) {
@@ -4925,6 +5009,16 @@ static QuerySpec parse_query_spec(
                 resolve_structure_variant(json_to_string(json_get(obj, "structure"), ""));
             c.structure = resolved_structure;
             c.min_required = min_required;
+            c.dimension = normalize_dimension_name(json_to_string(
+                json_get(obj, "dimension"),
+                spec.default_dimension == "overworld" ? default_dimension_for_structure(c.structure) : spec.default_dimension
+            ));
+            if (!structure_dimension_compatible(c.structure, c.dimension)) {
+                throw std::runtime_error(
+                    "Constraint " + c.cid + ": structure '" + c.structure +
+                    "' is not valid in dimension '" + c.dimension + "'."
+                );
+            }
             c.mode = lower_ascii(trim(json_to_string(json_get(obj, "mode"), "strict")));
             if (c.mode == "mixed") {
                 c.mode = "strict";
@@ -5143,6 +5237,10 @@ static QuerySpec parse_query_spec(
                 for (const std::string &point_anchor : point_anchors) {
                     BiomeFilterSpec bf{};
                     bf.point = parse_anchor_ref(point_anchor);
+                    bf.dimension = normalize_dimension_name(json_to_string(json_get(obj, "dimension"), spec.default_dimension));
+                    if (bf.point == "spawn" && bf.dimension != "overworld") {
+                        throw std::runtime_error("Biome filter point=spawn only supports the overworld dimension.");
+                    }
                     bf.y = bf_y;
                     bf.radius = bf_radius;
                     bf.allowed_ids = allowed_ids;
@@ -5153,6 +5251,10 @@ static QuerySpec parse_query_spec(
 
             BiomeFilterSpec bf{};
             bf.point = parse_anchor_ref(json_to_string(json_get(obj, "point"), spec.default_anchor));
+            bf.dimension = normalize_dimension_name(json_to_string(json_get(obj, "dimension"), spec.default_dimension));
+            if (bf.point == "spawn" && bf.dimension != "overworld") {
+                throw std::runtime_error("Biome filter point=spawn only supports the overworld dimension.");
+            }
             bf.y = bf_y;
             bf.radius = bf_radius;
             bf.allowed_ids = allowed_ids;
@@ -5234,6 +5336,10 @@ static QuerySpec parse_query_spec(
             sculpt.center = parse_anchor_ref(json_to_string(json_get(*sculpt_raw, "center"), "origin"));
             if (sculpt.center.rfind("constraint:", 0) == 0) {
                 throw std::runtime_error("sculpt.center cannot use constraint:<id> in this build.");
+            }
+            sculpt.dimension = normalize_dimension_name(json_to_string(json_get(*sculpt_raw, "dimension"), spec.default_dimension));
+            if (sculpt.center == "spawn" && sculpt.dimension != "overworld") {
+                throw std::runtime_error("sculpt.center=spawn only supports the overworld dimension.");
             }
             sculpt.y = json_to_int(json_get(*sculpt_raw, "y"), 64);
             sculpt.radius = json_to_int(json_get(*sculpt_raw, "radius"), 128);
@@ -5370,6 +5476,7 @@ build_native_query_arrays(const QueryRuntime &runtime) {
         desc.region_spacing_chunks =
             rc.prefilter_supported ? static_cast<uint32_t>(std::max(1, rc.context.preset.spacing)) : 0U;
         desc.strict_region_spacing_hint = rc.strict_region_spacing_hint;
+        desc.dimension = rc.dimension;
         desc.struct_id = rc.struct_id;
         desc.is_stronghold = rc.spec.structure == "stronghold" ? 1U : 0U;
         desc.structure_in_presets = rc.structure_in_presets ? 1U : 0U;
@@ -5417,6 +5524,7 @@ static std::pair<std::vector<NativeBiomeFilterDesc>, std::vector<int32_t>> build
             out.point_type = SCAN_ANCHOR_DEP;
             out.point_dep_index = constraint_index.at(bf.point.substr(std::strlen("constraint:")));
         }
+        out.dimension = dimension_id_from_name(bf.dimension);
         out.y = bf.y;
         out.radius = bf.radius;
         out.sample_step = static_cast<uint32_t>(effective_biome_sample_step(spec.perf.strict_surrogate, bf.radius));
@@ -5473,6 +5581,7 @@ static std::pair<NativeSculptDesc, std::vector<int32_t>> build_native_sculpt_con
 
     out.center_x = center_x;
     out.center_z = center_z;
+    out.dimension = dimension_id_from_name(spec.sculpt.dimension);
     out.y = spec.sculpt.y;
     out.radius = std::max<int32_t>(0, spec.sculpt.radius);
     out.step = std::max<int32_t>(1, spec.sculpt.step);
@@ -7679,11 +7788,6 @@ int main(int argc, char **argv) {
         if (args.count == 0) {
             throw std::runtime_error("--count must be > 0.");
         }
-        if (args.count > (JAVA_MASK + 1ULL)) {
-            throw std::runtime_error(
-                "--count cannot exceed the full lower48 domain (281474976710656 seeds) in contiguous lower48 scan mode."
-            );
-        }
         CompiledQueryPlanContext query_plan;
         query_plan.build(
             std::move(native_regions),
@@ -7927,8 +8031,27 @@ int main(int argc, char **argv) {
 
         if (terminal_mode.load()) {
             std::cout << "Device: native-cpp\n";
-            const uint64_t range_end = (start_seed + args.count) & JAVA_MASK;
-            std::cout << "Range: [" << fmt_seed(start_seed) << ", " << fmt_seed(range_end) << ") lower48\n";
+            const uint64_t tail_count = args.count % JAVA_DOMAIN;
+            const uint64_t range_end = (start_seed + tail_count) & JAVA_MASK;
+            const uint64_t seeds_until_wrap = JAVA_DOMAIN - start_seed;
+            const bool wraps_lower48 =
+                args.count > seeds_until_wrap || (start_seed == 0ULL && args.count >= JAVA_DOMAIN);
+            if (wraps_lower48) {
+                std::cout << "Range: start=" << fmt_seed(start_seed)
+                          << ", count=" << fmt_u64(args.count)
+                          << ", end=" << fmt_seed(range_end)
+                          << " lower48 (wraps";
+                const uint64_t full_passes = args.count / JAVA_DOMAIN;
+                if (full_passes > 0ULL) {
+                    std::cout << ", full passes=" << fmt_u64(full_passes);
+                }
+                if (tail_count > 0ULL) {
+                    std::cout << ", tail=" << fmt_u64(tail_count);
+                }
+                std::cout << ")\n";
+            } else {
+                std::cout << "Range: [" << fmt_seed(start_seed) << ", " << fmt_seed(range_end) << ") lower48\n";
+            }
             std::cout << "Batch size: " << fmt_u64(capped_batch_size) << " (" << args.batch_size << ")\n";
             std::cout << "Compiled Stage A mode: requested=" << requested_compiled_stage_a_mode
                       << ", active=" << compiled_stage_a_mode_name(compiled_stage_a_mode)

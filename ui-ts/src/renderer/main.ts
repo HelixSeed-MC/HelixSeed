@@ -48,9 +48,12 @@ import type { HelixSeedApi } from "../preload/preload";
 import { LineChart } from "./telemetry/chart";
 import { TelemetryStore, type SeriesDefinition, type TelemetrySnapshot } from "./telemetry/store";
 
+type DimensionName = "overworld" | "nether" | "end";
+
 type ConstraintRow = {
   id: string;
   structure: string;
+  dimension: DimensionName;
   anchor: string;
   radius: string;
   mode: "strict" | "placement" | "mixed";
@@ -58,6 +61,7 @@ type ConstraintRow = {
 
 type BiomeRow = {
   point: string;
+  dimension: DimensionName;
   y: string;
   radius: string;
   allowed: string;
@@ -72,6 +76,7 @@ type LootRow = {
 type ScriptConstraint = {
   id: string;
   structure: string;
+  dimension: string;
   mode: string;
   within: {
     anchor: string;
@@ -163,7 +168,7 @@ type QueryObject = {
   logic: string;
   anchor: { type: string };
   constraints: ScriptConstraint[];
-  biome_filters: Array<{ point: string; y: number; radius: number; allowed: string[] }>;
+  biome_filters: Array<{ point: string; dimension: string; y: number; radius: number; allowed: string[] }>;
   loot_filters: Array<{ constraint: string; structure: string; required: Record<string, number> }>;
   control_ops: ControlOp[];
   output: { detail: string };
@@ -201,8 +206,13 @@ const structures = [
   "ocean_ruin",
   "shipwreck",
   "ruined_portal",
+  "ruined_portal_nether",
+  "fortress",
+  "bastion_remnant",
+  "nether_fossil",
   "ocean_monument",
   "woodland_mansion",
+  "end_city",
   "trial_chambers",
   "pillager_outpost",
   "buried_treasure",
@@ -213,6 +223,60 @@ const structures = [
   "geode",
   "stronghold"
 ];
+
+const dimensions: DimensionName[] = ["overworld", "nether", "end"];
+
+const biomeSuggestions = [
+  "plains",
+  "forest",
+  "desert",
+  "savanna",
+  "taiga",
+  "snowy_plains",
+  "beach",
+  "ocean",
+  "deep_ocean",
+  "meadow",
+  "cherry_grove",
+  "pale_garden",
+  "dripstone_caves",
+  "lush_caves",
+  "deep_dark",
+  "nether_wastes",
+  "soul_sand_valley",
+  "crimson_forest",
+  "warped_forest",
+  "basalt_deltas",
+  "the_end",
+  "small_end_islands",
+  "end_midlands",
+  "end_highlands",
+  "end_barrens"
+];
+
+function normalizeDimensionName(value: string | undefined, fallback: DimensionName = "overworld"): DimensionName {
+  const normalized = normalizeName(value ?? "");
+  if (!normalized) return fallback;
+  if (normalized === "nether" || normalized === "the_nether" || normalized === "hell") return "nether";
+  if (normalized === "end" || normalized === "the_end") return "end";
+  return "overworld";
+}
+
+function defaultDimensionForStructure(structure: string): DimensionName {
+  const key = normalizeName(structure);
+  if (key === "fortress" || key === "bastion_remnant" || key === "ruined_portal_nether" || key === "nether_fossil") {
+    return "nether";
+  }
+  if (key === "end_city") {
+    return "end";
+  }
+  return "overworld";
+}
+
+function structuresForDimension(dimension: string): string[] {
+  const normalized = normalizeDimensionName(dimension);
+  return structures.filter((structure) => defaultDimensionForStructure(structure) === normalized);
+}
 
 const lootSources = [
   "auto",
@@ -258,7 +322,7 @@ const state: State = {
     candidateCapMode: "adaptive",
     fixedCap: "128"
   },
-  constraints: [{ id: "v1", structure: "village", anchor: "origin", radius: "64", mode: "strict" }],
+  constraints: [{ id: "v1", structure: "village", dimension: "overworld", anchor: "origin", radius: "64", mode: "strict" }],
   biomes: [],
   loot: [],
   foundSeeds: []
@@ -468,7 +532,7 @@ const helixScriptLanguage = StreamLanguage.define({
     if (stream.match(/\b-?\d+(?:\.\d+)?\b/u)) {
       return "number";
     }
-    if (stream.match(/\b(let|set|const|fn|function|call|if|elif|else|end|and|or|not|is|contains|for|in|find|as|within|of|strict|placement|mixed|anchor|logic|biome|y|radius|structure|mode|allow|loot|from|require|assert|skip|stop|continue|pause|scan|output|performance|workers|queue|survivor_cap|adaptive|execution|stage|gpu_pipeline|pipeline|cap|surrogate|fixed_cap)\b/u)) {
+    if (stream.match(/\b(let|set|const|fn|function|call|if|elif|else|end|and|or|not|is|contains|for|in|find|as|within|of|strict|placement|mixed|anchor|logic|biome|dimension|overworld|nether|end|y|radius|structure|mode|allow|loot|from|require|assert|skip|stop|continue|pause|scan|output|performance|workers|queue|survivor_cap|adaptive|execution|stage|gpu_pipeline|pipeline|cap|surrogate|fixed_cap)\b/u)) {
       return "keyword";
     }
     if (stream.match(/\b(true|false|found|optional|auto|origin|spawn|adaptive|fixed|none|balanced|aggressive|ultra|turbo|lightspeed|max-throughput|scalar|multi|single|cpu-a5|gpu-off)\b/u)) {
@@ -502,17 +566,17 @@ const commandCompletions: Completion[] = [
     `let structure = village
 let radius = 64
 if radius >= 64 and structure is village
-  find $structure as v1 within $radius of origin strict
+  find $structure in overworld as v1 within $radius of origin strict
 end`,
     { label: "if block", type: "class", detail: "conditional commands", boost: 99 }
   ),
   snippetCompletion(
     `if $radius of \${id} == \${radius}
-  find ruined_portal as rp1 within 96 of constraint:\${id} strict
+  find ruined_portal in overworld as rp1 within 96 of constraint:\${id} strict
 end`,
     { label: "if rule field", type: "class", detail: "condition using a rule id", boost: 98 }
   ),
-  snippetCompletion("find ${structure} as ${id} within ${radius} of origin strict", {
+  snippetCompletion("find ${structure} in overworld as ${id} within ${radius} of origin strict", {
     label: "find",
     type: "function",
     detail: "add a structure search rule",
@@ -526,7 +590,7 @@ end`,
   }),
   snippetCompletion(
     `for \${item} in [\${a}, \${b}, \${c}]
-  find \${item} as \${id}_\${item} within 64 of origin strict
+  find \${item} in overworld as \${id}_\${item} within 64 of origin strict
 end`,
     { label: "for", type: "class", detail: "iterate over a list", boost: 95 }
   ),
@@ -577,7 +641,7 @@ end`,
 end`,
     { label: "scan block", type: "class", detail: "scan runtime settings", boost: 90 }
   ),
-  snippetCompletion("biome origin y 64 radius ${radius} allow ${biome}", {
+  snippetCompletion("biome origin in overworld y 64 radius ${radius} allow ${biome}", {
     label: "biome",
     type: "function",
     detail: "add a biome filter",
@@ -625,20 +689,20 @@ const scriptBlockTemplates: Record<string, string> = {
   variable: "let radius = 64",
   list: "let biomes = [plains, meadow, cherry_grove]",
   for: `for biome in [plains, meadow, cherry_grove]
-  biome origin y 64 radius 96 allow $biome
+  biome origin in overworld y 64 radius 96 allow $biome
 end`,
-  if: `find village as v1 within 64 of origin strict
+  if: `find village in overworld as v1 within 64 of origin strict
 if $radius of v1 == 64 and $structure of v1 is village
-  find ruined_portal as rp1 within 96 of constraint:v1 strict
+  find ruined_portal in overworld as rp1 within 96 of constraint:v1 strict
 end`,
   assert: "assert $radius of v1 > 0 message v1 radius must be positive",
   skip: `skip if $mode of v1 is placement
-  find ruined_portal as rp1 within 96 of constraint:v1 strict
+  find ruined_portal in overworld as rp1 within 96 of constraint:v1 strict
 end`,
   stop: "stop if $radius of v1 > 512",
   output: "output raw",
   function: `function nearby_portal(anchor_id, portal_id, radius)
-  find ruined_portal as $portal_id within $radius of constraint:$anchor_id strict
+  find ruined_portal in overworld as $portal_id within $radius of constraint:$anchor_id strict
 end
 
 nearby_portal(v1, rp1, 96)`,
@@ -650,8 +714,8 @@ nearby_portal(v1, rp1, 96)`,
   progress 1
   mode mixed
 end`,
-  find: "find village as v1 within 64 of origin strict",
-  biome: "biome origin y 64 radius 128 allow plains",
+  find: "find village in overworld as v1 within 64 of origin strict",
+  biome: "biome origin in overworld y 64 radius 128 allow plains",
   // loot block disabled in UI; parser still understands the syntax.
   // loot: "loot v1 from village require emerald:3",
   performance: `performance
@@ -681,16 +745,22 @@ function scriptCompletionSource(context: CompletionContext): CompletionResult | 
         ? [...wordCompletions(["true", "false", "village", "strict", "placement", "origin", "spawn"], "condition value"), ...wordCompletions(Object.keys(scriptVariablesFromText(context.state.doc.toString())), "variable")]
         : /^if\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
           ? [...wordCompletions(["true", "false", "not"], "condition"), ...wordCompletions(Object.keys(scriptVariablesFromText(context.state.doc.toString())), "variable")]
-          : /^find\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
-      ? wordCompletions(structures, "structure")
-      : /^find\s+\S+\s+as\s+\S+\s+within\s+\S+\s+of\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+      : /^find\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+        ? wordCompletions(structures, "structure")
+      : /^find\s+\S+\s+in\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+        ? wordCompletions(dimensions, "dimension")
+      : /^find\s+\S+(?:\s+in\s+\S+)?\s+as\s+\S+\s+within\s+\S+\s+of\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
         ? wordCompletions(currentConstraintAnchors(), "anchor")
-        : /^find\s+\S+\s+as\s+\S+\s+within\s+\S+\s+of\s+\S+\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+        : /^find\s+\S+(?:\s+in\s+\S+)?\s+as\s+\S+\s+within\s+\S+\s+of\s+\S+\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
           ? wordCompletions(["strict", "placement", "mixed"], "mode")
           : /^anchor\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
             ? wordCompletions(["origin", "spawn"], "anchor")
             : /^biome\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
               ? wordCompletions(currentConstraintAnchors(), "sample point")
+              : /^biome\s+\S+\s+in\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+                ? wordCompletions(dimensions, "dimension")
+              : /^biome\s+\S+(?:\s+in\s+\S+)?\s+y\s+-?\d+\s+radius\s+\d+\s+allow\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+                ? wordCompletions(biomeSuggestions, "biome")
               : /^loot\s+\S+\s+from\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
                 ? wordCompletions(lootSources, "loot source")
                 : /^\s*(mode|scan_mode|execution|stage|gpu_pipeline|pipeline|cap|surrogate|adaptive)\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
@@ -930,7 +1000,12 @@ function attrList(attrs: Record<string, string>): string {
     .join(" ");
 }
 
-function dropdownControl(values: string[], selected: string, attrs: Record<string, string>): string {
+function dropdownControl(
+  values: string[],
+  selected: string,
+  attrs: Record<string, string>,
+  controlAttrs: Record<string, string> = {}
+): string {
   const normalized = selected.trim();
   const options = dropdownValues(values, normalized);
   const optionsData = options.map((value) => value.replace(/\\/gu, "\\\\").replace(/\|/gu, "\\|")).join("|");
@@ -943,7 +1018,7 @@ function dropdownControl(values: string[], selected: string, attrs: Record<strin
     .join("");
   const label = options.includes(normalized) ? normalized : options[0] ?? "Select";
   return `
-    <div class="dropdown-control" data-dropdown data-options="${escapeHtml(optionsData)}">
+    <div class="dropdown-control" data-dropdown data-options="${escapeHtml(optionsData)}" ${attrList(controlAttrs)}>
       <input type="hidden" ${attrList(attrs)} value="${escapeHtml(normalized)}" />
       <button class="dropdown-button" type="button" aria-haspopup="listbox" aria-expanded="false">${escapeHtml(label)}</button>
       <div class="dropdown-menu" role="listbox">${items}</div>
@@ -982,6 +1057,32 @@ function parseDropdownOptions(control: HTMLElement): string[] {
   return values;
 }
 
+function filterDropdownOptions(control: HTMLElement): void {
+  const search = control.querySelector<HTMLInputElement>(".dropdown-search");
+  const menu = control.querySelector<HTMLElement>(".dropdown-menu");
+  if (!menu) {
+    return;
+  }
+  const query = normalizeName(search?.value ?? "");
+  let visible = 0;
+  menu.querySelectorAll<HTMLButtonElement>(".dropdown-option").forEach((item) => {
+    const value = normalizeName(item.dataset.value ?? item.textContent ?? "");
+    const show = query.length === 0 || value.includes(query);
+    item.hidden = !show;
+    if (show) {
+      visible += 1;
+    }
+  });
+  let empty = menu.querySelector<HTMLElement>(".dropdown-empty");
+  if (!empty) {
+    empty = document.createElement("div");
+    empty.className = "dropdown-empty";
+    empty.textContent = "No matches";
+    menu.append(empty);
+  }
+  empty.hidden = visible !== 0;
+}
+
 function closeDropdown(): void {
   if (!openDropdown) {
     return;
@@ -1006,6 +1107,15 @@ function syncDropdownControl(control: HTMLElement): void {
   button.textContent = selected || "Select";
   button.title = selected || "Select";
   menu.innerHTML = "";
+  if (control.dataset.searchable === "true") {
+    const search = document.createElement("input");
+    search.type = "search";
+    search.className = "dropdown-search";
+    search.placeholder = control.dataset.searchPlaceholder ?? "Search";
+    search.autocomplete = "off";
+    search.spellcheck = false;
+    menu.append(search);
+  }
   values.forEach((value) => {
     const item = document.createElement("button");
     item.type = "button";
@@ -1018,6 +1128,7 @@ function syncDropdownControl(control: HTMLElement): void {
     item.setAttribute("aria-selected", active ? "true" : "false");
     menu.append(item);
   });
+  filterDropdownOptions(control);
 }
 
 function syncDropdowns(root: ParentNode = document): void {
@@ -1069,6 +1180,17 @@ document.addEventListener("click", (event) => {
   }
   if (!target.closest("[data-dropdown]")) {
     closeDropdown();
+  }
+});
+
+document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || !target.classList.contains("dropdown-search")) {
+    return;
+  }
+  const control = target.closest<HTMLElement>("[data-dropdown]");
+  if (control) {
+    filterDropdownOptions(control);
   }
 });
 
@@ -1680,6 +1802,9 @@ function constraintFieldValue(
   if (normalizedField === "structure") {
     return constraint.structure;
   }
+  if (normalizedField === "dimension") {
+    return constraint.dimension;
+  }
   if (normalizedField === "mode") {
     return constraint.mode;
   }
@@ -1690,7 +1815,7 @@ function constraintFieldValue(
     return constraint.within.radius;
   }
 
-  scriptError(lineNo, `Unknown field "${field}" for rule "${id}". Use radius, structure, mode, anchor, or id.`);
+  scriptError(lineNo, `Unknown field "${field}" for rule "${id}". Use radius, structure, dimension, mode, anchor, or id.`);
 }
 
 function resolveConditionValue(
@@ -1845,6 +1970,7 @@ function buildBuilderQuery(): unknown {
       return {
         id,
         structure: normalizeName(row.structure || "village"),
+        dimension: normalizeDimensionName(row.dimension, defaultDimensionForStructure(row.structure || "village")),
         mode: row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict",
         within: {
           anchor: row.anchor.trim() || "origin",
@@ -1859,6 +1985,7 @@ function buildBuilderQuery(): unknown {
     .filter((row) => row.allowed.trim())
     .map((row, index) => ({
       point: row.point.trim() || "origin",
+      dimension: normalizeDimensionName(row.dimension),
       y: parseNumberText(row.y, `biome row ${index + 1} y`),
       radius: parseNumberText(row.radius, `biome row ${index + 1} radius`, 0),
       allowed: row.allowed.split(",").map(normalizeName).filter(Boolean)
@@ -1954,7 +2081,7 @@ function parseFoundClauses(expr: string, constraints: ScriptConstraint[]): Found
 
 function compileQueryScript(text: string): ScriptCompileResult {
   const constraints: ScriptConstraint[] = [];
-  const biome_filters: Array<{ point: string; y: number; radius: number; allowed: string[] }> = [];
+  const biome_filters: Array<{ point: string; dimension: string; y: number; radius: number; allowed: string[] }> = [];
   const loot_filters: Array<{ constraint: string; structure: string; required: Record<string, number> }> = [];
   const controlOps: ControlOp[] = [];
   const scan: ScriptScanOverrides = {};
@@ -2055,9 +2182,10 @@ function compileQueryScript(text: string): ScriptCompileResult {
             bodyIndex += 1;
             continue;
           }
-          const findMatch = bodyLine.match(/^find\s+(\S+)\s+as\s+(\S+)\s+within\s+(\d+)\s+of\s+(\S+)(?:\s+(strict|placement|mixed))?(?:\s+(optional))?$/iu);
+          const findMatch = bodyLine.match(/^find\s+(\S+)(?:\s+in\s+(\S+))?\s+as\s+(\S+)\s+within\s+(\d+)\s+of\s+(\S+)(?:\s+(strict|placement|mixed))?(?:\s+(optional))?$/iu);
           if (findMatch) {
-            const id = normalizeId(findMatch[2]);
+            const structure = normalizeName(findMatch[1]);
+            const id = normalizeId(findMatch[3]);
             if (seen.has(id)) {
               scriptError(bodyLineNo, `Duplicate rule id "${id}".`);
             }
@@ -2065,14 +2193,15 @@ function compileQueryScript(text: string): ScriptCompileResult {
               scriptError(bodyLineNo, `Too many tracked finds; max 31 when using if-found.`);
             }
             seen.add(id);
-            const mode = findMatch[5]?.toLowerCase();
+            const mode = findMatch[6]?.toLowerCase();
             constraints.push({
               id,
-              structure: normalizeName(findMatch[1]),
+              structure,
+              dimension: normalizeDimensionName(findMatch[2], defaultDimensionForStructure(structure)),
               mode: mode === "placement" || mode === "mixed" ? mode : "strict",
               within: {
-                anchor: findMatch[4],
-                radius: parseNumberText(findMatch[3], `radius for ${id}`, 1)
+                anchor: findMatch[5],
+                radius: parseNumberText(findMatch[4], `radius for ${id}`, 1)
               },
               required: false,
               track_found: false
@@ -2362,38 +2491,41 @@ function compileQueryScript(text: string): ScriptCompileResult {
       continue;
     }
 
-    match = line.match(/^find\s+(\S+)\s+as\s+(\S+)\s+within\s+(\d+)\s+of\s+(\S+)(?:\s+(strict|placement|mixed))?(?:\s+(optional))?$/iu);
+    match = line.match(/^find\s+(\S+)(?:\s+in\s+(\S+))?\s+as\s+(\S+)\s+within\s+(\d+)\s+of\s+(\S+)(?:\s+(strict|placement|mixed))?(?:\s+(optional))?$/iu);
     if (match) {
-      const id = normalizeId(match[2]);
+      const structure = normalizeName(match[1]);
+      const id = normalizeId(match[3]);
       if (seen.has(id)) {
         scriptError(lineNo, `Duplicate rule id "${id}".`);
       }
       seen.add(id);
-      const mode = match[5]?.toLowerCase();
+      const mode = match[6]?.toLowerCase();
       constraints.push({
         id,
-        structure: normalizeName(match[1]),
+        structure,
+        dimension: normalizeDimensionName(match[2], defaultDimensionForStructure(structure)),
         mode: mode === "placement" || mode === "mixed" ? mode : "strict",
         within: {
-          anchor: match[4],
-          radius: parseNumberText(match[3], `radius for ${id}`, 1)
+          anchor: match[5],
+          radius: parseNumberText(match[4], `radius for ${id}`, 1)
         },
-        required: !match[6],
+        required: !match[7],
         track_found: false
       });
       continue;
     }
 
-    match = line.match(/^biome\s+(\S+)\s+y\s+(-?\d+)\s+radius\s+(\d+)\s+allow\s+(.+)$/iu);
+    match = line.match(/^biome\s+(\S+)(?:\s+in\s+(\S+))?\s+y\s+(-?\d+)\s+radius\s+(\d+)\s+allow\s+(.+)$/iu);
     if (match) {
-      const allowed = match[4].split(/[,\s]+/u).map(normalizeName).filter(Boolean);
+      const allowed = match[5].split(/[,\s]+/u).map(normalizeName).filter(Boolean);
       if (allowed.length === 0) {
         scriptError(lineNo, "Biome filter needs at least one allowed biome.");
       }
       biome_filters.push({
         point: match[1],
-        y: parseNumberText(match[2], "biome y"),
-        radius: parseNumberText(match[3], "biome radius", 0),
+        dimension: normalizeDimensionName(match[2]),
+        y: parseNumberText(match[3], "biome y"),
+        radius: parseNumberText(match[4], "biome radius", 0),
         allowed
       });
       continue;
@@ -2409,7 +2541,7 @@ function compileQueryScript(text: string): ScriptCompileResult {
       continue;
     }
 
-    scriptError(lineNo, `Unknown command "${line}". Try: find village as v1 within 64 of origin strict`);
+    scriptError(lineNo, `Unknown command "${line}". Try: find village in overworld as v1 within 64 of origin strict`);
   }
 
   if (!stopped && inPerformance) {
@@ -2460,8 +2592,8 @@ function buildArgs(overrides: ScriptScanOverrides = {}, query?: { loot_filters?:
   }
 
   const count = parseBigIntText(settings.count, "count", 1n);
-  if (count > (1n << 48n)) {
-    throw new Error("count cannot exceed the full lower48 domain.");
+  if (count > ((1n << 64n) - 1n)) {
+    throw new Error("count cannot exceed 18446744073709551615 seeds.");
   }
   args.push("--count", count.toString());
   const scanMode = parseChoice(settings.scanMode, ["placement", "strict", "mixed"] as const, "scan mode");
@@ -2547,11 +2679,11 @@ function scriptFromBuilder(): string {
     const structureVar = `${id}_structure`;
     lines.push(`let ${structureVar} = ${normalizeName(row.structure || "village")}`);
     lines.push(`let ${radiusVar} = ${row.radius || "64"}`);
-    lines.push(`find $${structureVar} as ${id} within $${radiusVar} of ${row.anchor || "origin"} ${row.mode || "strict"}`);
+    lines.push(`find $${structureVar} in ${row.dimension || defaultDimensionForStructure(row.structure)} as ${id} within $${radiusVar} of ${row.anchor || "origin"} ${row.mode || "strict"}`);
   }
 
   for (const row of state.biomes.filter((entry) => entry.allowed.trim())) {
-    lines.push(`biome ${row.point || "origin"} y ${row.y || "64"} radius ${row.radius || "0"} allow ${row.allowed}`);
+    lines.push(`biome ${row.point || "origin"} in ${row.dimension || "overworld"} y ${row.y || "64"} radius ${row.radius || "0"} allow ${row.allowed}`);
   }
 
   for (const row of state.loot.filter((entry) => entry.constraint.trim() || entry.required.trim())) {
@@ -2616,16 +2748,26 @@ function syncControlsFromState(): void {
 function renderConstraints(): void {
   const anchors = currentConstraintAnchors();
   $("#constraints-body").innerHTML = state.constraints
-    .map((row, index) => `
-      <div class="grid-row constraint-row">
-        <input data-collection="constraints" data-index="${index}" data-field="id" value="${escapeHtml(row.id)}" />
-        ${dropdownControl(structures, row.structure, { "data-collection": "constraints", "data-index": String(index), "data-field": "structure" })}
-        ${dropdownControl(anchors, row.anchor, { "data-collection": "constraints", "data-index": String(index), "data-field": "anchor" })}
-        <input data-collection="constraints" data-index="${index}" data-field="radius" value="${escapeHtml(row.radius)}" />
-        ${dropdownControl(["strict", "placement", "mixed"], row.mode, { "data-collection": "constraints", "data-index": String(index), "data-field": "mode" })}
-        <button class="icon-button row-action" data-action="remove-constraint" data-index="${index}" title="Remove constraint"><i data-lucide="trash-2"></i></button>
-      </div>
-    `)
+    .map((row, index) => {
+      const dimension = row.dimension || defaultDimensionForStructure(row.structure);
+      const visibleStructures = structuresForDimension(dimension);
+      return `
+        <div class="grid-row constraint-row">
+          <input data-collection="constraints" data-index="${index}" data-field="id" value="${escapeHtml(row.id)}" />
+          ${dropdownControl(
+            visibleStructures,
+            row.structure,
+            { "data-collection": "constraints", "data-index": String(index), "data-field": "structure" },
+            { "data-searchable": "true", "data-search-placeholder": `Search ${dimension} structures` }
+          )}
+          ${dropdownControl(dimensions, dimension, { "data-collection": "constraints", "data-index": String(index), "data-field": "dimension" })}
+          ${dropdownControl(anchors, row.anchor, { "data-collection": "constraints", "data-index": String(index), "data-field": "anchor" })}
+          <input data-collection="constraints" data-index="${index}" data-field="radius" value="${escapeHtml(row.radius)}" />
+          ${dropdownControl(["strict", "placement", "mixed"], row.mode, { "data-collection": "constraints", "data-index": String(index), "data-field": "mode" })}
+          <button class="icon-button row-action" data-action="remove-constraint" data-index="${index}" title="Remove constraint"><i data-lucide="trash-2"></i></button>
+        </div>
+      `;
+    })
     .join("");
 }
 
@@ -2634,9 +2776,10 @@ function renderBiomes(): void {
     .map((row, index) => `
       <div class="grid-row biome-row">
         <input data-collection="biomes" data-index="${index}" data-field="point" value="${escapeHtml(row.point)}" />
+        ${dropdownControl(dimensions, row.dimension || "overworld", { "data-collection": "biomes", "data-index": String(index), "data-field": "dimension" })}
         <input data-collection="biomes" data-index="${index}" data-field="y" value="${escapeHtml(row.y)}" />
         <input data-collection="biomes" data-index="${index}" data-field="radius" value="${escapeHtml(row.radius)}" />
-        <input data-collection="biomes" data-index="${index}" data-field="allowed" value="${escapeHtml(row.allowed)}" placeholder="plains,cherry_grove" />
+        <input data-collection="biomes" data-index="${index}" data-field="allowed" value="${escapeHtml(row.allowed)}" placeholder="plains,soul_sand_valley,end_highlands" />
         <button class="icon-button row-action" data-action="remove-biome" data-index="${index}" title="Remove biome filter"><i data-lucide="trash-2"></i></button>
       </div>
     `)
@@ -3051,6 +3194,23 @@ function updateCollection(target: HTMLInputElement): void {
   const value = target.value;
   if (collection === "constraints" && state.constraints[index]) {
     (state.constraints[index] as unknown as Record<string, string>)[field] = value;
+    if (field === "structure") {
+      state.constraints[index].dimension = defaultDimensionForStructure(value);
+      renderConstraints();
+      refreshIcons();
+      syncDropdowns();
+    }
+    if (field === "dimension") {
+      const dimension = normalizeDimensionName(value);
+      state.constraints[index].dimension = dimension;
+      const allowed = structuresForDimension(dimension);
+      if (!allowed.includes(state.constraints[index].structure)) {
+        state.constraints[index].structure = allowed[0] ?? state.constraints[index].structure;
+      }
+      renderConstraints();
+      refreshIcons();
+      syncDropdowns();
+    }
     if (field === "id") {
       renderConstraints();
       renderLoot();
@@ -3068,8 +3228,8 @@ function applyScriptToBuilder(): void {
   const compiled = compileQueryScript(queryEditorText());
   const raw = compiled.query as {
     anchor?: { type?: string };
-    constraints?: Array<{ id?: string; structure?: string; mode?: string; within?: { anchor?: string; radius?: number } | number }>;
-    biome_filters?: Array<{ point?: string; y?: number; radius?: number; allowed?: string[] | string }>;
+    constraints?: Array<{ id?: string; structure?: string; dimension?: string; mode?: string; within?: { anchor?: string; radius?: number } | number }>;
+    biome_filters?: Array<{ point?: string; dimension?: string; y?: number; radius?: number; allowed?: string[] | string }>;
     loot_filters?: Array<{ constraint?: string; source?: string; structure?: string; required?: Record<string, number> | string[] | string }>;
     performance?: Record<string, unknown>;
   };
@@ -3080,6 +3240,7 @@ function applyScriptToBuilder(): void {
         return {
           id: String(row.id ?? `c${index + 1}`),
           structure: String(row.structure ?? "village"),
+          dimension: normalizeDimensionName(row.dimension, defaultDimensionForStructure(String(row.structure ?? "village"))),
           anchor: String(within.anchor ?? "origin"),
           radius: String(within.radius ?? 64),
           mode: row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict"
@@ -3090,6 +3251,7 @@ function applyScriptToBuilder(): void {
   state.biomes = Array.isArray(raw.biome_filters)
     ? raw.biome_filters.map((row) => ({
         point: String(row.point ?? "origin"),
+        dimension: normalizeDimensionName(row.dimension),
         y: String(row.y ?? 64),
         radius: String(row.radius ?? 0),
         allowed: Array.isArray(row.allowed) ? row.allowed.join(",") : String(row.allowed ?? "")
@@ -3139,14 +3301,14 @@ function applyMaxPerformanceSettings(): void {
 function applyPreset(name: "starter" | "trial" | "ancient" | "max-performance" | "smart-mode"): void {
   if (name === "starter") {
     state.constraints = [
-      { id: "v1", structure: "village", anchor: "origin", radius: "96", mode: "strict" },
-      { id: "rp1", structure: "ruined_portal", anchor: "constraint:v1", radius: "80", mode: "strict" }
+      { id: "v1", structure: "village", dimension: "overworld", anchor: "origin", radius: "96", mode: "strict" },
+      { id: "rp1", structure: "ruined_portal", dimension: "overworld", anchor: "constraint:v1", radius: "80", mode: "strict" }
     ];
   } else if (name === "trial") {
-    state.constraints = [{ id: "tc1", structure: "trial_chambers", anchor: "origin", radius: "256", mode: "placement" }];
+    state.constraints = [{ id: "tc1", structure: "trial_chambers", dimension: "overworld", anchor: "origin", radius: "256", mode: "placement" }];
   } else if (name === "ancient") {
-    state.constraints = [{ id: "ac1", structure: "ancient_city", anchor: "origin", radius: "512", mode: "strict" }];
-    state.biomes = [{ point: "origin", y: "80", radius: "128", allowed: "cherry_grove,meadow" }];
+    state.constraints = [{ id: "ac1", structure: "ancient_city", dimension: "overworld", anchor: "origin", radius: "512", mode: "strict" }];
+    state.biomes = [{ point: "origin", dimension: "overworld", y: "80", radius: "128", allowed: "cherry_grove,meadow" }];
   } else if (name === "max-performance") {
     applyMaxPerformanceSettings();
   } else if (name === "smart-mode") {
@@ -3280,13 +3442,13 @@ document.addEventListener("click", async (event) => {
   const action = button.dataset.action;
   try {
     if (action === "add-constraint") {
-      state.constraints.push({ id: `c${state.constraints.length + 1}`, structure: "village", anchor: "origin", radius: "64", mode: "strict" });
+      state.constraints.push({ id: `c${state.constraints.length + 1}`, structure: "village", dimension: "overworld", anchor: "origin", radius: "64", mode: "strict" });
       renderAll();
     } else if (action === "remove-constraint") {
       state.constraints.splice(Number(button.dataset.index), 1);
       renderAll();
     } else if (action === "add-biome") {
-      state.biomes.push({ point: "origin", y: "64", radius: "0", allowed: "plains" });
+      state.biomes.push({ point: "origin", dimension: "overworld", y: "64", radius: "0", allowed: "plains" });
       renderAll();
     } else if (action === "remove-biome") {
       state.biomes.splice(Number(button.dataset.index), 1);

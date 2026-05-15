@@ -39,6 +39,7 @@ enum StructureType
     End_Island,
     Trail_Ruins,
     Trial_Chambers,
+    Nether_Fossil,
     FEATURE_NUM
 };
 
