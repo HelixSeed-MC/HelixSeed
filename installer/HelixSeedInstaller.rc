@@ -1,7 +1,9 @@
 #include <windows.h>
 
-#define HELIXSEED_INSTALLER_VERSION 0,1,0,0
-#define HELIXSEED_INSTALLER_VERSION_STR "0.1.0.0"
+#define IDI_APP_ICON 101
+
+#define HELIXSEED_INSTALLER_VERSION 0,1,1,0
+#define HELIXSEED_INSTALLER_VERSION_STR "0.1.1.0"
 
 IDI_APP_ICON ICON "..\\ui-ts\\build\\icon.ico"
 

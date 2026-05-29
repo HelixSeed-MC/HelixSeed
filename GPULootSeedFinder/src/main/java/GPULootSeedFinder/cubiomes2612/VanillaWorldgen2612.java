@@ -61,15 +61,9 @@ public final class VanillaWorldgen2612 {
         Pattern.DOTALL
     );
     private static final Pattern JSON_STRING = Pattern.compile("\"((?:\\\\.|[^\"\\\\])*)\"");
-    private static final Path DEFAULT_DATA_ROOT = Path.of(
-        "C:",
-        "Users",
-        "David",
-        "Downloads",
-        "minecraft-26.1.2-decompiled-nicest",
-        "data",
-        "minecraft"
-    );
+    private static final String DECOMPILED_ROOT_PROPERTY = "helixseed.minecraft2612.decompiled";
+    private static final String DECOMPILED_ROOT_ENV = "HELIXSEED_MINECRAFT_2612_DECOMPILED";
+    private static final String DEFAULT_DECOMPILED_DIR = "Minecraft-Decompiled-26.1.2";
 
     private static volatile VanillaWorldgen2612 instance;
 
@@ -148,7 +142,7 @@ public final class VanillaWorldgen2612 {
         try {
             return get().validate(structure, seed, blockX, blockZ);
         } catch (ClassNotFoundException ex) {
-            return Result.skip("Minecraft 26.1.2 classes are not on the Java runtime classpath.");
+            return Result.skip("Minecraft 26.1.1 / 26.1.2 classes are not on the Java runtime classpath.");
         } catch (Throwable ex) {
             Throwable root = ex instanceof InvocationTargetException && ex.getCause() != null ? ex.getCause() : ex;
             return Result.skip(root.getClass().getSimpleName() + ": " + String.valueOf(root.getMessage()));
@@ -427,11 +421,11 @@ public final class VanillaWorldgen2612 {
     }
 
     private static Path resolveDataRoot() {
-        String configured = System.getProperty("helixseed.minecraft2612.decompiled");
+        String configured = System.getProperty(DECOMPILED_ROOT_PROPERTY);
         if (configured == null || configured.isBlank()) {
-            configured = System.getenv("HELIXSEED_MINECRAFT_2612_DECOMPILED");
+            configured = System.getenv(DECOMPILED_ROOT_ENV);
         }
-        Path root = configured == null || configured.isBlank() ? DEFAULT_DATA_ROOT.getParent().getParent() : Path.of(configured);
+        Path root = configured == null || configured.isBlank() ? defaultDecompiledRoot() : Path.of(configured);
         Path data = root.resolve("data").resolve("minecraft");
         if (Files.isDirectory(data)) {
             return data;
@@ -439,7 +433,18 @@ public final class VanillaWorldgen2612 {
         if (Files.isDirectory(root.resolve("worldgen"))) {
             return root;
         }
-        return DEFAULT_DATA_ROOT;
+        return defaultDecompiledRoot().resolve("resources").resolve("data").resolve("minecraft");
+    }
+
+    private static Path defaultDecompiledRoot() {
+        String home = System.getProperty("user.home");
+        if (home != null && !home.isBlank()) {
+            Path desktopCopy = Path.of(home, "Desktop", DEFAULT_DECOMPILED_DIR);
+            if (Files.isDirectory(desktopCopy)) {
+                return desktopCopy;
+            }
+        }
+        return Path.of(DEFAULT_DECOMPILED_DIR);
     }
 
     private static List<String> mappedStructureIds(String structure) {

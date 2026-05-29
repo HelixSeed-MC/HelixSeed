@@ -3,10 +3,16 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%" || goto fail
 
+REM Try vswhere first
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" goto no_vswhere
+if exist "%VSWHERE%" (
+    for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
+)
 
-for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
+REM If vswhere didn't find it, allow an explicit local override.
+if "%VSROOT%"=="" (
+    set "VSROOT=%HELIXSEED_VSROOT%"
+)
 if "%VSROOT%"=="" goto no_vsroot
 
 set "VCVARS=%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"

@@ -7,17 +7,22 @@ source.
 
 1. Detects the toolchain it needs (`git`, `npm`, `cl`, `nvcc`, `javac`, optionally `mvn`).
 2. Asks where to install (defaults to `%LOCALAPPDATA%\HelixSeed`).
-3. `git clone --depth=1 https://github.com/HelixSeed-MC/HelixSeed`.
-4. Runs the build pipeline in order:
+3. Installs missing required tools with winget: Git, Node.js/npm, Visual Studio
+   Build Tools, CUDA Toolkit, and Microsoft OpenJDK.
+4. `git clone --depth=1 https://github.com/HelixSeed-MC/HelixSeed`.
+5. Runs the build pipeline in order:
    - `cuda\build_cuda.bat` - CUDA prefilter (`gpu_filter.dll`)
    - `native\build_scanner_core.bat` - native scanner (`scanner_native.exe`)
-   - `cubiomes_12111_fork\build_windows.bat` - native cubiomes library (`lib.dll`)
-   - `GPULootSeedFinder` via `mvn.cmd`, or the bundled `mvnw.cmd` if Maven is absent
+   - `cubiomes_26.1.2_fork\build_windows.bat` - native cubiomes library (`lib.dll`)
+   - `GPULootSeedFinder` via system Maven, bundled Maven, or the Maven wrapper
    - `npm install` and `npm run dist:win` in `ui-ts`
-5. Reports the path of the packaged `HelixSeed.exe` and offers to launch it.
+6. Reports the path of the packaged `HelixSeed.exe` and offers to launch it.
 
 The installer never silently installs toolchains for you. If a prerequisite is
-missing, it points you at the upstream installer URL and exits.
+missing, its button opens a winget install command in a console so the user can
+see what is happening. Maven is the exception: `installer.zip` includes
+`tools\apache-maven-*-bin.zip`, and the installer extracts that copy locally
+when system Maven is absent.
 
 ## Building the installer
 
@@ -71,10 +76,25 @@ end.
 | MSVC | Compile native code | Visual Studio Build Tools |
 | CUDA | Compile the GPU prefilter | https://developer.nvidia.com/cuda-toolkit |
 | JDK 16+ | Build/run loot and Java validation | https://learn.microsoft.com/java/openjdk/download |
-| Maven | Optional; `mvnw.cmd` is used if absent | https://maven.apache.org/ |
+| Maven | Bundled in `installer.zip`; system Maven can also be used | https://maven.apache.org/ |
 
 The installer can discover Visual Studio Build Tools through `vswhere`, so it
-does not need to be launched from a Developer Command Prompt.
+does not need to be launched from a Developer Command Prompt. If Build Tools
+were installed in a custom location, set `HELIXSEED_VSROOT` to that installation
+root before building the installer.
+
+## Release Zip Layout
+
+`installer.zip` should contain:
+
+```text
+HelixSeedInstaller.exe
+tools/
+  apache-maven-<version>-bin.zip
+```
+
+All other missing required build tools are installed through winget from the
+installer UI.
 
 ## Why a custom installer?
 

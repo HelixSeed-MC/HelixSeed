@@ -25,7 +25,7 @@ function scannerPath(root = appRoot()): string {
 }
 
 function cubiomesPath(root = appRoot()): string {
-  return path.join(root, "cubiomes_12111_fork", "lib", isWindows ? "lib.dll" : "lib.so");
+  return path.join(root, "cubiomes_26.1.2_fork", "lib", isWindows ? "lib.dll" : "lib.so");
 }
 
 function iconPath(root = appRoot()): string | undefined {
@@ -118,7 +118,7 @@ function createWindow(): void {
       preload: path.join(__dirname, "..", "preload", "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     }
   });
 
@@ -181,8 +181,11 @@ ipcMain.handle("app:get-context", (): AppContext => {
   };
 });
 
-ipcMain.handle("app:open-path", async (_event, targetPath: string): Promise<void> => {
-  await shell.openPath(targetPath);
+ipcMain.handle("app:open-path", async (): Promise<void> => {
+  // Always opens the application root, never a renderer-supplied path. shell.openPath
+  // hands its target to the OS shell, which on Windows will *launch* executables/scripts.
+  // Accepting an arbitrary path here would turn any renderer-side injection into RCE.
+  await shell.openPath(appRoot());
 });
 
 ipcMain.handle("app:open-external", async (_event, url: string): Promise<void> => {
@@ -259,8 +262,14 @@ ipcMain.handle("scan:start", async (_event, request: ScanStartRequest): Promise<
   };
 });
 
+const CONTROL_COMMANDS = new Set(["pause", "resume", "terminal_on", "terminal_off", "snapshot"]);
+
 ipcMain.handle("scan:control", (_event, command: "pause" | "resume" | "terminal_on" | "terminal_off" | "snapshot"): boolean => {
   if (!activeProcess || activeProcess.killed) {
+    return false;
+  }
+  // Never forward an unvalidated string to the child's stdin control channel.
+  if (typeof command !== "string" || !CONTROL_COMMANDS.has(command)) {
     return false;
   }
   activeProcess.stdin.write(`${command}\n`);
@@ -278,6 +287,32 @@ ipcMain.handle("scan:stop", (): boolean => {
     }
   }, 3000);
   return true;
+});
+
+// Harden every web contents: a renderer (or anything injected into one) must never be
+// able to navigate the IPC-privileged window away from our bundled content or spawn an
+// uncontrolled child window. External http(s) links are handed to the system browser;
+// all other navigations/window.open requests and any <webview> attach are denied.
+app.on("web-contents-created", (_event, contents) => {
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//iu.test(url)) {
+      void shell.openExternal(url);
+    }
+    return { action: "deny" };
+  });
+  contents.on("will-navigate", (event, url) => {
+    const devServer = process.env.VITE_DEV_SERVER_URL;
+    if (devServer && url.startsWith(devServer)) {
+      return;
+    }
+    event.preventDefault();
+    if (/^https?:\/\//iu.test(url)) {
+      void shell.openExternal(url);
+    }
+  });
+  contents.on("will-attach-webview", (event) => {
+    event.preventDefault();
+  });
 });
 
 app.whenReady().then(() => {

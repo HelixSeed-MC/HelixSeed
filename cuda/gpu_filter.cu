@@ -21,12 +21,14 @@ constexpr int CHUNK_SIZE = 16;
 
 constexpr uint32_t SPREAD_LINEAR = 0;
 constexpr uint32_t SPREAD_TRIANGULAR = 1;
+constexpr uint32_t SPREAD_BURIED_TREASURE = 2;
 
 constexpr int THREADS_PER_BLOCK = 256;
 // Each thread processes SEEDS_PER_THREAD seeds in 4-way ILP. Bigger launches
 // amortize host-launch overhead and let the GPU run thousands of blocks per SM.
 constexpr int SEEDS_PER_THREAD = 4;
 constexpr uint64_t MAX_SEEDS_PER_LAUNCH = 64ULL * 1024ULL * 1024ULL;
+constexpr uint32_t MAX_ASYNC_SLOTS = 8U;
 constexpr int MAX_CONST_REGIONS = 2048;
 constexpr uint32_t MAX_QUAD_CHECK_POINTS = 128U;
 
@@ -209,6 +211,13 @@ __device__ __forceinline__ uint32_t next_int_exact(uint64_t &state, uint32_t bou
     return val;
 }
 
+__device__ __forceinline__ bool buried_treasure_frequency_pass(uint64_t seed48, const RegionTerm &term) {
+    uint64_t state = ((seed48 + term.add_term_mod48) ^ JAVA_MULT) & JAVA_MASK;
+    state = lcg_step(state);
+    const uint32_t bits24 = static_cast<uint32_t>(state >> 24U);
+    return bits24 < 167773U;
+}
+
 __device__ __forceinline__ bool region_hit_exact(
     const RegionTerm &term,
     uint64_t seed48,
@@ -217,6 +226,27 @@ __device__ __forceinline__ bool region_hit_exact(
     uint64_t radius_sq,
     int32_t *out_x = nullptr,
     int32_t *out_z = nullptr) {
+    if (term.spread_type == SPREAD_BURIED_TREASURE) {
+        if (!buried_treasure_frequency_pass(seed48, term)) {
+            return false;
+        }
+        const int64_t bx = static_cast<int64_t>(term.base_block_x);
+        const int64_t bz = static_cast<int64_t>(term.base_block_z);
+        const int64_t dx = bx - static_cast<int64_t>(anchor_x);
+        const int64_t dz = bz - static_cast<int64_t>(anchor_z);
+        const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
+        if (d2 > radius_sq) {
+            return false;
+        }
+        if (out_x != nullptr) {
+            *out_x = static_cast<int32_t>(bx);
+        }
+        if (out_z != nullptr) {
+            *out_z = static_cast<int32_t>(bz);
+        }
+        return true;
+    }
+
     uint64_t state = ((seed48 + term.add_term_mod48) ^ JAVA_MULT) & JAVA_MASK;
     const uint32_t bound = term.bound;
     if (bound == 0U) {
@@ -266,11 +296,15 @@ __device__ __forceinline__ bool gate_pass(uint64_t seed48, uint32_t gate_div, ui
     if (gate_div <= 1U) {
         return true;
     }
-    const uint64_t mixed = seed48 + (static_cast<uint64_t>(gate_salt) & JAVA_MASK);
+    uint32_t shift = (gate_salt >> 24U) & 63U;
     if (is_pow2_u32(gate_div)) {
-        return (mixed & (static_cast<uint64_t>(gate_div) - 1ULL)) == 0ULL;
+        const uint64_t mask = static_cast<uint64_t>(gate_div) - 1ULL;
+        return ((seed48 >> shift) & mask) == (static_cast<uint64_t>(gate_salt) & mask);
     }
-    return (mixed % gate_div) == 0ULL;
+    if (shift > 47U) {
+        shift %= 48U;
+    }
+    return ((seed48 >> shift) % gate_div) == (gate_salt % gate_div);
 }
 
 __device__ __forceinline__ bool region_hit(
@@ -281,6 +315,27 @@ __device__ __forceinline__ bool region_hit(
     uint64_t radius_sq,
     int32_t *out_x = nullptr,
     int32_t *out_z = nullptr) {
+    if (term.spread_type == SPREAD_BURIED_TREASURE) {
+        if (!buried_treasure_frequency_pass(seed48, term)) {
+            return false;
+        }
+        const int64_t bx = static_cast<int64_t>(term.base_block_x);
+        const int64_t bz = static_cast<int64_t>(term.base_block_z);
+        const int64_t dx = bx - static_cast<int64_t>(anchor_x);
+        const int64_t dz = bz - static_cast<int64_t>(anchor_z);
+        const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
+        if (d2 > radius_sq) {
+            return false;
+        }
+        if (out_x != nullptr) {
+            *out_x = static_cast<int32_t>(bx);
+        }
+        if (out_z != nullptr) {
+            *out_z = static_cast<int32_t>(bz);
+        }
+        return true;
+    }
+
     uint64_t state = ((seed48 + term.add_term_mod48) ^ JAVA_MULT) & JAVA_MASK;
     const bool use_fast = term.use_fast_next_int != 0U;
     const uint32_t bound = term.bound;
@@ -398,6 +453,92 @@ __device__ __forceinline__ void next_int_exact_n(
     }
 }
 
+template<int N, uint32_t BOUND>
+__device__ __forceinline__ void next_int_exact_bound_n(
+    uint64_t (&state)[N], uint32_t (&out)[N]) {
+    static_assert(BOUND > 0U, "Java nextInt bound must be positive");
+    lcg_step_n<N>(state);
+    if constexpr ((BOUND & (BOUND - 1U)) == 0U) {
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            out[i] = static_cast<uint32_t>((static_cast<uint64_t>(BOUND) * (state[i] >> 17)) >> 31);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            uint32_t bits = static_cast<uint32_t>(state[i] >> 17);
+            uint32_t val = bits % BOUND;
+            while ((bits - val + (BOUND - 1U)) >= INT32_SIGN) {
+                state[i] = (state[i] * JAVA_MULT + JAVA_ADD) & JAVA_MASK;
+                bits = static_cast<uint32_t>(state[i] >> 17);
+                val = bits % BOUND;
+            }
+            out[i] = val;
+        }
+    }
+}
+
+template<int N, uint32_t BOUND>
+__device__ __forceinline__ void region_offsets_bound_n(
+    const RegionTerm &term,
+    const uint64_t (&seed48)[N],
+    uint32_t (&off_x)[N],
+    uint32_t (&off_z)[N]) {
+    const uint64_t add = term.add_term_mod48;
+    uint64_t state[N];
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        state[i] = ((seed48[i] + add) ^ JAVA_MULT) & JAVA_MASK;
+    }
+
+    if (term.spread_type == SPREAD_TRIANGULAR) {
+        uint32_t x1[N], x2[N], z1[N], z2[N];
+        next_int_exact_bound_n<N, BOUND>(state, x1);
+        next_int_exact_bound_n<N, BOUND>(state, x2);
+        next_int_exact_bound_n<N, BOUND>(state, z1);
+        next_int_exact_bound_n<N, BOUND>(state, z2);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            off_x[i] = (x1[i] + x2[i]) >> 1;
+            off_z[i] = (z1[i] + z2[i]) >> 1;
+        }
+    } else {
+        next_int_exact_bound_n<N, BOUND>(state, off_x);
+        next_int_exact_bound_n<N, BOUND>(state, off_z);
+    }
+}
+
+template<int N>
+__device__ __forceinline__ bool try_region_offsets_common_bound_n(
+    const RegionTerm &term,
+    const uint64_t (&seed48)[N],
+    uint32_t (&off_x)[N],
+    uint32_t (&off_z)[N]) {
+    switch (term.bound) {
+    case 1U:  region_offsets_bound_n<N, 1U>(term, seed48, off_x, off_z); return true;
+    case 8U:  region_offsets_bound_n<N, 8U>(term, seed48, off_x, off_z); return true;
+    case 9U:  region_offsets_bound_n<N, 9U>(term, seed48, off_x, off_z); return true;
+    case 10U: region_offsets_bound_n<N, 10U>(term, seed48, off_x, off_z); return true;
+    case 12U: region_offsets_bound_n<N, 12U>(term, seed48, off_x, off_z); return true;
+    case 16U: region_offsets_bound_n<N, 16U>(term, seed48, off_x, off_z); return true;
+    case 20U: region_offsets_bound_n<N, 20U>(term, seed48, off_x, off_z); return true;
+    case 22U: region_offsets_bound_n<N, 22U>(term, seed48, off_x, off_z); return true;
+    case 23U: region_offsets_bound_n<N, 23U>(term, seed48, off_x, off_z); return true;
+    case 24U: region_offsets_bound_n<N, 24U>(term, seed48, off_x, off_z); return true;
+    case 25U: region_offsets_bound_n<N, 25U>(term, seed48, off_x, off_z); return true;
+    case 26U: region_offsets_bound_n<N, 26U>(term, seed48, off_x, off_z); return true;
+    case 27U: region_offsets_bound_n<N, 27U>(term, seed48, off_x, off_z); return true;
+    case 28U: region_offsets_bound_n<N, 28U>(term, seed48, off_x, off_z); return true;
+    case 30U: region_offsets_bound_n<N, 30U>(term, seed48, off_x, off_z); return true;
+    case 32U: region_offsets_bound_n<N, 32U>(term, seed48, off_x, off_z); return true;
+    case 40U: region_offsets_bound_n<N, 40U>(term, seed48, off_x, off_z); return true;
+    case 48U: region_offsets_bound_n<N, 48U>(term, seed48, off_x, off_z); return true;
+    case 60U: region_offsets_bound_n<N, 60U>(term, seed48, off_x, off_z); return true;
+    default:
+        return false;
+    }
+}
+
 template<int N>
 __device__ __forceinline__ void region_offsets_n(
     const RegionTerm &term,
@@ -405,6 +546,9 @@ __device__ __forceinline__ void region_offsets_n(
     uint32_t (&off_x)[N],
     uint32_t (&off_z)[N]) {
     const uint32_t bound = term.bound;
+    if (try_region_offsets_common_bound_n<N>(term, seed48, off_x, off_z)) {
+        return;
+    }
     const bool pow2 = is_pow2_u32(bound);
     const uint64_t add = term.add_term_mod48;
 
@@ -439,6 +583,20 @@ __device__ __forceinline__ void region_hit_n(
     int32_t anchor_z,
     uint64_t radius_sq,
     bool (&hit)[N]) {
+    if (term.spread_type == SPREAD_BURIED_TREASURE) {
+        const int64_t bx = static_cast<int64_t>(term.base_block_x);
+        const int64_t bz = static_cast<int64_t>(term.base_block_z);
+        const int64_t dx = bx - static_cast<int64_t>(anchor_x);
+        const int64_t dz = bz - static_cast<int64_t>(anchor_z);
+        const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
+        const bool in_radius = d2 <= radius_sq;
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            hit[i] = in_radius && buried_treasure_frequency_pass(seed48[i], term);
+        }
+        return;
+    }
+
     if (term.bound == 0U) {
         #pragma unroll
         for (int i = 0; i < N; ++i) {
@@ -469,6 +627,22 @@ __device__ __forceinline__ void region_hit_n_with_pos(
     bool (&hit)[N],
     int32_t (&out_x)[N],
     int32_t (&out_z)[N]) {
+    if (term.spread_type == SPREAD_BURIED_TREASURE) {
+        const int64_t bx = static_cast<int64_t>(term.base_block_x);
+        const int64_t bz = static_cast<int64_t>(term.base_block_z);
+        const int64_t dx = bx - static_cast<int64_t>(anchor_x);
+        const int64_t dz = bz - static_cast<int64_t>(anchor_z);
+        const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
+        const bool in_radius = d2 <= radius_sq;
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            hit[i] = in_radius && buried_treasure_frequency_pass(seed48[i], term);
+            out_x[i] = static_cast<int32_t>(bx);
+            out_z[i] = static_cast<int32_t>(bz);
+        }
+        return;
+    }
+
     if (term.bound == 0U) {
         #pragma unroll
         for (int i = 0; i < N; ++i) {
@@ -500,12 +674,19 @@ __device__ __forceinline__ void gate_pass_n(
         return;
     }
     const bool pow2 = is_pow2_u32(gate_div);
-    const uint64_t mask = static_cast<uint64_t>(gate_div) - 1ULL;
-    const uint64_t add = static_cast<uint64_t>(gate_salt) & JAVA_MASK;
+    uint32_t shift = (gate_salt >> 24U) & 63U;
+    uint64_t mask = static_cast<uint64_t>(gate_div) - 1ULL;
+    uint64_t target = static_cast<uint64_t>(gate_salt) & mask;
+    if (!pow2) {
+        if (shift > 47U) {
+            shift %= 48U;
+        }
+        target = gate_salt % gate_div;
+    }
     #pragma unroll
     for (int i = 0; i < N; ++i) {
-        const uint64_t mixed = seed48[i] + add;
-        pass[i] = pow2 ? ((mixed & mask) == 0ULL) : ((mixed % gate_div) == 0ULL);
+        const uint64_t shifted = seed48[i] >> shift;
+        pass[i] = pow2 ? ((shifted & mask) == target) : ((shifted % gate_div) == target);
     }
 }
 
@@ -683,6 +864,22 @@ __global__ void filter_multi_exact_kernel_x4(
 
     for (uint32_t ci = 0; ci < constraint_count; ++ci) {
         const ConstraintDesc c = constraints_global[ci];
+        if (c.gate_div <= 1U) {
+            continue;
+        }
+        bool gate[N];
+        gate_pass_n<N>(seed48, c.gate_div, c.gate_salt, gate);
+        bool gate_any_alive = false;
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            alive[i] = alive[i] && gate[i];
+            gate_any_alive = gate_any_alive || alive[i];
+        }
+        if (!gate_any_alive) return;
+    }
+
+    for (uint32_t ci = 0; ci < constraint_count; ++ci) {
+        const ConstraintDesc c = constraints_global[ci];
         if (c.is_gate_only != 0U || c.region_count == 0U) continue;
 
         const uint32_t min_required = c.min_required == 0U ? 1U : c.min_required;
@@ -848,6 +1045,13 @@ __global__ void filter_multi_exact_kernel(
 
     for (uint32_t ci = 0; ci < constraint_count; ++ci) {
         const ConstraintDesc c = constraints[ci];
+        if (c.gate_div > 1U && !gate_pass(seed48, c.gate_div, c.gate_salt)) {
+            return;
+        }
+    }
+
+    for (uint32_t ci = 0; ci < constraint_count; ++ci) {
+        const ConstraintDesc c = constraints[ci];
         // Exact Stage A consumes structure-only constraints. Legacy surrogate
         // entries are skipped so older callers remain compatible while the
         // compiled plan migrates to exact low-48 descriptors.
@@ -992,7 +1196,7 @@ struct AsyncSlotResources {
 };
 
 struct AsyncDeviceState {
-    AsyncSlotResources slots[2];
+    AsyncSlotResources slots[MAX_ASYNC_SLOTS];
     uint64_t regions_hash = 0ULL;
     uint32_t regions_count = 0U;
     uint64_t constraints_hash = 0ULL;
@@ -1043,6 +1247,7 @@ bool ensure_async_slot_resources(AsyncSlotResources &slot, uint64_t needed_out_c
         if (slot.d_out != nullptr) {
             cudaFree(slot.d_out);
             slot.d_out = nullptr;
+            slot.d_out_capacity = 0ULL;
         }
         uint64_t new_cap = needed_out_capacity;
         if (slot.d_out_capacity > 0ULL) {
@@ -1063,6 +1268,7 @@ bool ensure_async_slot_resources(AsyncSlotResources &slot, uint64_t needed_out_c
         if (slot.pinned_out != nullptr) {
             cudaFreeHost(slot.pinned_out);
             slot.pinned_out = nullptr;
+            slot.pinned_capacity = 0ULL;
         }
         uint64_t new_cap = needed_out_capacity;
         if (slot.pinned_capacity > 0ULL) {
@@ -1140,7 +1346,7 @@ struct AsyncSlotState {
     std::vector<PerDeviceJob> jobs;
 };
 
-AsyncSlotState g_async_slots[2];
+AsyncSlotState g_async_slots[MAX_ASYNC_SLOTS];
 
 }  // namespace
 
@@ -1547,6 +1753,10 @@ extern "C" int gpu_filter_double_buffer_available_impl(void) {
     return 1;
 }
 
+extern "C" uint32_t gpu_filter_async_max_slots_impl(void) {
+    return MAX_ASYNC_SLOTS;
+}
+
 extern "C" int gpu_filter_multi_submit_impl(
     uint32_t slot_id,
     uint64_t start_seed,
@@ -1555,7 +1765,7 @@ extern "C" int gpu_filter_multi_submit_impl(
     uint32_t region_count,
     ConstraintDesc *constraints,
     uint32_t constraint_count) {
-    if (slot_id >= 2U) {
+    if (slot_id >= MAX_ASYNC_SLOTS) {
         return GPU_FILTER_STATUS_INVALID_ARG;
     }
     AsyncSlotState &slot = g_async_slots[slot_id];
@@ -1766,7 +1976,7 @@ extern "C" int gpu_filter_multi_collect_impl(
     uint32_t *out_hit_count,
     double *out_kernel_seconds,
     double *out_transfer_seconds) {
-    if (slot_id >= 2U || out_hit_count == nullptr) {
+    if (slot_id >= MAX_ASYNC_SLOTS || out_hit_count == nullptr) {
         return GPU_FILTER_STATUS_INVALID_ARG;
     }
     *out_hit_count = 0U;

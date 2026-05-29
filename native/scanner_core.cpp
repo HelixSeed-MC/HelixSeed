@@ -59,6 +59,7 @@ constexpr int32_t MC_VERSION_1_17 = 21;
 constexpr int32_t SPAWN_AREA_PREFILTER_RADIUS_PRE118 = 288;
 constexpr int32_t SPAWN_AREA_PREFILTER_RADIUS_118_PLUS = 96;
 constexpr int32_t SPAWN_AREA_PREFILTER_STEP = 4;
+constexpr uint32_t EARLY_FIXED_BIOME_MAX_SAMPLES = 128U;
 
 struct CPos {
     int32_t x;
@@ -342,12 +343,25 @@ static SCANNER_FORCE_INLINE uint32_t java_next_int_exact(uint64_t &state48, uint
     }
 }
 
+static SCANNER_FORCE_INLINE bool buried_treasure_frequency_pass(uint64_t seed, const NativeRegionTerm &region) {
+    uint64_t state = ((seed + (region.add_term_mod48 & JAVA_MASK)) ^ JAVA_MULT) & JAVA_MASK;
+    state = (state * JAVA_MULT + JAVA_ADD) & JAVA_MASK;
+    const uint32_t bits24 = static_cast<uint32_t>(state >> 24U);
+    return bits24 < 167773U;
+}
+
 static SCANNER_FORCE_INLINE void structure_attempt_block_pos(
     uint64_t seed,
     const NativeRegionTerm &region,
     int32_t &out_x,
     int32_t &out_z
 ) {
+    if (region.spread_type == SCAN_SPREAD_BURIED_TREASURE) {
+        out_x = region.base_block_x;
+        out_z = region.base_block_z;
+        return;
+    }
+
     const uint32_t bound = std::max<uint32_t>(1U, region.bound);
     uint64_t state = ((seed + (region.add_term_mod48 & JAVA_MASK)) ^ JAVA_MULT) & JAVA_MASK;
 
@@ -384,6 +398,10 @@ static SCANNER_FORCE_INLINE bool structure_attempt_within_radius(
     int32_t *out_x = nullptr,
     int32_t *out_z = nullptr
 ) {
+    if (region.spread_type == SCAN_SPREAD_BURIED_TREASURE && !buried_treasure_frequency_pass(seed, region)) {
+        return false;
+    }
+
     int32_t x = 0;
     int32_t z = 0;
     structure_attempt_block_pos(seed, region, x, z);
@@ -463,6 +481,7 @@ static const char *debug_structure_name_from_id(int32_t struct_id) {
     case 20: return "end_city";
     case 23: return "trail_ruin";
     case 24: return "trial_chambers";
+    case 25: return "nether_fossil";
     default: return "unknown";
     }
 }
@@ -928,6 +947,7 @@ struct CompiledQueryPlan {
     std::vector<uint8_t> stage_a_available_mask;
     std::vector<uint32_t> stage_b_exact_structure;
     std::vector<uint32_t> stage_b_stronghold;
+    bool has_early_fixed_biome_filters = false;
     bool direct_api_needed = false;
     bool generator_needed = false;
     mutable std::mutex batch_stats_mu;
@@ -1518,11 +1538,13 @@ static SCANNER_FORCE_INLINE uint64_t structure_direct_cache_key(
     int32_t dimension,
     int32_t struct_id,
     int32_t rx,
-    int32_t rz
+    int32_t rz,
+    uint32_t flags = 0U
 ) {
     uint64_t key = pack_xz_i32(rx, rz);
     key ^= static_cast<uint64_t>(static_cast<uint32_t>(struct_id)) * 0xd6e8feb86659fd93ULL;
     key ^= static_cast<uint64_t>(static_cast<uint32_t>(dimension)) * 0x9e3779b185ebca87ULL;
+    key ^= static_cast<uint64_t>(flags) * 0x94d049bb133111ebULL;
     return mix_cache_key64(key);
 }
 
@@ -1594,13 +1616,18 @@ static SCANNER_FORCE_INLINE bool cached_is_viable_structure_pos_direct(
     QueryScratch &scratch,
     int32_t struct_id,
     int32_t dimension,
+    int mc_version,
+    uint64_t seed,
     void *g_world,
     int32_t rx,
     int32_t rz,
     int32_t x,
-    int32_t z
+    int32_t z,
+    uint32_t flags
 ) {
-    const uint64_t key = structure_direct_cache_key(dimension, struct_id, rx, rz);
+    (void)mc_version;
+    (void)seed;
+    const uint64_t key = structure_direct_cache_key(dimension, struct_id, rx, rz, flags);
     QueryScratch::StructureDirectCacheEntry &entry =
         scratch.structure_cache[static_cast<size_t>(key) & (QueryScratch::kStructureDirectCacheSize - 1U)];
     if (entry.epoch == scratch.cache_epoch && entry.key == key && entry.viable_ready != 0U) {
@@ -1609,7 +1636,7 @@ static SCANNER_FORCE_INLINE bool cached_is_viable_structure_pos_direct(
     if (scratch.call_counters != nullptr) {
         ++scratch.call_counters->is_viable_structure_pos_calls;
     }
-    const bool viable = api.is_viable_structure_pos_direct(struct_id, g_world, x, z, 0U) == 1;
+    const bool viable = api.is_viable_structure_pos_direct(struct_id, g_world, x, z, flags) == 1;
     entry.key = key;
     entry.epoch = scratch.cache_epoch;
     entry.x = x;
@@ -1842,6 +1869,12 @@ static SCANNER_FORCE_INLINE bool biome_filter_uses_exact_early_anchor(const Nati
     return desc.point_type == SCAN_ANCHOR_ORIGIN || desc.point_type == SCAN_ANCHOR_FIXED;
 }
 
+static SCANNER_FORCE_INLINE bool biome_filter_is_cheap_exact_early_anchor(const QueryBiomePrepared &bf) {
+    return biome_filter_uses_exact_early_anchor(bf.desc) &&
+           bf.offsets != nullptr &&
+           bf.offsets->size() <= EARLY_FIXED_BIOME_MAX_SAMPLES;
+}
+
 static SCANNER_FORCE_INLINE bool constraint_region_outside_radius(
     const NativeQueryConstraintDesc &rc,
     const NativeRegionTerm &region,
@@ -2013,9 +2046,9 @@ static SCANNER_FORCE_INLINE uint32_t collect_constraint_candidates_stronghold_em
         if (scratch.call_counters != nullptr) {
             ++scratch.call_counters->next_stronghold_calls;
         }
+        const int ring = std::max<int>(0, sh_cache.iter.ringnum);
         api.next_stronghold(&sh_cache.iter, g_world);
         const CPos p = sh_cache.iter.pos;
-        const int ring = std::max<int>(0, sh_cache.iter.ringnum);
         sh_cache.pos[sh_cache.generated] = p;
         sh_cache.ring[sh_cache.generated] = static_cast<uint8_t>(std::min<int>(255, ring));
         ++sh_cache.generated;
@@ -2149,7 +2182,19 @@ static SCANNER_FORCE_INLINE uint32_t collect_constraint_candidates_direct_no_pre
         const int32_t x = pos.x;
         const int32_t z = pos.z;
         if (require_viability && structure_has_viability_check(rc.struct_id) &&
-            !cached_is_viable_structure_pos_direct(api, scratch, rc.struct_id, rc.dimension, g_world, rx, rz, x, z)) {
+            !cached_is_viable_structure_pos_direct(
+                api,
+                scratch,
+                rc.struct_id,
+                rc.dimension,
+                mc_version,
+                seed,
+                g_world,
+                rx,
+                rz,
+                x,
+                z,
+                rc.viability_flags)) {
             return false;
         }
         if (dist2_i64(x, z, anchor_x, anchor_z) > rc.candidate_radius_sq) {
@@ -2525,11 +2570,14 @@ static SCANNER_FORCE_INLINE uint32_t collect_constraint_candidates_strict_region
                 scratch,
                 rc.struct_id,
                 rc.dimension,
+                mc_version,
+                seed,
                 g_world,
                 region.rx,
                 region.rz,
                 x,
-                z)) {
+                z,
+                rc.viability_flags)) {
             continue;
         }
         if (dist2_i64(x, z, anchor_x, anchor_z) > rc.candidate_radius_sq) {
@@ -2748,53 +2796,14 @@ static SeedStatus evaluate_query_seed_fast_native_impl(
     int32_t early_biome_point_x = 0;
     int32_t early_biome_point_z = 0;
     SeedStatus late_status = SeedStatus::valid;
-    auto run_early_biome_prefilters = [&]() -> SeedStatus {
+    auto run_early_exact_biome_prefilters = [&]() -> SeedStatus {
         if (!biome_needed || early_biome_checked) {
             return SeedStatus::valid;
         }
         early_biome_checked = true;
         for (uint32_t bf_idx = 0; bf_idx < biome_filters.size(); ++bf_idx) {
             const QueryBiomePrepared &bf = biome_filters[bf_idx];
-            if (bf.desc.point_type == SCAN_ANCHOR_SPAWN && bf.desc.dimension == DIM_OVERWORLD) {
-                const int32_t spawn_search_radius = spawn_area_prefilter_search_radius(mc_version);
-                if (spawn_search_radius <= 0) {
-                    continue;
-                }
-                int32_t estimate_x = 0;
-                int32_t estimate_z = 0;
-                if (!query_get_spawn_estimate(api, st, mc_version, seed, scratch, g_world, estimate_x, estimate_z)) {
-                    continue;
-                }
-                // Reject only when the requested biome is absent from every block position
-                // that the final server spawn search could still choose after estimateSpawn().
-                const std::vector<BiomeOffset> &spawn_area_offsets = build_biome_offsets_cached(
-                    std::max<int32_t>(0, bf.desc.radius) + spawn_search_radius,
-                    SPAWN_AREA_PREFILTER_STEP
-                );
-                if (query_biome_matches_with_offsets_at_point(
-                        api,
-                        st,
-                        scratch,
-                        seed,
-                        mc_version,
-                        g_world,
-                        bf.desc.dimension,
-                        bf.desc.y,
-                        spawn_area_offsets,
-                        bf.allowed_sorted,
-                        estimate_x,
-                        estimate_z)) {
-                    continue;
-                }
-                if (!debug_prefilter) {
-                    return SeedStatus::biome_reject;
-                }
-                early_biome_rejected = true;
-                early_spawn_area_rejected = true;
-                early_biome_reject_index = bf_idx;
-                break;
-            }
-            if (!biome_filter_uses_exact_early_anchor(bf.desc)) {
+            if (!biome_filter_is_cheap_exact_early_anchor(bf)) {
                 continue;
             }
             int32_t point_x = 0;
@@ -2839,6 +2848,69 @@ static SeedStatus evaluate_query_seed_fast_native_impl(
         }
         return SeedStatus::valid;
     };
+    bool early_spawn_area_checked = false;
+    auto run_early_spawn_area_biome_prefilters = [&]() -> SeedStatus {
+        if (!biome_needed || early_spawn_area_checked) {
+            return SeedStatus::valid;
+        }
+        early_spawn_area_checked = true;
+        for (uint32_t bf_idx = 0; bf_idx < biome_filters.size(); ++bf_idx) {
+            const QueryBiomePrepared &bf = biome_filters[bf_idx];
+            if (bf.desc.point_type != SCAN_ANCHOR_SPAWN || bf.desc.dimension != DIM_OVERWORLD) {
+                continue;
+            }
+            const int32_t spawn_search_radius = spawn_area_prefilter_search_radius(mc_version);
+            if (spawn_search_radius <= 0) {
+                continue;
+            }
+            int32_t estimate_x = 0;
+            int32_t estimate_z = 0;
+            if (!query_get_spawn_estimate(api, st, mc_version, seed, scratch, g_world, estimate_x, estimate_z)) {
+                continue;
+            }
+            // Reject only when the requested biome is absent from every block position
+            // that the final server spawn search could still choose after estimateSpawn().
+            const std::vector<BiomeOffset> &spawn_area_offsets = build_biome_offsets_cached(
+                std::max<int32_t>(0, bf.desc.radius) + spawn_search_radius,
+                SPAWN_AREA_PREFILTER_STEP
+            );
+            if (query_biome_matches_with_offsets_at_point(
+                    api,
+                    st,
+                    scratch,
+                    seed,
+                    mc_version,
+                    g_world,
+                    bf.desc.dimension,
+                    bf.desc.y,
+                    spawn_area_offsets,
+                    bf.allowed_sorted,
+                    estimate_x,
+                    estimate_z)) {
+                continue;
+            }
+            if (!debug_prefilter) {
+                return SeedStatus::biome_reject;
+            }
+            early_biome_rejected = true;
+            early_spawn_area_rejected = true;
+            early_biome_reject_index = bf_idx;
+            break;
+        }
+        return SeedStatus::valid;
+    };
+    auto run_early_biome_prefilters = [&]() -> SeedStatus {
+        const SeedStatus exact_status = run_early_exact_biome_prefilters();
+        if (exact_status != SeedStatus::valid) {
+            return exact_status;
+        }
+        return run_early_spawn_area_biome_prefilters();
+    };
+
+    const SeedStatus early_fixed_biome_status = run_early_exact_biome_prefilters();
+    if (early_fixed_biome_status != SeedStatus::valid) {
+        return early_fixed_biome_status;
+    }
 
     for (uint32_t ord = 0; ord < constraint_count; ++ord) {
         const uint32_t idx = constraint_eval_order == nullptr ? ord : constraint_eval_order[ord];
@@ -2992,7 +3064,7 @@ constraint_eval_done:
     for (uint32_t bf_idx = 0; bf_idx < biome_filters.size(); ++bf_idx) {
         const QueryBiomePrepared &bf = biome_filters[bf_idx];
         const NativeBiomeFilterDesc &desc = bf.desc;
-        if (early_biome_checked && !early_biome_rejected && biome_filter_uses_exact_early_anchor(desc)) {
+        if (early_biome_checked && !early_biome_rejected && biome_filter_is_cheap_exact_early_anchor(bf)) {
             continue;
         }
 
@@ -3226,7 +3298,7 @@ static SeedStatus collect_query_details_native(
                 anchor_points,
                 rc.candidate_cap,
                 collect_world,
-                true
+                false
             );
             for (uint64_t packed : anchor_points) {
                 if (scratch.constraint_seen_dedupe.insert(packed)) {
@@ -4310,6 +4382,56 @@ static bool evaluate_compiled_biome_group_at_anchor(
     return true;
 }
 
+static SeedStatus evaluate_query_seed_early_fixed_biomes_compiled(
+    const CubiApi &api,
+    ThreadCubiState &st,
+    QueryScratch &scratch,
+    uint64_t seed,
+    int mc_version,
+    const CompiledQueryPlan &plan
+) {
+    if (!plan.has_early_fixed_biome_filters) {
+        return SeedStatus::valid;
+    }
+    if (!api.direct_ready) {
+        return SeedStatus::biome_reject;
+    }
+
+    void *g_world = nullptr;
+    for (const QueryBiomePrepared &bf : plan.prepared_filters) {
+        if (!biome_filter_is_cheap_exact_early_anchor(bf)) {
+            continue;
+        }
+        int32_t point_x = 0;
+        int32_t point_z = 0;
+        if (!resolve_exact_early_biome_anchor_point(
+                api,
+                st,
+                scratch,
+                seed,
+                mc_version,
+                g_world,
+                bf.desc,
+                point_x,
+                point_z)) {
+            return SeedStatus::biome_reject;
+        }
+        if (!query_biome_filter_matches_at_point(
+                api,
+                st,
+                scratch,
+                seed,
+                mc_version,
+                g_world,
+                bf,
+                point_x,
+                point_z)) {
+            return SeedStatus::biome_reject;
+        }
+    }
+    return SeedStatus::valid;
+}
+
 static SeedStatus evaluate_query_seed_stage_c_biomes_compiled(
     const CubiApi &api,
     ThreadCubiState &st,
@@ -4376,20 +4498,32 @@ static SeedStatus evaluate_query_seed_stage_c_biomes_compiled(
             const std::vector<uint64_t> &deps =
                 scratch.matches_by_constraint[static_cast<uint32_t>(group.point_dep_index)];
             for (uint64_t packed : deps) {
-                if (!process_anchor(unpack_x_from_packed(packed), unpack_z_from_packed(packed))) {
-                    return SeedStatus::biome_reject;
+                std::vector<uint8_t> candidate_satisfied = filter_satisfied;
+                if (!evaluate_compiled_biome_group_at_anchor(
+                        api,
+                        scratch,
+                        ensure_world(group.dimension),
+                        group.dimension,
+                        group,
+                        plan.prepared_filters,
+                        unpack_x_from_packed(packed),
+                        unpack_z_from_packed(packed),
+                        candidate_satisfied,
+                        records)) {
+                    continue;
                 }
-                anchor_ok = true;
                 bool group_done = true;
                 for (const CompiledBiomeGroupFilter &filter_ref : group.filters) {
-                    if (filter_ref.filter_index >= filter_satisfied.size() ||
-                        filter_satisfied[filter_ref.filter_index] != 0U) {
+                    if (filter_ref.filter_index >= candidate_satisfied.size() ||
+                        candidate_satisfied[filter_ref.filter_index] != 0U) {
                         continue;
                     }
                     group_done = false;
                     break;
                 }
                 if (group_done) {
+                    filter_satisfied = std::move(candidate_satisfied);
+                    anchor_ok = true;
                     break;
                 }
             }
@@ -4548,6 +4682,13 @@ static std::unique_ptr<CompiledQueryPlan> compile_query_plan_internal(
     }
 
     plan->stage_c_biome_groups = build_compiled_biome_groups(plan->prepared_filters);
+    plan->has_early_fixed_biome_filters = false;
+    for (const QueryBiomePrepared &bf : plan->prepared_filters) {
+        if (biome_filter_is_cheap_exact_early_anchor(bf)) {
+            plan->has_early_fixed_biome_filters = true;
+            break;
+        }
+    }
     build_compiled_stage_partitions(*plan);
     rc_out = 0;
     return plan;
@@ -4649,7 +4790,8 @@ static int validate_query_batch_with_plan(
     uint32_t *valid_count,
     uint32_t *mismatch_count,
     uint32_t *biome_reject_count,
-    uint32_t *cap_pruned_total
+    uint32_t *cap_pruned_total,
+    bool skip_stage_a = false
 ) {
     if ((seed_count > 0U && seeds == nullptr) || valid_out == nullptr || valid_count == nullptr ||
         mismatch_count == nullptr || biome_reject_count == nullptr || cap_pruned_total == nullptr) {
@@ -4677,6 +4819,28 @@ static int validate_query_batch_with_plan(
     CompiledBatchStatsAccumulator batch_stats(constraint_count);
     batch_stats.input_seed_count = seed_count;
     batch_stats.stage_a_survivor_count = seed_count;
+    auto run_early_fixed_biomes = [&](
+                                      ThreadCubiState &cubi_state,
+                                      QueryScratch &scratch,
+                                      uint64_t seed,
+                                      auto &stats
+                                  ) -> SeedStatus {
+        if (!plan.has_early_fixed_biome_filters) {
+            return SeedStatus::valid;
+        }
+        const auto stage_c_t0 = std::chrono::high_resolution_clock::now();
+        const SeedStatus status = evaluate_query_seed_early_fixed_biomes_compiled(
+            api_copy,
+            cubi_state,
+            scratch,
+            seed,
+            cubi_mc_version,
+            plan
+        );
+        stats.cpu_stage_c_seconds +=
+            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0).count();
+        return status;
+    };
     const uint32_t warmup_seed_count =
         constraint_count > 1U ? std::min<uint32_t>(seed_count, kSelectivityWarmupSeeds) : 0U;
 
@@ -4695,24 +4859,34 @@ static int validate_query_batch_with_plan(
         const uint32_t *effective_caps_ptr =
             plan.effective_target_caps.empty() ? nullptr : plan.effective_target_caps.data();
         for (uint32_t i = 0; i < warmup_seed_count; ++i) {
-            uint32_t stage_a_cap_pruned = 0U;
-            const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
-            const SeedStatus stage_a_status = evaluate_query_seed_stage_a_compiled(
-                warmup_scratch,
-                seeds[i],
-                plan,
-                stage_a_cap_pruned,
-                batch_stats.per_constraint_stage_a5_rejects.data()
-            );
-            batch_stats.cpu_stage_a5_seconds +=
-                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
-            warmup_result.cap_pruned += stage_a_cap_pruned;
-            if (stage_a_status != SeedStatus::valid) {
-                ++batch_stats.stage_a5_reject_count;
-                ++warmup_result.mismatch;
-                continue;
+            if (!skip_stage_a) {
+                uint32_t stage_a_cap_pruned = 0U;
+                const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
+                const SeedStatus stage_a_status = evaluate_query_seed_stage_a_compiled(
+                    warmup_scratch,
+                    seeds[i],
+                    plan,
+                    stage_a_cap_pruned,
+                    batch_stats.per_constraint_stage_a5_rejects.data()
+                );
+                batch_stats.cpu_stage_a5_seconds +=
+                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
+                warmup_result.cap_pruned += stage_a_cap_pruned;
+                if (stage_a_status != SeedStatus::valid) {
+                    ++batch_stats.stage_a5_reject_count;
+                    ++warmup_result.mismatch;
+                    continue;
+                }
             }
             ++batch_stats.stage_a5_survivor_count;
+
+            const SeedStatus early_biome_status =
+                run_early_fixed_biomes(warmup_cubi_state, warmup_scratch, seeds[i], batch_stats);
+            if (early_biome_status != SeedStatus::valid) {
+                ++batch_stats.stage_c_biome_reject_count;
+                ++warmup_result.biome_reject;
+                continue;
+            }
 
             uint32_t stage_b_cap_pruned = 0U;
             const auto stage_b_t0 = std::chrono::high_resolution_clock::now();
@@ -4807,24 +4981,33 @@ static int validate_query_batch_with_plan(
                 out.valid.reserve(static_cast<size_t>(end - start));
                 for (uint32_t i = start; i < end; ++i) {
                     const uint32_t seed_idx = warmup_seed_count + i;
-                    uint32_t stage_a_cap_pruned = 0U;
-                    const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
-                    const SeedStatus stage_a_status =
-                        evaluate_query_seed_stage_a_compiled(
-                            scratch,
-                            seeds[seed_idx],
-                            plan,
-                            stage_a_cap_pruned,
-                            local_stats.per_constraint_stage_a5_rejects.data());
-                    local_stats.cpu_stage_a5_seconds +=
-                        std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
-                    out.cap_pruned += stage_a_cap_pruned;
-                    if (stage_a_status != SeedStatus::valid) {
-                        ++local_stats.stage_a5_reject_count;
-                        ++out.mismatch;
-                        continue;
+                    if (!skip_stage_a) {
+                        uint32_t stage_a_cap_pruned = 0U;
+                        const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
+                        const SeedStatus stage_a_status =
+                            evaluate_query_seed_stage_a_compiled(
+                                scratch,
+                                seeds[seed_idx],
+                                plan,
+                                stage_a_cap_pruned,
+                                local_stats.per_constraint_stage_a5_rejects.data());
+                        local_stats.cpu_stage_a5_seconds +=
+                            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
+                        out.cap_pruned += stage_a_cap_pruned;
+                        if (stage_a_status != SeedStatus::valid) {
+                            ++local_stats.stage_a5_reject_count;
+                            ++out.mismatch;
+                            continue;
+                        }
                     }
                     ++local_stats.stage_a5_survivor_count;
+                    const SeedStatus early_biome_status =
+                        run_early_fixed_biomes(cubi_state, scratch, seeds[seed_idx], local_stats);
+                    if (early_biome_status != SeedStatus::valid) {
+                        ++local_stats.stage_c_biome_reject_count;
+                        ++out.biome_reject;
+                        continue;
+                    }
                     uint32_t stage_b_cap_pruned = 0U;
                     const auto stage_b_t0 = std::chrono::high_resolution_clock::now();
                     SeedStatus status = evaluate_query_seed_stage_b_constraints_compiled<false>(
@@ -4904,25 +5087,34 @@ static int validate_query_batch_with_plan(
                         out.valid.reserve(static_cast<size_t>(end - start));
                         for (uint32_t i = start; i < end; ++i) {
                             const uint32_t seed_idx = warmup_seed_count + i;
-                            uint32_t stage_a_cap_pruned = 0U;
-                            const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
-                            const SeedStatus stage_a_status =
-                                evaluate_query_seed_stage_a_compiled(
-                                    scratch,
-                                    seeds[seed_idx],
-                                    plan,
-                                    stage_a_cap_pruned,
-                                    local_stats.per_constraint_stage_a5_rejects.data());
-                            local_stats.cpu_stage_a5_seconds +=
-                                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0)
-                                    .count();
-                            out.cap_pruned += stage_a_cap_pruned;
-                            if (stage_a_status != SeedStatus::valid) {
-                                ++local_stats.stage_a5_reject_count;
-                                ++out.mismatch;
-                                continue;
+                            if (!skip_stage_a) {
+                                uint32_t stage_a_cap_pruned = 0U;
+                                const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
+                                const SeedStatus stage_a_status =
+                                    evaluate_query_seed_stage_a_compiled(
+                                        scratch,
+                                        seeds[seed_idx],
+                                        plan,
+                                        stage_a_cap_pruned,
+                                        local_stats.per_constraint_stage_a5_rejects.data());
+                                local_stats.cpu_stage_a5_seconds +=
+                                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0)
+                                        .count();
+                                out.cap_pruned += stage_a_cap_pruned;
+                                if (stage_a_status != SeedStatus::valid) {
+                                    ++local_stats.stage_a5_reject_count;
+                                    ++out.mismatch;
+                                    continue;
+                                }
                             }
                             ++local_stats.stage_a5_survivor_count;
+                            const SeedStatus early_biome_status =
+                                run_early_fixed_biomes(cubi_state, scratch, seeds[seed_idx], local_stats);
+                            if (early_biome_status != SeedStatus::valid) {
+                                ++local_stats.stage_c_biome_reject_count;
+                                ++out.biome_reject;
+                                continue;
+                            }
                             uint32_t stage_b_cap_pruned = 0U;
                             const auto stage_b_t0 = std::chrono::high_resolution_clock::now();
                             SeedStatus status = evaluate_query_seed_stage_b_constraints_compiled<false>(
@@ -5570,6 +5762,37 @@ SCANNER_CORE_API int scanner_core_validate_query_batch_compiled(
         mismatch_count,
         biome_reject_count,
         cap_pruned_total
+    );
+}
+
+SCANNER_CORE_API int scanner_core_validate_query_batch_compiled_post_stage_a(
+    const ScannerCompiledQueryPlan *plan,
+    const uint64_t *seeds,
+    uint32_t seed_count,
+    int32_t cubi_mc_version,
+    uint32_t worker_count,
+    uint64_t *valid_out,
+    uint32_t *valid_count,
+    uint32_t *mismatch_count,
+    uint32_t *biome_reject_count,
+    uint32_t *cap_pruned_total
+) {
+    const CompiledQueryPlan *compiled = unwrap_query_plan(plan);
+    if (compiled == nullptr) {
+        return -1;
+    }
+    return validate_query_batch_with_plan(
+        *compiled,
+        seeds,
+        seed_count,
+        cubi_mc_version,
+        worker_count,
+        valid_out,
+        valid_count,
+        mismatch_count,
+        biome_reject_count,
+        cap_pruned_total,
+        true
     );
 }
 

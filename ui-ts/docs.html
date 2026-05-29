@@ -2,6 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HelixScript Documentation</title>
     <style>
@@ -254,16 +258,16 @@ find trial_chambers as tc1 within 256 of spawn placement</code></pre>
           <p>Biome filters check an area around a point. Use comma-separated or space-separated biome names after <code>allow</code>.</p>
         </section>
 
-        <!-- Loot Filters section disabled. The parser still accepts the loot command, but it is no longer documented or surfaced in the UI.
         <section>
           <h2>10. Loot Filters</h2>
-          <pre><code>loot v1 from village require emerald:3,diamond:1</code></pre>
-          <p>Loot filters attach required items to a structure rule. Counts default to 1 if omitted.</p>
+          <pre><code>loot v1 from auto require diamond:2,emerald:5
+loot t1 from buried_treasure require heart_of_the_sea:1</code></pre>
+          <p>Loot filters attach item requirements to a strict structure rule. <code>auto</code> uses the referenced rule's structure. Counts default to 1 if omitted, and multiple requirements are comma-separated.</p>
+          <p>For current exact versions, loot filters are limited to <code>desert_pyramid</code> and <code>buried_treasure</code>. Older legacy validation also accepts <code>ruined_portal</code> and <code>shipwreck</code>.</p>
         </section>
-        -->
 
         <section>
-          <h2>10. Output</h2>
+          <h2>11. Output</h2>
           <pre><code>output
 output raw
 output both
@@ -273,7 +277,7 @@ output world64</code></pre>
         </section>
 
         <section>
-          <h2>11. Functions</h2>
+          <h2>12. Functions</h2>
           <pre><code>function nearby_portal(anchor_id, portal_id, radius)
   find ruined_portal as $portal_id within $radius of constraint:$anchor_id strict
 end
@@ -284,7 +288,7 @@ nearby_portal(v1, rp1, 96)</code></pre>
         </section>
 
         <section>
-          <h2>12. Scan Control</h2>
+          <h2>13. Scan Control</h2>
           <pre><code>scan
   start 0
   count 1000000
@@ -302,7 +306,7 @@ stop if $radius of v1 &gt; 512</code></pre>
         </section>
 
         <section>
-          <h2>13. Performance Block</h2>
+          <h2>14. Performance Block</h2>
           <pre><code>performance
   workers 0
   execution auto
@@ -315,7 +319,7 @@ end</code></pre>
         </section>
 
         <section>
-          <h2>14. Layout &amp; Indentation</h2>
+          <h2>15. Layout &amp; Indentation</h2>
           <p>HelixScript is line-based: every command is a single line, and whitespace at the start of a line is ignored. Indenting block bodies is encouraged for readability but never required.</p>
           <pre><code># both of these compile to the same thing
 if radius &gt;= 64
@@ -329,12 +333,12 @@ end</code></pre>
         </section>
 
         <section>
-          <h2>15. Block Menu</h2>
-          <p>The block menu beside the editor inserts common script pieces: Variable, List, For, If, Assert, Skip, Stop, Output, Function, Scan, Find, Biome, and Performance. Click a block, then edit the placeholders.</p>
+          <h2>16. Block Menu</h2>
+          <p>The block menu beside the editor inserts common script pieces: Variable, List, For, If, Assert, Skip, Stop, Output, Function, Scan, Find, Biome, Loot, and Performance. Click a block, then edit the placeholders.</p>
         </section>
 
         <section>
-          <h2>16. Common Mistakes</h2>
+          <h2>17. Common Mistakes</h2>
           <ul>
             <li>Define variables before using <code>$variable</code>.</li>
             <li>Close every <code>if</code>, <code>for</code>, <code>skip</code>, <code>scan</code>, <code>function</code>, and <code>performance</code> block with <code>end</code>.</li>

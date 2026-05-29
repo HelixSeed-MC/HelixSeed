@@ -54,7 +54,7 @@ public class StructureLootSelectorFrame extends JFrame {
     private static final MCVersion REVERSER_VERSION = MCVersion.v1_17_1;
 
     public StructureLootSelectorFrame() {
-        super("GPULootSeedFinder - 26.1.2 Structure Loot");
+        super("GPULootSeedFinder - 26.1.1 / 26.1.2 Structure Loot");
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         setSize(1100, 760);
         setMinimumSize(new Dimension(920, 620));
@@ -122,7 +122,7 @@ public class StructureLootSelectorFrame extends JFrame {
         positionArea.setWrapStyleWord(true);
 
         JPanel top = new JPanel(new BorderLayout(8, 8));
-        top.add(new JLabel("Selected Structures: exact 26.1.2 loot preview + salt metadata"), BorderLayout.NORTH);
+        top.add(new JLabel("Selected Structures: exact 26.1.1 / 26.1.2 loot preview + salt metadata"), BorderLayout.NORTH);
         top.add(new JScrollPane(infoArea), BorderLayout.CENTER);
 
         JPanel bottom = new JPanel(new BorderLayout(8, 8));

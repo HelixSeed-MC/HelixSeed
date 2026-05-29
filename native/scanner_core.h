@@ -22,6 +22,7 @@ extern "C" {
 enum {
     SCAN_SPREAD_LINEAR = 0,
     SCAN_SPREAD_TRIANGULAR = 1,
+    SCAN_SPREAD_BURIED_TREASURE = 2,
 };
 
 enum {
@@ -102,6 +103,7 @@ typedef struct NativeQueryConstraintDesc {
     uint32_t attempt_spread_type;
     int32_t attempt_salt;
     uint32_t attempt_anchor_exact_stage0;
+    uint32_t viability_flags;
 } NativeQueryConstraintDesc;
 
 typedef struct NativeBiomeFilterDesc {
@@ -254,6 +256,18 @@ SCANNER_CORE_API ScannerCompiledQueryPlan *scanner_core_compile_query_plan(
 SCANNER_CORE_API void scanner_core_free_query_plan(ScannerCompiledQueryPlan *plan);
 
 SCANNER_CORE_API int scanner_core_validate_query_batch_compiled(
+    const ScannerCompiledQueryPlan *plan,
+    const uint64_t *seeds,
+    uint32_t seed_count,
+    int32_t cubi_mc_version,
+    uint32_t worker_count,
+    uint64_t *valid_out,
+    uint32_t *valid_count,
+    uint32_t *mismatch_count,
+    uint32_t *biome_reject_count,
+    uint32_t *cap_pruned_total);
+
+SCANNER_CORE_API int scanner_core_validate_query_batch_compiled_post_stage_a(
     const ScannerCompiledQueryPlan *plan,
     const uint64_t *seeds,
     uint32_t seed_count,

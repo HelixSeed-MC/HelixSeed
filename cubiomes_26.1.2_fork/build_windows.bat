@@ -26,21 +26,21 @@ if errorlevel 1 goto fail
 if exist "build\cubiomes.dll" copy /Y "build\cubiomes.dll" "lib\lib.dll" >nul
 if not exist "lib\lib.dll" goto fail
 
-echo [cubiomes_12111_fork] Built cubiomes_12111_fork\lib\lib.dll
+echo [cubiomes_26.1.2_fork] Built cubiomes_26.1.2_fork\lib\lib.dll
 exit /b 0
 
 :no_vswhere
-echo [cubiomes_12111_fork] vswhere.exe not found. Install Visual Studio Build Tools 2022.
+echo [cubiomes_26.1.2_fork] vswhere.exe not found. Install Visual Studio Build Tools 2022.
 exit /b 1
 
 :no_vsroot
-echo [cubiomes_12111_fork] Visual C++ build tools not found.
+echo [cubiomes_26.1.2_fork] Visual C++ build tools not found.
 exit /b 1
 
 :no_vcvars
-echo [cubiomes_12111_fork] vcvars64.bat not found: %VCVARS%
+echo [cubiomes_26.1.2_fork] vcvars64.bat not found: %VCVARS%
 exit /b 1
 
 :fail
-echo [cubiomes_12111_fork] Build failed.
+echo [cubiomes_26.1.2_fork] Build failed.
 exit /b 1

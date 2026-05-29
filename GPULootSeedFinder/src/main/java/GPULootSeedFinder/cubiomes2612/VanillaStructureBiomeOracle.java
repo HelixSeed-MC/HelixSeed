@@ -26,25 +26,20 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Reflection-only bridge to Minecraft 26.1.2 vanilla worldgen biome checks.
+ * Reflection-only bridge to Minecraft 26.1.1 / 26.1.2 vanilla worldgen biome checks.
  *
  * <p>No net.minecraft type is referenced at compile time. At runtime the class
- * expects the named 26.1.2 Minecraft client jar and its libraries on either the
- * process classpath, the thread context classloader, or a classpath supplied by
- * {@code helixseed.mc2612.classpath}. If no explicit classpath is supplied it
- * will also try Prism Launcher's default 26.1.2 library location.</p>
+ * expects either the 26.1.1 or 26.1.2 Minecraft client jar and its libraries on
+ * the process classpath, the thread context classloader, or a classpath supplied
+ * by {@code helixseed.mc2612.classpath}. If no explicit classpath is supplied it
+ * will also try Prism Launcher's default 26.1.2 then 26.1.1 library locations.</p>
  */
 public final class VanillaStructureBiomeOracle {
-    private static final Path DEFAULT_DATA_ROOT = Path.of(
-        "C:",
-        "Users",
-        "David",
-        "Downloads",
-        "minecraft-26.1.2-decompiled-nicest",
-        "data",
-        "minecraft"
-    );
     private static final String DATA_ROOT_PROPERTY = "helixseed.mc2612.dataRoot";
+    private static final String DATA_ROOT_ENV = "HELIXSEED_MC2612_DATA_ROOT";
+    private static final String DECOMPILED_ROOT_PROPERTY = "helixseed.minecraft2612.decompiled";
+    private static final String DECOMPILED_ROOT_ENV = "HELIXSEED_MINECRAFT_2612_DECOMPILED";
+    private static final String DEFAULT_DECOMPILED_DIR = "Minecraft-Decompiled-26.1.2";
     private static final String CLASSPATH_PROPERTY = "helixseed.mc2612.classpath";
     private static final String CLIENT_JAR_PROPERTY = "helixseed.mc2612.clientJar";
 
@@ -131,7 +126,10 @@ public final class VanillaStructureBiomeOracle {
                 }
             }
 
-            boolean viable = vanillaCheck.validGenerationPoint.orElse(biomeViable);
+            final boolean placementCandidate = vanillaCheck.placementCandidate;
+            boolean viable = vanillaCheck.validGenerationPoint
+                .map(valid -> placementCandidate && valid)
+                .orElse(false);
             ValidationResult result = new ValidationResult(
                 requested,
                 candidate,
@@ -173,6 +171,34 @@ public final class VanillaStructureBiomeOracle {
             return minecraft().world(seed).surfaceHeight(blockX, blockZ);
         } catch (ReflectiveOperationException | RuntimeException ex) {
             throw new IllegalStateException("Unable to sample vanilla surface height: " + brief(ex), ex);
+        }
+    }
+
+    public static Optional<Boolean> jigsawPiecesContainAny(
+        String structure,
+        long seed,
+        int blockX,
+        int blockZ,
+        List<String> needles
+    ) {
+        try {
+            if (needles == null || needles.isEmpty()) {
+                return Optional.of(true);
+            }
+            VanillaRuntime mc = minecraft();
+            List<String> normalizedNeedles = new ArrayList<>();
+            for (String needle : needles) {
+                String n = normalizeStructureId(needle);
+                if (!n.isEmpty()) {
+                    normalizedNeedles.add(n);
+                }
+            }
+            if (normalizedNeedles.isEmpty()) {
+                return Optional.of(true);
+            }
+            return Optional.of(mc.world(seed).jigsawPiecesContainAny(normalizeStructureId(structure), blockX, blockZ, normalizedNeedles));
+        } catch (Throwable ex) {
+            return Optional.empty();
         }
     }
 
@@ -353,7 +379,31 @@ public final class VanillaStructureBiomeOracle {
 
     private static Path defaultDataRoot() {
         String override = System.getProperty(DATA_ROOT_PROPERTY);
-        return override == null || override.isBlank() ? DEFAULT_DATA_ROOT : Path.of(override);
+        if (override == null || override.isBlank()) {
+            override = System.getenv(DATA_ROOT_ENV);
+        }
+        if (override != null && !override.isBlank()) {
+            return Path.of(override);
+        }
+        String decompiledRoot = System.getProperty(DECOMPILED_ROOT_PROPERTY);
+        if (decompiledRoot == null || decompiledRoot.isBlank()) {
+            decompiledRoot = System.getenv(DECOMPILED_ROOT_ENV);
+        }
+        Path root = decompiledRoot == null || decompiledRoot.isBlank()
+            ? defaultDecompiledRoot()
+            : Path.of(decompiledRoot);
+        return root.resolve("resources").resolve("data").resolve("minecraft");
+    }
+
+    private static Path defaultDecompiledRoot() {
+        String home = System.getProperty("user.home");
+        if (home != null && !home.isBlank()) {
+            Path desktopCopy = Path.of(home, "Desktop", DEFAULT_DECOMPILED_DIR);
+            if (Files.isDirectory(desktopCopy)) {
+                return desktopCopy;
+            }
+        }
+        return Path.of(DEFAULT_DECOMPILED_DIR);
     }
 
     private static ClassLoader resolveMinecraftClassLoader() {
@@ -373,7 +423,7 @@ public final class VanillaStructureBiomeOracle {
             appendDefaultPrismClasspath(urls);
         }
         if (urls.isEmpty()) {
-            throw new IllegalStateException("Minecraft 26.1.2 classes are not on the runtime classpath");
+            throw new IllegalStateException("Minecraft 26.1.1 / 26.1.2 classes are not on the runtime classpath");
         }
         URLClassLoader loader = new URLClassLoader(urls.toArray(new URL[0]), own);
         if (!canLoadMinecraft(loader)) {
@@ -418,8 +468,10 @@ public final class VanillaStructureBiomeOracle {
 
     private static void appendDefaultPrismClasspath(List<URL> urls) {
         Path prismLibraries = Path.of(System.getProperty("user.home"), "AppData", "Roaming", "PrismLauncher", "libraries");
-        Path clientJar = prismLibraries.resolve(Path.of("com", "mojang", "minecraft", "26.1.2", "minecraft-26.1.2-client.jar"));
-        appendJarOrDirectory(urls, clientJar);
+        Path clientJar2612 = prismLibraries.resolve(Path.of("com", "mojang", "minecraft", "26.1.2", "minecraft-26.1.2-client.jar"));
+        appendJarOrDirectory(urls, clientJar2612);
+        Path clientJar2611 = prismLibraries.resolve(Path.of("com", "mojang", "minecraft", "26.1.1", "minecraft-26.1.1-client.jar"));
+        appendJarOrDirectory(urls, clientJar2611);
         appendAllJars(urls, prismLibraries);
     }
 
@@ -568,6 +620,9 @@ public final class VanillaStructureBiomeOracle {
                     }
                 }
             }
+            if (!placementCandidate) {
+                return new VanillaGenerationCheck(false, Optional.of(false), "", "Placement predicate failed");
+            }
 
             Object chunkPos = construct(runtime.load("net.minecraft.world.level.ChunkPos"), chunkX, chunkZ);
             Object holderSet = call(structure, "biomes");
@@ -585,6 +640,56 @@ public final class VanillaStructureBiomeOracle {
             Object pos = call(stub, "position");
             String location = blockPosString(pos);
             return new VanillaGenerationCheck(placementCandidate, Optional.of(true), location, "");
+        }
+
+        boolean jigsawPiecesContainAny(
+            String structureId,
+            int blockX,
+            int blockZ,
+            List<String> needles
+        ) throws ReflectiveOperationException {
+            Object holder = runtime.structureHolder(structureId);
+            Object structure = call(holder, "value");
+            int chunkX = Math.floorDiv(blockX, 16);
+            int chunkZ = Math.floorDiv(blockZ, 16);
+            boolean placementCandidate = false;
+            Object placements = call(structureState, "getPlacementsForStructure", holder);
+            if (placements instanceof Iterable<?>) {
+                for (Object placement : (Iterable<?>) placements) {
+                    Object candidate = call(placement, "isStructureChunk", structureState, chunkX, chunkZ);
+                    if (Boolean.TRUE.equals(candidate)) {
+                        placementCandidate = true;
+                        break;
+                    }
+                }
+            }
+            if (!placementCandidate) {
+                return false;
+            }
+            Object chunkPos = construct(runtime.load("net.minecraft.world.level.ChunkPos"), chunkX, chunkZ);
+            Object holderSet = call(structure, "biomes");
+            Object predicate = biomePredicate(holderSet);
+            Object context = constructGenerationContext(chunkPos, predicate);
+            Object optional = call(structure, "findValidGenerationPoint", context);
+            if (!(optional instanceof Optional<?> generationPoint) || generationPoint.isEmpty()) {
+                return false;
+            }
+            Object stub = generationPoint.get();
+            Object builder = call(stub, "getPiecesBuilder");
+            Object container = call(builder, "build");
+            Object pieces = call(container, "pieces");
+            if (!(pieces instanceof Iterable<?> iterable)) {
+                return false;
+            }
+            for (Object piece : iterable) {
+                String pieceText = normalizePieceText(String.valueOf(piece));
+                for (String needle : needles) {
+                    if (!needle.isEmpty() && pieceText.contains(needle)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         private Object constructGenerationContext(Object chunkPos, Object predicate) throws ReflectiveOperationException {
@@ -924,6 +1029,14 @@ public final class VanillaStructureBiomeOracle {
             return normalized;
         }
         return normalized;
+    }
+
+    private static String normalizePieceText(String id) {
+        return stripMinecraftNamespace(nullToEmpty(id).trim().toLowerCase(Locale.ROOT))
+            .replace('-', '_')
+            .replace(" ", "_")
+            .replace('/', '_')
+            .replace('\\', '_');
     }
 
     private static String normalizeResourceId(String id) {

@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "logic": "and",
+  "anchor": {
+    "type": "origin"
+  },
+  "constraints": [
+    {
+      "id": "v1",
+      "structure": "village",
+      "dimension": "overworld",
+      "mode": "strict",
+      "within": {
+        "anchor": "origin",
+        "radius": 64
+      },
+      "required": true,
+      "track_found": false
+    }
+  ],
+  "biome_filters": [
+    {
+      "point": "origin",
+      "dimension": "overworld",
+      "y": 80,
+      "radius": 128,
+      "allowed": [
+        "cherry_grove"
+      ]
+    }
+  ],
+  "loot_filters": [],
+  "control_ops": [],
+  "output": {
+    "detail": "matched_set"
+  },
+  "safety": {
+    "completeness": "exact"
+  },
+  "performance": {
+    "strict_workers": 16,
+    "execution_mode": "max-throughput",
+    "compiled_stage_a_mode": "auto",
+    "candidate_cap_mode": "none",
+    "strict_surrogate": "off",
+    "fixed_cap": 128
+  }
+}

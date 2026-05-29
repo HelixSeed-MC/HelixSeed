@@ -62,7 +62,7 @@ C++ pipeline driven by `scanner_native.exe`. Implements three scan modes:
 
 ### Vendored
 
-- `cubiomes_12111_fork/` — cubiomes retargeted to Minecraft 26.1.2
+- `cubiomes_26.1.2_fork/` — cubiomes retargeted to Minecraft 26.1.2
 - `kaptainwutax/` — SeedFinding libraries (kept for future Java validation work)
 - `GPULootSeedFinder/` — loot resolver for the upcoming loot validation path
 
@@ -177,7 +177,7 @@ ui-ts/                  Electron / TypeScript desktop UI
   docs.html             In-app HelixScript Field Guide
   scripts/              Build / packaging helpers
   assets/               UI icons (HelixSeed.png, Seed.png, kofi-mug.webp)
-cubiomes_12111_fork/    Vendored cubiomes (MC 26.1.2)
+cubiomes_26.1.2_fork/    Vendored cubiomes (MC 26.1.2)
 kaptainwutax/           Vendored SeedFinding libraries
 GPULootSeedFinder/      Vendored loot resolver
 benchmarks/             Performance tests

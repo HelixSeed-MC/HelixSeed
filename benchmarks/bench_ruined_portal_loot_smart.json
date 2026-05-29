@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "logic": "and",
+  "anchor": {"type": "origin"},
+  "constraints": [
+    {
+      "id": "rp1",
+      "structure": "ruined_portal",
+      "mode": "strict",
+      "within": {"anchor": "origin", "radius": 64}
+    }
+  ],
+  "loot_filters": [
+    {
+      "constraint": "rp1",
+      "structure": "auto",
+      "required": {
+        "flint_and_steel": 1,
+        "iron_nugget": 32,
+        "obsidian": 10
+      }
+    }
+  ],
+  "safety": {
+    "completeness": "approximate"
+  },
+  "performance": {
+    "strict_workers": 0,
+    "execution_mode": "max-throughput",
+    "compiled_stage_a_mode": "multi",
+    "candidate_cap_mode": "adaptive",
+    "strict_surrogate": "lightspeed",
+    "fixed_cap": 128
+  }
+}

@@ -97,10 +97,15 @@ GPU_FILTER_API int gpu_filter_multi_checked(
 // submit/collect pair below. Older DLLs without this symbol must be treated as
 // not supporting async, and callers should fall back to gpu_filter_multi_checked.
 //
+// gpu_filter_async_max_slots returns the number of async slots accepted by
+// gpu_filter_multi_submit/collect. Older DLLs without this symbol should be
+// treated as supporting two slots when gpu_filter_double_buffer_available is 1.
+//
 // gpu_filter_multi_submit launches a Stage A prefilter batch on the requested
-// slot (0 or 1) and returns without waiting for the GPU. The slot must not
-// already be in flight. Inputs are copied internally, so the caller may free
-// or modify the buffers as soon as submit returns.
+// slot (0 <= slot < gpu_filter_async_max_slots()) and returns without waiting
+// for the GPU. The slot must not already be in flight. Inputs are copied
+// internally, so the caller may free or modify the buffers as soon as submit
+// returns.
 //
 // gpu_filter_multi_collect blocks until the slot's GPU work and D2H transfers
 // are done, copies the survivors into out_buffer (up to out_capacity entries),
@@ -110,6 +115,7 @@ GPU_FILTER_API int gpu_filter_multi_checked(
 // Both functions return 0 on success and the same negative status codes as
 // gpu_filter_multi_checked on failure.
 GPU_FILTER_API int gpu_filter_double_buffer_available(void);
+GPU_FILTER_API uint32_t gpu_filter_async_max_slots(void);
 
 GPU_FILTER_API int gpu_filter_multi_submit(
     uint32_t slot_id,

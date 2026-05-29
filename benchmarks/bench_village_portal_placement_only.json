@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "logic": "and",
+  "anchor": {"type": "origin"},
+  "constraints": [
+    {
+      "id": "v1",
+      "structure": "village",
+      "dimension": "overworld",
+      "mode": "placement",
+      "within": {"anchor": "origin", "radius": 64}
+    },
+    {
+      "id": "c2",
+      "structure": "ruined_portal",
+      "dimension": "overworld",
+      "mode": "placement",
+      "within": {"anchor": "origin", "radius": 64}
+    }
+  ],
+  "biome_filters": [],
+  "loot_filters": [],
+  "safety": {
+    "completeness": "approximate"
+  },
+  "performance": {
+    "strict_workers": 16,
+    "execution_mode": "max-throughput",
+    "compiled_stage_a_mode": "multi",
+    "candidate_cap_mode": "adaptive",
+    "strict_surrogate": "lightspeed",
+    "fixed_cap": 128
+  }
+}

@@ -9,7 +9,9 @@
     "build": "tsc -p tsconfig.main.json && vite build",
     "stage:resources": "node scripts/stage-resources.mjs",
     "start": "npm run build && electron .",
-    "dist:win": "npm run build && npm run stage:resources && node scripts/package-win.mjs"
+    "dist:win": "npm run build && npm run stage:resources && node scripts/package-win.mjs",
+    "dist:mac": "npm run build && node scripts/package-mac.mjs",
+    "dist:linux": "npm run build && node scripts/package-linux.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.2",
@@ -24,7 +26,7 @@
   "devDependencies": {
     "@electron/packager": "^20.0.0",
     "@types/node": "^22.10.2",
-    "electron": "^33.3.0",
+    "electron": "^42.3.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.3"
   }

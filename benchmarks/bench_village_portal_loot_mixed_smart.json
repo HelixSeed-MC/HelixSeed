@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "logic": "and",
+  "anchor": {"type": "origin"},
+  "constraints": [
+    {
+      "id": "v1",
+      "structure": "village",
+      "dimension": "overworld",
+      "mode": "mixed",
+      "within": {"anchor": "origin", "radius": 64}
+    },
+    {
+      "id": "c2",
+      "structure": "ruined_portal",
+      "dimension": "overworld",
+      "mode": "mixed",
+      "within": {"anchor": "origin", "radius": 64}
+    }
+  ],
+  "loot_filters": [
+    {
+      "constraint": "c2",
+      "structure": "auto",
+      "required": {
+        "obsidian": 10
+      }
+    },
+    {
+      "constraint": "c2",
+      "structure": "auto",
+      "required": {
+        "flint_and_steel": 1
+      }
+    }
+  ],
+  "safety": {
+    "completeness": "approximate"
+  },
+  "performance": {
+    "strict_workers": 16,
+    "execution_mode": "max-throughput",
+    "compiled_stage_a_mode": "multi",
+    "candidate_cap_mode": "adaptive",
+    "strict_surrogate": "lightspeed",
+    "fixed_cap": 128
+  }
+}

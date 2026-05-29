@@ -13,8 +13,8 @@
 //   - Tool detection uses SearchPathW (instant, no console flashes).
 //   - Visual Studio is discovered via vswhere; cl works without a Developer
 //     Command Prompt by routing the C++ build through vcvars64.bat.
-//   - Per-tool Install buttons run winget where there's a real package id;
-//     otherwise the official download page opens in the browser.
+//   - Per-tool Install buttons use winget for the required build tools.
+//   - Maven can be bundled beside the installer as tools\apache-maven-*-bin.zip.
 //   - The build runs in a worker thread; output is piped into the log via
 //     chunked WM_APP messages so the UI stays responsive.
 //
@@ -56,6 +56,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
+#define IDI_APP_ICON 101
+
 namespace fs = std::filesystem;
 
 // =========================================================================
@@ -81,6 +83,8 @@ constexpr COLORREF C_ACCENT     = RGB(255, 255, 255);
 constexpr COLORREF C_GREEN      = RGB(111, 191, 138);
 constexpr COLORREF C_RED        = RGB(201, 112, 112);
 constexpr COLORREF C_DIVIDER    = RGB(48, 48, 52);
+constexpr COLORREF C_APP_GREEN  = RGB(95, 150, 64);
+constexpr COLORREF C_APP_GREEN_DARK = RGB(38, 62, 31);
 
 // Layout
 constexpr int W_WINDOW = 800;
@@ -96,11 +100,14 @@ constexpr int Y_PATH_PANEL  = Y_TOPBAR_H + 16;
 constexpr int H_PATH_PANEL  = 110;
 
 constexpr int Y_TOOLS_PANEL = Y_PATH_PANEL + H_PATH_PANEL + 12;
-constexpr int H_TOOLS_PANEL = 220;
+// Sized so all 6 tool rows fit: 56 header strip + 6 * 30 row height + 0 padding.
+constexpr int H_TOOLS_PANEL = 236;
 constexpr int H_TOOL_ROW    = 30;
 
 constexpr int Y_LOG_PANEL   = Y_TOOLS_PANEL + H_TOOLS_PANEL + 12;
-constexpr int H_LOG_PANEL   = 220;
+// Reduced to compensate for the taller toolchain panel so the action bar
+// stays at the same y; preserves the existing fixed window size.
+constexpr int H_LOG_PANEL   = 204;
 
 constexpr int Y_ACTION_BAR  = Y_LOG_PANEL + H_LOG_PANEL + 16;
 constexpr int H_ACTION      = 38;
@@ -115,7 +122,14 @@ enum : int {
     ID_LAUNCH_BTN    = 121,
     ID_OPEN_BTN      = 122,
     ID_CLOSE_BTN     = 123,
+    ID_BACKEND_COMBO = 124,
     ID_TOOL_BASE     = 200,  // ID_TOOL_BASE + i*10 + 1 = install button for tool i
+};
+
+enum BackendChoice : int {
+    BACKEND_BOTH    = 0,
+    BACKEND_CUDA    = 1,
+    BACKEND_OPENCL  = 2,
 };
 
 constexpr UINT WM_APP_LOG_CHUNK = WM_APP + 1;
@@ -146,12 +160,12 @@ const ToolDef kTools[] = {
       L"https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022",
       true },
     { L"nvcc.exe", L"nvcc", L"CUDA prefilter compiler",
-      nullptr,
+      L"Nvidia.CUDA",
       L"https://developer.nvidia.com/cuda-toolkit", true },
     { L"javac.exe", L"JDK", L"Loot / Java validation compiler",
       L"Microsoft.OpenJDK.21",
       L"https://learn.microsoft.com/java/openjdk/download", true },
-    { L"mvn.cmd",  L"mvn",  L"Loot validator (optional)",
+    { L"mvn.cmd",  L"mvn",  L"Bundled loot build tool",
       nullptr,
       L"https://maven.apache.org/download.cgi", false },
 };
@@ -165,6 +179,7 @@ HFONT g_fontBody  = nullptr;   // Segoe UI 12
 HFONT g_fontSmall = nullptr;   // Segoe UI 11
 HFONT g_fontStatus = nullptr;  // Segoe UI 12 semibold (status pill)
 HFONT g_fontMono  = nullptr;   // Consolas 11 (log)
+HICON g_appIcon   = nullptr;
 
 HBRUSH g_brushBg        = nullptr;
 HBRUSH g_brushPanel     = nullptr;
@@ -177,6 +192,8 @@ HWND g_browseBtn  = nullptr;
 HWND g_defaultBtn = nullptr;
 HWND g_logEdit    = nullptr;
 HWND g_installBtn = nullptr;
+HWND g_backendLabel = nullptr;
+HWND g_backendCombo = nullptr;
 HWND g_launchBtn  = nullptr;
 HWND g_openBtn    = nullptr;
 HWND g_closeBtn   = nullptr;
@@ -191,6 +208,8 @@ struct ToolUi {
 ToolUi g_toolUi[kToolCount];
 
 bool g_hasWinget = false;
+bool g_hasSystemMaven = false;
+bool g_hasBundledMaven = false;
 std::wstring g_vcvarsPath;
 std::wstring g_jdkHome;
 std::wstring g_installedExePath;
@@ -203,6 +222,11 @@ struct ButtonState {
     HWND hwnd = nullptr;
     bool hover = false;
     bool primary = false;  // Install HelixSeed = primary white button
+    // Color to fill the button's bounding rect *outside* the rounded shape.
+    // The BUTTON window class erases its background to COLOR_BTNFACE before
+    // sending WM_DRAWITEM; without painting over those corners with the
+    // parent's color, light-gray pixels bleed through at every button corner.
+    COLORREF bgColor = C_BG;
 };
 std::vector<ButtonState> g_buttons;
 
@@ -276,6 +300,13 @@ void drawCustomButton(LPDRAWITEMSTRUCT dis) {
     bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
     bool disabled = (dis->itemState & ODS_DISABLED) != 0;
     bool focused  = (dis->itemState & ODS_FOCUS) != 0;
+    COLORREF parentBg = st ? st->bgColor : C_BG;
+
+    // Repaint the full bounding rect with the parent's background color
+    // first. The rounded fill below leaves four corner triangles uncovered;
+    // without this step the BUTTON class's default COLOR_BTNFACE erase
+    // shows through as bright pixels at every corner.
+    fillSolid(dis->hDC, dis->rcItem, parentBg);
 
     COLORREF fill, border, text;
     if (primary) {
@@ -290,7 +321,7 @@ void drawCustomButton(LPDRAWITEMSTRUCT dis) {
         }
     } else {
         if (disabled) {
-            fill = C_PANEL; border = C_LINE_SOFT; text = C_SUBTLE;
+            fill = parentBg; border = C_LINE_SOFT; text = C_SUBTLE;
         } else if (pressed) {
             fill = RGB(8, 8, 8); border = RGB(58, 58, 58); text = C_TEXT;
         } else if (hover) {
@@ -300,19 +331,15 @@ void drawCustomButton(LPDRAWITEMSTRUCT dis) {
         }
     }
 
-    fillRoundRect(dis->hDC, dis->rcItem, 6, fill, border);
-
-    if (focused && !disabled) {
-        // subtle inner focus ring
-        RECT rf = dis->rcItem;
-        InflateRect(&rf, -3, -3);
-        HPEN pen = CreatePen(PS_DOT, 1, primary ? RGB(120, 120, 120) : RGB(80, 80, 80));
-        HGDIOBJ op = SelectObject(dis->hDC, pen);
-        HGDIOBJ ob = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
-        Rectangle(dis->hDC, rf.left, rf.top, rf.right, rf.bottom);
-        SelectObject(dis->hDC, op); SelectObject(dis->hDC, ob);
-        DeleteObject(pen);
+    // Focus is shown by brightening the border only; no second inset
+    // round-rect. Two concentric rounded rects with different radii leave
+    // sub-pixel mismatches at the corners that look like tiny line/dot
+    // artifacts, especially when focus jumps from one button to another.
+    if (focused && !disabled && !pressed) {
+        border = primary ? RGB(255, 255, 255) : RGB(96, 96, 102);
     }
+
+    fillRoundRect(dis->hDC, dis->rcItem, 6, fill, border);
 
     wchar_t buf[256];
     GetWindowTextW(dis->hwndItem, buf, 256);
@@ -320,8 +347,8 @@ void drawCustomButton(LPDRAWITEMSTRUCT dis) {
 }
 
 LRESULT CALLBACK ButtonSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
-                                    UINT_PTR /*id*/, DWORD_PTR ref) {
-    ButtonState* st = reinterpret_cast<ButtonState*>(ref);
+                                    UINT_PTR /*id*/, DWORD_PTR /*ref*/) {
+    ButtonState* st = findButtonState(h);
     switch (msg) {
         case WM_MOUSEMOVE:
             if (st && !st->hover) {
@@ -338,19 +365,20 @@ LRESULT CALLBACK ButtonSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
     return DefSubclassProc(h, msg, wp, lp);
 }
 
-void registerOwnerButton(HWND h, bool primary) {
-    g_buttons.push_back(ButtonState{ h, false, primary });
-    SetWindowSubclass(h, ButtonSubclassProc, 1, reinterpret_cast<DWORD_PTR>(&g_buttons.back()));
+void registerOwnerButton(HWND h, bool primary, COLORREF bgColor) {
+    g_buttons.push_back(ButtonState{ h, false, primary, bgColor });
+    SetWindowSubclass(h, ButtonSubclassProc, 1, 0);
 }
 
 HWND createButton(HWND parent, const wchar_t* text, int id, int x, int y, int w, int h,
-                  bool primary = false, bool defaultBtn = false) {
+                  bool primary = false, bool defaultBtn = false, COLORREF bgColor = C_PANEL) {
+    (void)defaultBtn;
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW
-                  | (defaultBtn ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON);
+                  | BS_PUSHBUTTON;
     HWND b = CreateWindowW(L"BUTTON", text, style, x, y, w, h, parent,
                            reinterpret_cast<HMENU>((INT_PTR)id), nullptr, nullptr);
     SendMessageW(b, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
-    registerOwnerButton(b, primary);
+    registerOwnerButton(b, primary, bgColor);
     return b;
 }
 
@@ -373,6 +401,44 @@ HWND createLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h,
 bool toolFound(const wchar_t* exeName) {
     wchar_t buf[MAX_PATH];
     return SearchPathW(nullptr, exeName, nullptr, MAX_PATH, buf, nullptr) > 0;
+}
+
+bool canInstallTool(const ToolDef& tool) {
+    return g_hasWinget && tool.wingetId != nullptr;
+}
+
+bool startsWith(const std::wstring& s, const std::wstring& prefix) {
+    return s.rfind(prefix, 0) == 0;
+}
+
+bool endsWith(const std::wstring& s, const std::wstring& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::wstring moduleDirectory() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return L".";
+    return fs::path(buf).parent_path().wstring();
+}
+
+std::wstring findBundledMavenZip() {
+    const fs::path dir = fs::path(moduleDirectory()) / L"tools";
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return {};
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        const std::wstring name = entry.path().filename().wstring();
+        if (startsWith(name, L"apache-maven-") && endsWith(name, L"-bin.zip")) {
+            return entry.path().wstring();
+        }
+    }
+    return {};
+}
+
+bool bundledMavenAvailable() {
+    return !findBundledMavenZip().empty();
 }
 
 std::wstring runCaptureSilent(const std::wstring& command) {
@@ -475,10 +541,17 @@ bool discoverJdk() {
 }
 
 void rescanTools() {
+    g_hasWinget = toolFound(L"winget.exe");
+    g_hasSystemMaven = toolFound(L"mvn.cmd");
+    g_hasBundledMaven = bundledMavenAvailable();
     discoverVisualStudio();
     discoverJdk();
     for (int i = 0; i < kToolCount; ++i) {
         bool found = toolFound(kTools[i].exeName);
+        const std::wstring exeName = kTools[i].exeName;
+        if (!found && exeName == L"mvn.cmd" && g_hasBundledMaven) {
+            found = true;
+        }
         if (!found && std::wstring(kTools[i].exeName) == L"cl.exe" && !g_vcvarsPath.empty()) {
             found = true;
         }
@@ -489,23 +562,25 @@ void rescanTools() {
 
         std::wstring statusText;
         if (found) {
-            statusText = L"*  found";
-            if (std::wstring(kTools[i].exeName) == L"cl.exe" && !g_vcvarsPath.empty()
-                && SearchPathW(nullptr, L"cl.exe", nullptr, 0, nullptr, nullptr) == 0) {
-                statusText = L"*  found via vswhere";
+            statusText = L"found";
+            if (exeName == L"mvn.cmd" && !g_hasSystemMaven && g_hasBundledMaven) {
+                statusText = L"bundled";
             }
-            if (std::wstring(kTools[i].exeName) == L"javac.exe" && !g_jdkHome.empty()
+            if (exeName == L"cl.exe" && !g_vcvarsPath.empty()
+                && SearchPathW(nullptr, L"cl.exe", nullptr, 0, nullptr, nullptr) == 0) {
+                statusText = L"found via vswhere";
+            }
+            if (exeName == L"javac.exe" && !g_jdkHome.empty()
                 && SearchPathW(nullptr, L"javac.exe", nullptr, 0, nullptr, nullptr) == 0) {
-                statusText = L"*  found via JDK folder";
+                statusText = L"found via JDK folder";
             }
         } else {
-            statusText = kTools[i].required ? L"*  missing" : L"*  optional";
+            statusText = kTools[i].required ? L"missing" : L"optional";
         }
         SetWindowTextW(g_toolUi[i].statusLabel, statusText.c_str());
         InvalidateRect(g_toolUi[i].statusLabel, nullptr, TRUE);
 
-        bool canHelp = (kTools[i].wingetId && g_hasWinget) || kTools[i].downloadUrl;
-        EnableWindow(g_toolUi[i].actionBtn, !found && canHelp);
+        EnableWindow(g_toolUi[i].actionBtn, !found && canInstallTool(kTools[i]));
         InvalidateRect(g_toolUi[i].actionBtn, nullptr, FALSE);
     }
 }
@@ -595,11 +670,23 @@ int runCaptured(const std::wstring& workDir, const std::wstring& command) {
 // =========================================================================
 void launchInstallForTool(int idx) {
     const ToolDef& t = kTools[idx];
-    if (g_hasWinget && t.wingetId) {
+    const wchar_t* packageId = t.wingetId;
+
+    if (std::wstring(t.exeName) == L"mvn.cmd") {
+        MessageBoxW(g_hwnd,
+            L"Maven is bundled in installer.zip as tools\\apache-maven-*-bin.zip. "
+            L"Put that tools folder beside HelixSeedInstaller.exe before running the installer.",
+            kAppTitle, MB_ICONINFORMATION | MB_OK);
+    } else if (!g_hasWinget) {
+        MessageBoxW(g_hwnd,
+            L"winget is required to install missing build tools. Install App Installer from Microsoft, "
+            L"then reopen this installer.",
+            kAppTitle, MB_ICONWARNING | MB_OK);
+    } else if (packageId) {
         std::wstring cmd = L"winget install --id ";
-        cmd += t.wingetId;
+        cmd += packageId;
         cmd += L" -e --accept-package-agreements --accept-source-agreements";
-        if (std::wstring(t.wingetId).find(L"BuildTools") != std::wstring::npos) {
+        if (std::wstring(packageId).find(L"BuildTools") != std::wstring::npos) {
             cmd += L" --override \"--add Microsoft.VisualStudio.Workload.VCTools "
                    L"--add Microsoft.VisualStudio.Component.Windows10SDK "
                    L"--includeRecommended --quiet --norestart\"";
@@ -609,8 +696,10 @@ void launchInstallForTool(int idx) {
             L"Installing the package via winget. When the console finishes, "
             L"close it and the toolchain status here will refresh.",
             kAppTitle, MB_ICONINFORMATION | MB_OK);
-    } else if (t.downloadUrl) {
-        ShellExecuteW(g_hwnd, L"open", t.downloadUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    } else {
+        MessageBoxW(g_hwnd,
+            L"This tool is bundled or handled by the build and has no winget package configured here.",
+            kAppTitle, MB_ICONWARNING | MB_OK);
     }
     PostMessageW(g_hwnd, WM_APP_RESCAN, 0, 0);
 }
@@ -623,6 +712,7 @@ struct WorkerArgs {
     bool hasMvn;
     std::wstring vcvarsPath;
     std::wstring jdkHome;
+    BackendChoice backend;
 };
 
 std::wstring withVcvars(const std::wstring& vcvarsPath, const std::wstring& command) {
@@ -634,9 +724,64 @@ bool pathExists(const std::wstring& p) {
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+std::wstring psSingleQuote(const std::wstring& s) {
+    std::wstring out = L"'";
+    for (wchar_t ch : s) {
+        if (ch == L'\'') out += L"''";
+        else out.push_back(ch);
+    }
+    out.push_back(L'\'');
+    return out;
+}
+
+std::wstring findMavenHomeUnder(const fs::path& toolsRoot) {
+    std::error_code ec;
+    if (!fs::exists(toolsRoot, ec) || !fs::is_directory(toolsRoot, ec)) return {};
+    std::vector<fs::path> candidates;
+    for (const auto& entry : fs::directory_iterator(toolsRoot, ec)) {
+        if (entry.is_directory(ec)) candidates.push_back(entry.path());
+    }
+    std::sort(candidates.begin(), candidates.end(), std::greater<fs::path>());
+    for (const auto& candidate : candidates) {
+        if (fs::exists(candidate / L"bin" / L"mvn.cmd", ec)) {
+            return candidate.wstring();
+        }
+    }
+    return {};
+}
+
+std::wstring ensureBundledMaven(const std::wstring& installPath) {
+    const std::wstring zip = findBundledMavenZip();
+    if (zip.empty()) return {};
+
+    const fs::path toolsRoot = fs::path(installPath) / L".tools";
+    if (std::wstring existing = findMavenHomeUnder(toolsRoot); !existing.empty()) {
+        return existing;
+    }
+
+    std::error_code ec;
+    fs::create_directories(toolsRoot, ec);
+    if (ec) return {};
+
+    postLog(L"[*] Extracting bundled Maven from " + zip);
+    std::wstring cmd = L"powershell -NoProfile -ExecutionPolicy Bypass -Command ";
+    cmd += L"\"Expand-Archive -LiteralPath ";
+    cmd += psSingleQuote(zip);
+    cmd += L" -DestinationPath ";
+    cmd += psSingleQuote(toolsRoot.wstring());
+    cmd += L" -Force\"";
+    if (runCaptured(L"", cmd) != 0) return {};
+    return findMavenHomeUnder(toolsRoot);
+}
+
 std::wstring withJdk(const std::wstring& jdkHome, const std::wstring& command) {
     if (jdkHome.empty()) return command;
     return L"set \"JAVA_HOME=" + jdkHome + L"\" && set \"PATH=" + jdkHome + L"\\bin;%PATH%\" && " + command;
+}
+
+std::wstring withMavenHome(const std::wstring& mavenHome, const std::wstring& command) {
+    if (mavenHome.empty()) return command;
+    return L"set \"MAVEN_HOME=" + mavenHome + L"\" && set \"PATH=" + mavenHome + L"\\bin;%PATH%\" && " + command;
 }
 
 void buildWorker(WorkerArgs args) {
@@ -667,11 +812,39 @@ void buildWorker(WorkerArgs args) {
 
     if (!args.vcvarsPath.empty()) postLog(L"[*] Using MSVC environment from " + args.vcvarsPath);
 
-    postLog("[*] Building CUDA prefilter...");
-    if (runCaptured(args.installPath, withVcvars(args.vcvarsPath, L"cuda\\build_cuda.bat")) != 0) {
-        fail("CUDA build failed."); return;
+    const bool wantCuda   = (args.backend == BACKEND_CUDA || args.backend == BACKEND_BOTH);
+    const bool wantOpenCL = (args.backend == BACKEND_OPENCL || args.backend == BACKEND_BOTH);
+
+    if (wantCuda) {
+        postLog("[*] Building CUDA prefilter...");
+        if (runCaptured(args.installPath, withVcvars(args.vcvarsPath, L"cuda\\build_cuda.bat")) != 0) {
+            // In "both" mode treat CUDA failure as non-fatal so OpenCL-only
+            // users with nvcc installed but a broken CUDA toolchain still
+            // get a working build. CUDA-only selection remains hard-fail.
+            if (args.backend == BACKEND_CUDA) {
+                fail("CUDA build failed."); return;
+            }
+            postLog("[warn] CUDA prefilter build failed; continuing with OpenCL only.");
+        } else {
+            postLog("[ok] CUDA prefilter built.");
+        }
+    } else {
+        postLog("[*] Skipping CUDA prefilter (OpenCL-only selected).");
     }
-    postLog("[ok] CUDA prefilter built.");
+
+    if (wantOpenCL) {
+        postLog("[*] Building OpenCL prefilter...");
+        if (runCaptured(args.installPath, withVcvars(args.vcvarsPath, L"opencl\\build_opencl.bat")) != 0) {
+            if (args.backend == BACKEND_OPENCL) {
+                fail("OpenCL build failed."); return;
+            }
+            postLog("[warn] OpenCL prefilter build failed; continuing with CUDA only.");
+        } else {
+            postLog("[ok] OpenCL prefilter built.");
+        }
+    } else {
+        postLog("[*] Skipping OpenCL prefilter (CUDA-only selected).");
+    }
 
     postLog("[*] Building native scanner...");
     if (runCaptured(args.installPath, withVcvars(args.vcvarsPath, L"native\\build_scanner_core.bat")) != 0) {
@@ -679,10 +852,10 @@ void buildWorker(WorkerArgs args) {
     }
     postLog("[ok] Native scanner built.");
 
-    // cubiomes_12111_fork must be built before stage-resources can stage lib.dll
-    if (fs::exists(fs::path(args.installPath) / "cubiomes_12111_fork" / "build_windows.bat")) {
-        postLog("[*] Building cubiomes (cubiomes_12111_fork\\build_windows.bat)...");
-        if (runCaptured(args.installPath + L"\\cubiomes_12111_fork",
+    // cubiomes_26.1.2_fork must be built before stage-resources can stage lib.dll
+    if (fs::exists(fs::path(args.installPath) / "cubiomes_26.1.2_fork" / "build_windows.bat")) {
+        postLog("[*] Building cubiomes (cubiomes_26.1.2_fork\\build_windows.bat)...");
+        if (runCaptured(args.installPath + L"\\cubiomes_26.1.2_fork",
                         withVcvars(args.vcvarsPath, L"build_windows.bat")) != 0) {
             fail("cubiomes build failed."); return;
         }
@@ -696,18 +869,33 @@ void buildWorker(WorkerArgs args) {
         }
 
         const bool hasWrapper = pathExists(lootDir + L"\\mvnw.cmd");
-        const std::wstring mvnCmd = args.hasMvn ? L"mvn.cmd" : (hasWrapper ? L"mvnw.cmd" : L"");
+        std::wstring mavenHome;
+        std::wstring mvnCmd;
+        if (args.hasMvn) {
+            mvnCmd = L"mvn.cmd";
+        } else {
+            mavenHome = ensureBundledMaven(args.installPath);
+            if (!mavenHome.empty()) {
+                mvnCmd = L"\"" + mavenHome + L"\\bin\\mvn.cmd\"";
+            } else if (hasWrapper) {
+                mvnCmd = L"mvnw.cmd";
+            }
+        }
         if (mvnCmd.empty()) {
-            fail("Maven is missing and GPULootSeedFinder\\mvnw.cmd was not found."); return;
+            fail("Maven is missing. installer.zip should include tools\\apache-maven-*-bin.zip."); return;
         }
 
-        postLog(args.hasMvn
-            ? L"[*] Building GPULootSeedFinder (mvn.cmd)..."
-            : L"[*] Building GPULootSeedFinder (mvnw.cmd)...");
+        if (args.hasMvn) {
+            postLog(L"[*] Building GPULootSeedFinder (system mvn.cmd)...");
+        } else if (!mavenHome.empty()) {
+            postLog(L"[*] Building GPULootSeedFinder (bundled Maven)...");
+        } else {
+            postLog(L"[*] Building GPULootSeedFinder (mvnw.cmd)...");
+        }
         const std::wstring lootBuild =
             mvnCmd + L" -q -DskipTests package dependency:build-classpath "
                      L"\"-Dmdep.outputFile=target\\runtime-classpath.txt\"";
-        if (runCaptured(lootDir, withJdk(args.jdkHome, lootBuild)) != 0) {
+        if (runCaptured(lootDir, withJdk(args.jdkHome, withMavenHome(mavenHome, lootBuild))) != 0) {
             fail("Loot validator build failed."); return;
         }
 
@@ -760,7 +948,7 @@ std::wstring pickFolder(HWND owner) {
 }
 
 // =========================================================================
-// WM_PAINT — paint background, brand mark, panels, separators
+// WM_PAINT - paint background, brand mark, panels, separators
 // =========================================================================
 void paintWindow(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -773,16 +961,20 @@ void paintWindow(HWND hwnd) {
     RECT divider{ 0, Y_TOPBAR_H - 1, clientRect.right, Y_TOPBAR_H };
     fillSolid(dc, divider, C_LINE_SOFT);
 
-    // Brand mark (HS box)
-    RECT mark{ X_PAD, 20, X_PAD + 32, 52 };
-    fillRoundRect(dc, mark, 6, C_PANEL, C_LINE);
-    drawCenteredText(dc, mark, L"HS", C_TEXT, g_fontStatus);
+    // Brand mark
+    RECT mark{ X_PAD, 20, X_PAD + 36, 56 };
+    fillRoundRect(dc, mark, 7, C_APP_GREEN_DARK, C_APP_GREEN);
+    if (g_appIcon) {
+        DrawIconEx(dc, mark.left + 4, mark.top + 4, g_appIcon, 28, 28, 0, nullptr, DI_NORMAL);
+    } else {
+        drawCenteredText(dc, mark, L"HS", C_TEXT, g_fontStatus);
+    }
 
     // Brand title + subtitle
-    RECT title{ X_PAD + 44, 18, clientRect.right - X_PAD, 40 };
+    RECT title{ X_PAD + 48, 18, clientRect.right - X_PAD, 40 };
     drawLeftText(dc, title, L"HelixSeed Installer", C_TEXT, g_fontBrand);
-    RECT sub{ X_PAD + 44, 40, clientRect.right - X_PAD, 60 };
-    drawLeftText(dc, sub, L"GPU-assisted Minecraft seed scanner — clones, builds, packages.",
+    RECT sub{ X_PAD + 48, 40, clientRect.right - X_PAD, 60 };
+    drawLeftText(dc, sub, L"Source installer: clones, builds, and packages the desktop app.",
                  C_MUTED, g_fontSmall);
 
     // ---- Panels (rounded fill + border, then header) ----
@@ -817,7 +1009,6 @@ void paintWindow(HWND hwnd) {
 
     EndPaint(hwnd, &ps);
 }
-
 // =========================================================================
 // Layout (controls placed inside painted panels)
 // =========================================================================
@@ -853,6 +1044,7 @@ void buildUi(HWND hwnd) {
         W_PANEL - 232, 32,
         hwnd, reinterpret_cast<HMENU>((INT_PTR)ID_PATH_EDIT), nullptr, nullptr);
     SendMessageW(g_pathEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
+    SetWindowTheme(g_pathEdit, L"DarkMode_Explorer", nullptr);
 
     g_browseBtn  = createButton(hwnd, L"Browse...", ID_BROWSE_BTN,
                                 X_PANEL + W_PANEL - 212, Y_PATH_PANEL + 56, 95, 32);
@@ -888,16 +1080,36 @@ void buildUi(HWND hwnd) {
         W_PANEL - 32, H_LOG_PANEL - 72,
         hwnd, reinterpret_cast<HMENU>((INT_PTR)ID_LOG_EDIT), nullptr, nullptr);
     SendMessageW(g_logEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontMono), TRUE);
+    SetWindowTheme(g_logEdit, L"DarkMode_Explorer", nullptr);
 
     // ---- Action buttons ----
     g_installBtn = createButton(hwnd, L"Install HelixSeed", ID_INSTALL_BTN,
-        X_PANEL, Y_ACTION_BAR, 200, H_ACTION, true, true);
+        X_PANEL, Y_ACTION_BAR, 200, H_ACTION, true, true, C_BG);
     g_launchBtn  = createButton(hwnd, L"Launch", ID_LAUNCH_BTN,
-        X_PANEL + 212, Y_ACTION_BAR, 110, H_ACTION);
+        X_PANEL + 212, Y_ACTION_BAR, 110, H_ACTION, false, false, C_BG);
     g_openBtn    = createButton(hwnd, L"Open Folder", ID_OPEN_BTN,
-        X_PANEL + 330, Y_ACTION_BAR, 130, H_ACTION);
+        X_PANEL + 330, Y_ACTION_BAR, 130, H_ACTION, false, false, C_BG);
+
+    // GPU backend selector. Sits between Open Folder and Close. Default to
+    // Both so existing users get the same behaviour with no extra clicks.
+    const int comboY = Y_ACTION_BAR + (H_ACTION - 24) / 2;
+    g_backendLabel = CreateWindowExW(0, L"STATIC", L"GPU backend:",
+        WS_CHILD | WS_VISIBLE | SS_RIGHT,
+        X_PANEL + 470, comboY + 4, 88, 18,
+        hwnd, nullptr, nullptr, nullptr);
+    SendMessageW(g_backendLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontSmall), TRUE);
+    g_backendCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        X_PANEL + 562, comboY, 100, 200,
+        hwnd, reinterpret_cast<HMENU>((INT_PTR)ID_BACKEND_COMBO), nullptr, nullptr);
+    SendMessageW(g_backendCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
+    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Both"));
+    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CUDA only"));
+    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"OpenCL only"));
+    SendMessageW(g_backendCombo, CB_SETCURSEL, BACKEND_BOTH, 0);
+
     g_closeBtn   = createButton(hwnd, L"Close", ID_CLOSE_BTN,
-        X_PANEL + W_PANEL - 110, Y_ACTION_BAR, 110, H_ACTION);
+        X_PANEL + W_PANEL - 110, Y_ACTION_BAR, 110, H_ACTION, false, false, C_BG);
 
     EnableWindow(g_launchBtn, FALSE);
     EnableWindow(g_openBtn, FALSE);
@@ -918,9 +1130,20 @@ void onInstallClicked(HWND hwnd) {
         return;
     }
 
+    const LRESULT comboSel = SendMessageW(g_backendCombo, CB_GETCURSEL, 0, 0);
+    BackendChoice backend = BACKEND_BOTH;
+    if (comboSel == BACKEND_CUDA || comboSel == BACKEND_OPENCL) {
+        backend = static_cast<BackendChoice>(comboSel);
+    }
+
     bool requiredOk = true;
     for (int i = 0; i < kToolCount; ++i) {
-        if (kTools[i].required && !g_toolUi[i].found) { requiredOk = false; break; }
+        if (!kTools[i].required) continue;
+        // nvcc is only required when building the CUDA backend.
+        if (std::wstring(kTools[i].exeName) == L"nvcc.exe" && backend == BACKEND_OPENCL) {
+            continue;
+        }
+        if (!g_toolUi[i].found) { requiredOk = false; break; }
     }
     if (!requiredOk) {
         MessageBoxW(hwnd,
@@ -940,17 +1163,12 @@ void onInstallClicked(HWND hwnd) {
     EnableWindow(g_browseBtn, FALSE);
     EnableWindow(g_defaultBtn, FALSE);
     EnableWindow(g_pathEdit, FALSE);
+    if (g_backendCombo) EnableWindow(g_backendCombo, FALSE);
     SetWindowTextW(g_logEdit, L"");
 
     bool clOnPath = SearchPathW(nullptr, L"cl.exe", nullptr, 0, nullptr, nullptr) > 0;
-    bool hasMvn = false;
-    for (int i = 0; i < kToolCount; ++i) {
-        if (std::wstring(kTools[i].exeName) == L"mvn.cmd") {
-            hasMvn = g_toolUi[i].found;
-            break;
-        }
-    }
-    WorkerArgs args{ path, hasMvn, clOnPath ? L"" : g_vcvarsPath, g_jdkHome };
+    bool hasMvn = g_hasSystemMaven;
+    WorkerArgs args{ path, hasMvn, clOnPath ? L"" : g_vcvarsPath, g_jdkHome, backend };
     std::thread([args]() { buildWorker(args); }).detach();
 }
 
@@ -967,6 +1185,7 @@ void onDone(WPARAM success, LPARAM lparam) {
     EnableWindow(g_browseBtn, TRUE);
     EnableWindow(g_defaultBtn, TRUE);
     EnableWindow(g_pathEdit, TRUE);
+    if (g_backendCombo) EnableWindow(g_backendCombo, TRUE);
 
     if (success && lparam) {
         const wchar_t* p = reinterpret_cast<const wchar_t*>(lparam);
@@ -1003,7 +1222,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_hwnd = hwnd;
             enableDarkTitleBar(hwnd);
             buildUi(hwnd);
-            g_hasWinget = toolFound(L"winget.exe");
             rescanTools();
             return 0;
 
@@ -1137,6 +1355,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
     OleInitialize(nullptr);
+    g_appIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -1146,7 +1365,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;  // we paint everything
     wc.lpszClassName = kClassName;
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = g_appIcon ? g_appIcon : LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIconSm = wc.hIcon;
     if (!RegisterClassExW(&wc)) return 1;
 
     int sw = GetSystemMetrics(SM_CXSCREEN);
@@ -1158,6 +1378,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         (sw - W_WINDOW) / 2, (sh - H_WINDOW) / 2, W_WINDOW, H_WINDOW,
         nullptr, nullptr, hInstance, nullptr);
     if (!hwnd) return 1;
+    if (g_appIcon) {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_appIcon));
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_appIcon));
+    }
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);

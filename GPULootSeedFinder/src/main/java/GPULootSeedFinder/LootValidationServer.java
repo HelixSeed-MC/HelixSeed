@@ -1,16 +1,24 @@
 package GPULootSeedFinder;
 
-import GPULootSeedFinder.cubiomes2612.VanillaWorldgen2612;
+import GPULootSeedFinder.cubiomes2612.VanillaStructureBiomeOracle;
 import GPULootSeedFinder.loot12111.ExactLootTableLibrary;
 import GPULootSeedFinder.loot12111.ExactWorldgenLootResolver;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import kaptainwutax.featureutils.loot.ChestContent;
 import kaptainwutax.featureutils.loot.ILoot;
 import kaptainwutax.featureutils.loot.item.ItemStack;
@@ -18,6 +26,7 @@ import kaptainwutax.featureutils.structure.BuriedTreasure;
 import kaptainwutax.featureutils.structure.DesertPyramid;
 import kaptainwutax.featureutils.structure.RuinedPortal;
 import kaptainwutax.featureutils.structure.Shipwreck;
+import kaptainwutax.featureutils.structure.Village;
 import kaptainwutax.mcutils.rand.ChunkRand;
 import kaptainwutax.mcutils.state.Dimension;
 import kaptainwutax.mcutils.util.pos.CPos;
@@ -37,7 +46,7 @@ public class LootValidationServer {
 
     private static boolean isExact2612(String token) {
         String t = token == null ? "" : token.trim();
-        return "26.1.2".equals(t) || "1.21.11".equals(t) || "4790".equals(t);
+        return "26.1.2".equals(t) || "26.1.1".equals(t) || "1.21.11".equals(t) || "4790".equals(t);
     }
 
     private static String encodeStructure(String structure, String versionToken, long seed, int blockX, int blockZ)
@@ -45,11 +54,12 @@ public class LootValidationServer {
         if (!isExact2612(versionToken)) {
             return "OK\tSTRUCTURE\tSKIP";
         }
-        Boolean result = VanillaWorldgen2612.hasStructure(structure, seed, blockX, blockZ);
-        if (result == null) {
+        VanillaStructureBiomeOracle.ValidationResult result =
+            VanillaStructureBiomeOracle.validateStructure(structure, seed, blockX, blockZ, false);
+        if (result == null || (result.vanillaGenerationPoint().isEmpty() && !result.message().isEmpty())) {
             return "OK\tSTRUCTURE\tSKIP";
         }
-        return "OK\tSTRUCTURE\t" + (result ? "1" : "0");
+        return "OK\tSTRUCTURE\t" + (result.viable() ? "1" : "0");
     }
 
     private static class StructureConfig {
@@ -61,6 +71,457 @@ public class LootValidationServer {
     }
 
     private record SlotEncoding(String slots, String counts) {
+    }
+
+    private record LootRequirement(String item, int count) {
+    }
+
+    private record StructureSettingSpec(boolean abandoned, List<String> buildings) {
+    }
+
+    private record VillageHouseEntry(String location, int weight) {
+    }
+
+    private static final Map<String, List<LootRequirement>> REQUIREMENT_CACHE = new HashMap<>();
+    private static final Map<String, List<VillageHouseEntry>> VILLAGE_HOUSE_POOL_CACHE = new HashMap<>();
+    private static final Pattern VILLAGE_HOUSE_ENTRY = Pattern.compile(
+        "\"location\"\\s*:\\s*\"minecraft:village/([^\"]+)\"[\\s\\S]*?\"weight\"\\s*:\\s*(\\d+)"
+    );
+    private static final String DECOMPILED_ROOT_PROPERTY = "helixseed.minecraft2612.decompiled";
+    private static final String DECOMPILED_ROOT_ENV = "HELIXSEED_MINECRAFT_2612_DECOMPILED";
+    private static final String DEFAULT_DECOMPILED_DIR = "Minecraft-Decompiled-26.1.2";
+
+    private static String normalizeItemId(String item) {
+        String out = item == null ? "" : item.trim().toLowerCase();
+        if (out.startsWith("minecraft:")) {
+            out = out.substring("minecraft:".length());
+        }
+        return out;
+    }
+
+    private static List<LootRequirement> parseRequirements(String encoded) {
+        List<LootRequirement> out = new ArrayList<>();
+        String raw = encoded == null ? "" : encoded.trim();
+        if (raw.isEmpty() || "_".equals(raw)) {
+            return out;
+        }
+        String[] entries = raw.split(";");
+        for (String entry : entries) {
+            String e = entry == null ? "" : entry.trim();
+            if (e.isEmpty() || "_".equals(e)) {
+                continue;
+            }
+            int sep = e.lastIndexOf(':');
+            if (sep <= 0 || sep + 1 >= e.length()) {
+                throw new IllegalArgumentException("Invalid loot requirement: " + e);
+            }
+            String item = normalizeItemId(e.substring(0, sep));
+            int count = Integer.parseInt(e.substring(sep + 1).trim());
+            if (!item.isEmpty() && count > 0) {
+                out.add(new LootRequirement(item, count));
+            }
+        }
+        return out;
+    }
+
+    private static List<LootRequirement> parseRequirementsCached(String encoded) {
+        String key = encoded == null ? "" : encoded.trim();
+        List<LootRequirement> cached = REQUIREMENT_CACHE.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        List<LootRequirement> parsed = List.copyOf(parseRequirements(key));
+        REQUIREMENT_CACHE.put(key, parsed);
+        return parsed;
+    }
+
+    private static String normalizeId(String value) {
+        String out = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+        if (out.startsWith("minecraft:")) {
+            out = out.substring("minecraft:".length());
+        }
+        return out.replace('-', '_').replace(' ', '_');
+    }
+
+    private static StructureSettingSpec parseStructureSettings(String encoded) {
+        boolean abandoned = false;
+        List<String> buildings = new ArrayList<>();
+        String raw = encoded == null ? "" : encoded.trim();
+        if (raw.isEmpty() || "_".equals(raw)) {
+            return new StructureSettingSpec(false, List.of());
+        }
+        for (String group : raw.split(";")) {
+            if (group.isBlank()) {
+                continue;
+            }
+            int sep = group.indexOf('=');
+            if (sep <= 0) {
+                continue;
+            }
+            String key = normalizeId(group.substring(0, sep));
+            String value = group.substring(sep + 1).trim();
+            if ("state".equals(key)) {
+                for (String part : value.split(",")) {
+                    if ("abandoned".equals(normalizeId(part))) {
+                        abandoned = true;
+                    }
+                }
+            } else if ("buildings".equals(key)) {
+                for (String part : value.split(",")) {
+                    String building = normalizeId(part);
+                    if (!building.isEmpty()) {
+                        buildings.add(building);
+                    }
+                }
+            }
+        }
+        return new StructureSettingSpec(abandoned, List.copyOf(buildings));
+    }
+
+    private static MCVersion resolveVillageVersion(String token) {
+        MCVersion version = resolveVersion(token);
+        if (version != null) {
+            return version;
+        }
+        if (isExact2612(token)) {
+            return MCVersion.latest();
+        }
+        return MCVersion.latest();
+    }
+
+    private static Path resolveDecompiledRoot() {
+        String configured = System.getProperty(DECOMPILED_ROOT_PROPERTY);
+        if (configured == null || configured.isBlank()) {
+            configured = System.getenv(DECOMPILED_ROOT_ENV);
+        }
+        if (configured != null && !configured.isBlank()) {
+            return Path.of(configured);
+        }
+        String home = System.getProperty("user.home");
+        if (home != null && !home.isBlank()) {
+            Path desktopCopy = Path.of(home, "Desktop", DEFAULT_DECOMPILED_DIR);
+            if (Files.isDirectory(desktopCopy)) {
+                return desktopCopy;
+            }
+        }
+        return Path.of(DEFAULT_DECOMPILED_DIR);
+    }
+
+    private static String villageStyleFromStructure(String structure) {
+        String s = normalizeId(structure);
+        if (s.startsWith("village_")) {
+            String tail = s.substring("village_".length());
+            if ("plains".equals(tail) || "desert".equals(tail) || "savanna".equals(tail) ||
+                "snowy".equals(tail) || "taiga".equals(tail)) {
+                return tail;
+            }
+        }
+        return "plains";
+    }
+
+    private static List<VillageHouseEntry> loadVillageHousePool(String style, boolean zombie) {
+        String normalizedStyle = normalizeId(style);
+        String key = normalizedStyle + "|" + (zombie ? "zombie" : "normal");
+        List<VillageHouseEntry> cached = VILLAGE_HOUSE_POOL_CACHE.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Path root = resolveDecompiledRoot();
+        Path path = root.resolve("resources")
+            .resolve("data")
+            .resolve("minecraft")
+            .resolve("worldgen")
+            .resolve("template_pool")
+            .resolve("village")
+            .resolve(normalizedStyle);
+        if (zombie) {
+            path = path.resolve("zombie");
+        }
+        path = path.resolve("houses.json");
+        List<VillageHouseEntry> out = new ArrayList<>();
+        try {
+            if (Files.isRegularFile(path)) {
+                String json = Files.readString(path, StandardCharsets.UTF_8);
+                Matcher matcher = VILLAGE_HOUSE_ENTRY.matcher(json);
+                while (matcher.find()) {
+                    String location = normalizeId(matcher.group(1));
+                    int weight = Integer.parseInt(matcher.group(2));
+                    if (location.contains("/houses/") && weight > 0) {
+                        out.add(new VillageHouseEntry(location, weight));
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            out.clear();
+        }
+        List<VillageHouseEntry> frozen = List.copyOf(out);
+        VILLAGE_HOUSE_POOL_CACHE.put(key, frozen);
+        return frozen;
+    }
+
+    private static VillageHouseEntry pickWeightedHouse(List<VillageHouseEntry> pool, ChunkRand rand) {
+        int total = 0;
+        for (VillageHouseEntry entry : pool) {
+            total += Math.max(0, entry.weight());
+        }
+        if (total <= 0) {
+            return null;
+        }
+        int roll = rand.nextInt(total);
+        for (VillageHouseEntry entry : pool) {
+            roll -= Math.max(0, entry.weight());
+            if (roll < 0) {
+                return entry;
+            }
+        }
+        return pool.get(pool.size() - 1);
+    }
+
+    private static boolean checkStructureSettings(
+        String structure,
+        String versionToken,
+        long seed,
+        int blockX,
+        int blockZ,
+        String encodedSettings
+    ) {
+        StructureSettingSpec spec = parseStructureSettings(encodedSettings);
+        if (spec.buildings().isEmpty() && !spec.abandoned()) {
+            return true;
+        }
+        String family = normalizeId(structure);
+        if (!family.equals("village") && !family.startsWith("village_")) {
+            return true;
+        }
+        Path decompiledRoot = resolveDecompiledRoot();
+        if (!spec.buildings().isEmpty()) {
+            boolean buildingMatch = false;
+            List<String> needles = buildingNeedles(spec.buildings());
+            for (String styleStructure : candidateVillageSettingStructures(structure, versionToken, seed, blockX, blockZ)) {
+                Optional<Boolean> vanillaMatch =
+                    VanillaStructureBiomeOracle.jigsawPiecesContainAny(styleStructure, seed, blockX, blockZ, needles);
+                if (vanillaMatch.isPresent()) {
+                    if (vanillaMatch.get()) {
+                        buildingMatch = true;
+                        break;
+                    }
+                    continue;
+                }
+                if (VillageJigsawBuildingDetector.villageHasAnyBuilding(
+                        styleStructure,
+                        versionToken,
+                        seed,
+                        blockX,
+                        blockZ,
+                        decompiledRoot,
+                        spec.buildings())) {
+                    buildingMatch = true;
+                    break;
+                }
+                if (estimatedVillageHasBuildings(
+                        styleStructure,
+                        versionToken,
+                        seed,
+                        blockX,
+                        blockZ,
+                        spec.abandoned(),
+                        spec.buildings())) {
+                    buildingMatch = true;
+                    break;
+                }
+            }
+            if (!buildingMatch) {
+                return false;
+            }
+        }
+        if (spec.abandoned()) {
+            boolean abandoned = VillageJigsawBuildingDetector.villageAbandoned(
+                structure,
+                versionToken,
+                seed,
+                blockX,
+                blockZ,
+                decompiledRoot
+            );
+            if (!abandoned) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean estimatedVillageHasBuildings(
+        String structure,
+        String versionToken,
+        long seed,
+        int blockX,
+        int blockZ,
+        boolean zombie,
+        List<String> buildings
+    ) {
+        if (buildings.isEmpty()) {
+            return true;
+        }
+        String style = villageStyleFromStructure(structure);
+        List<VillageHouseEntry> pool = loadVillageHousePool(style, zombie);
+        if (pool.isEmpty()) {
+            return false;
+        }
+
+        int chunkX = Math.floorDiv(blockX, 16);
+        int chunkZ = Math.floorDiv(blockZ, 16);
+        ChunkRand rand = new ChunkRand();
+        rand.setCarverSeed(seed, chunkX, chunkZ, resolveVillageVersion(versionToken));
+        rand.nextInt(4);
+        rand.nextInt(4);
+        int houseDraws = 10 + rand.nextInt(12);
+        List<String> needles = buildingNeedles(buildings);
+        for (int i = 0; i < houseDraws; i++) {
+            VillageHouseEntry entry = pickWeightedHouse(pool, rand);
+            if (entry == null) {
+                break;
+            }
+            String location = entry.location();
+            for (String needle : needles) {
+                if (!needle.isEmpty() && location.contains(needle)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static List<String> buildingNeedles(List<String> buildings) {
+        List<String> out = new ArrayList<>();
+        for (String building : buildings) {
+            String b = normalizeId(building);
+            if (b.startsWith("village_")) {
+                b = b.substring("village_".length());
+            }
+            switch (b) {
+                case "blacksmith":
+                case "weaponsmith":
+                    out.add("weaponsmith");
+                    out.add("weapon_smith");
+                    break;
+                case "toolsmith":
+                case "tool_smith":
+                    out.add("tool_smith");
+                    break;
+                case "tannery":
+                case "leatherworker":
+                    out.add("tannery");
+                    break;
+                case "temple":
+                case "cleric":
+                    out.add("temple");
+                    break;
+                default:
+                    if (!b.isEmpty()) {
+                        out.add(b);
+                    }
+                    break;
+            }
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<String> candidateVillageSettingStructures(
+        String structure,
+        String versionToken,
+        long seed,
+        int blockX,
+        int blockZ
+    ) {
+        String s = normalizeId(structure);
+        if (s.equals("village_plains") || s.equals("village_desert") || s.equals("village_savanna") ||
+            s.equals("village_snowy") || s.equals("village_taiga")) {
+            return List.of(s);
+        }
+        String sampled = sampledVillageStyle(seed, blockX, blockZ);
+        if (!sampled.isEmpty()) {
+            return List.of("village_" + sampled);
+        }
+
+        List<String> vanillaViable = new ArrayList<>();
+        for (String candidate : List.of("village_plains", "village_desert", "village_savanna", "village_snowy", "village_taiga")) {
+            try {
+                VanillaStructureBiomeOracle.ValidationResult result =
+                    VanillaStructureBiomeOracle.validateStructure(candidate, seed, blockX, blockZ, false);
+                if (result != null && result.viable()) {
+                    vanillaViable.add(candidate);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (!vanillaViable.isEmpty()) {
+            return List.copyOf(vanillaViable);
+        }
+
+        return List.of("village_plains", "village_desert", "village_savanna", "village_snowy", "village_taiga");
+    }
+
+    private static String sampledVillageStyle(long seed, int blockX, int blockZ) {
+        try {
+            int y = 64;
+            try {
+                y = VanillaStructureBiomeOracle.surfaceHeight(seed, blockX, blockZ);
+            } catch (Throwable ignored) {
+            }
+            String biome = normalizeId(VanillaStructureBiomeOracle.sampleBiomeId(seed, blockX, y, blockZ));
+            return switch (biome) {
+                case "plains", "meadow" -> "plains";
+                case "desert" -> "desert";
+                case "savanna" -> "savanna";
+                case "snowy_plains" -> "snowy";
+                case "taiga" -> "taiga";
+                default -> "";
+            };
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static void addCount(Map<String, Integer> counts, String item, int count) {
+        if (count <= 0) {
+            return;
+        }
+        String normalized = normalizeItemId(item);
+        if (normalized.isEmpty()) {
+            return;
+        }
+        counts.put(normalized, counts.getOrDefault(normalized, 0) + count);
+    }
+
+    private static boolean countsSatisfy(Map<String, Integer> counts, List<LootRequirement> requirements) {
+        for (LootRequirement req : requirements) {
+            if (counts.getOrDefault(req.item(), 0) < req.count()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Map<String, Integer> aggregateLegacyItems(List<ItemStack> slots) {
+        Map<String, Integer> counts = new TreeMap<>();
+        for (ItemStack stack : slots) {
+            if (stack == null || stack.isEmpty()) {
+                continue;
+            }
+            addCount(counts, stack.getItem().getName(), stack.getCount());
+        }
+        return counts;
+    }
+
+    private static Map<String, Integer> aggregateExactItems(List<ExactLootTableLibrary.ItemStackView> slots) {
+        Map<String, Integer> counts = new TreeMap<>();
+        for (ExactLootTableLibrary.ItemStackView stack : slots) {
+            if (stack == null || stack.isEmpty()) {
+                continue;
+            }
+            addCount(counts, stack.itemId(), stack.count());
+        }
+        return counts;
     }
 
     private static StructureConfig resolveStructureConfig(String structure, MCVersion version) {
@@ -262,6 +723,27 @@ public class LootValidationServer {
         return "OK\tROLL\t" + encoding.slots() + "\t" + encoding.counts();
     }
 
+    private static String encodeCheck(
+        StructureConfig cfg,
+        long seed,
+        int blockX,
+        int blockZ,
+        List<LootRequirement> requirements
+    ) {
+        return "OK\tCHECK\t" + (legacyCheckPassed(cfg, seed, blockX, blockZ, requirements) ? "1" : "0");
+    }
+
+    private static boolean legacyCheckPassed(
+        StructureConfig cfg,
+        long seed,
+        int blockX,
+        int blockZ,
+        List<LootRequirement> requirements
+    ) {
+        List<ChestContent> chests = gatherLegacyChests(cfg, seed, blockX, blockZ);
+        return countsSatisfy(aggregateLegacyItems(flattenLegacyItems(chests)), requirements);
+    }
+
     private static String encodeRollDetail(StructureConfig cfg, String structure, long seed, int blockX, int blockZ) {
         List<ChestContent> chests = gatherLegacyChests(cfg, seed, blockX, blockZ);
         SlotEncoding encoding = encodeLegacySlots(flattenLegacyItems(chests));
@@ -275,9 +757,86 @@ public class LootValidationServer {
         return "OK\tROLL\t" + encoding.slots() + "\t" + encoding.counts();
     }
 
+    private static String encodeExactCheck(
+        String structure,
+        long seed,
+        int blockX,
+        int blockZ,
+        List<LootRequirement> requirements
+    ) {
+        return "OK\tCHECK\t" + (exactCheckPassed(structure, seed, blockX, blockZ, requirements) ? "1" : "0");
+    }
+
+    private static boolean exactCheckPassed(
+        String structure,
+        long seed,
+        int blockX,
+        int blockZ,
+        List<LootRequirement> requirements
+    ) {
+        List<Map<String, Integer>> alternatives =
+            ExactWorldgenLootResolver.gatherAggregateCountAlternatives(structure, seed, blockX, blockZ);
+        for (Map<String, Integer> counts : alternatives) {
+            if (countsSatisfy(counts, requirements)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Map<String, Integer> normalizeCountKeys(Map<String, Integer> counts) {
+        Map<String, Integer> out = new TreeMap<>();
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            addCount(out, entry.getKey(), entry.getValue() == null ? 0 : entry.getValue());
+        }
+        return out;
+    }
+
+    private static String encodeExactRollAt(
+        String structure,
+        long seed,
+        int blockX,
+        int blockZ,
+        int chestX,
+        int chestY,
+        int chestZ
+    ) {
+        List<ExactLootTableLibrary.ItemStackView> indexedSlots =
+            ExactWorldgenLootResolver.gatherIndexedSlotsAt(structure, seed, blockX, blockZ, chestX, chestY, chestZ);
+        SlotEncoding encoding = encodeExactSlots(indexedSlots);
+        return "OK\tROLL\t" + encoding.slots() + "\t" + encoding.counts();
+    }
+
     private static String encodeExactRollDetail(String structure, long seed, int blockX, int blockZ) {
         List<ExactWorldgenLootResolver.ChestRollView> chests =
             ExactWorldgenLootResolver.gatherChestRolls(structure, seed, blockX, blockZ);
+        List<ExactWorldgenLootResolver.ChestRollView> displayChests = orderExactChestsForDisplay(
+            structure,
+            chests,
+            blockX,
+            blockZ
+        );
+        List<ExactLootTableLibrary.ItemStackView> allSlots = new ArrayList<>();
+        for (ExactWorldgenLootResolver.ChestRollView chest : displayChests) {
+            if (chest != null && chest.slots() != null) {
+                allSlots.addAll(chest.slots());
+            }
+        }
+        SlotEncoding encoding = encodeExactSlots(allSlots);
+        return "OK\tROLL_DETAIL\t" + encoding.counts() + "\t" + encodeExactChestDetails(displayChests);
+    }
+
+    private static String encodeExactRollDetailAt(
+        String structure,
+        long seed,
+        int blockX,
+        int blockZ,
+        int chestX,
+        int chestY,
+        int chestZ
+    ) {
+        List<ExactWorldgenLootResolver.ChestRollView> chests =
+            ExactWorldgenLootResolver.gatherChestRollsAt(structure, seed, blockX, blockZ, chestX, chestY, chestZ);
         List<ExactWorldgenLootResolver.ChestRollView> displayChests = orderExactChestsForDisplay(
             structure,
             chests,
@@ -354,19 +913,95 @@ public class LootValidationServer {
                 out.println("BYE");
                 break;
             }
-            String[] parts = line.split("\t");
-            if (parts.length != 6 || (
-                !"ROLL".equals(parts[0]) && !"ROLL_DETAIL".equals(parts[0]) && !"STRUCTURE".equals(parts[0])
-            )) {
+            String[] parts = line.split("\t", -1);
+            String command = parts.length == 0 ? "" : parts[0].trim();
+            boolean basicCommand = "ROLL".equals(command) || "ROLL_DETAIL".equals(command) || "STRUCTURE".equals(command);
+            boolean chestCommand = "ROLL_AT".equals(command) || "ROLL_DETAIL_AT".equals(command);
+            boolean checkCommand = "CHECK".equals(command);
+            boolean checkBatchCommand = "CHECK_BATCH".equals(command);
+            boolean settingsBatchCommand = "SETTINGS_BATCH".equals(command);
+            if ((!basicCommand || parts.length != 6) && (!chestCommand || parts.length != 9) &&
+                (!checkCommand || parts.length != 7) &&
+                (!checkBatchCommand || parts.length < 3 || ((parts.length - 3) % 5) != 0) &&
+                (!settingsBatchCommand || parts.length < 3 || ((parts.length - 3) % 5) != 0)) {
                 out.println(
                     "ERR\tInvalid command. Expected: ROLL<TAB>structure<TAB>version<TAB>seed<TAB>x<TAB>z or " +
                     "ROLL_DETAIL<TAB>structure<TAB>version<TAB>seed<TAB>x<TAB>z or " +
+                    "ROLL_AT<TAB>structure<TAB>version<TAB>seed<TAB>x<TAB>z<TAB>chestX<TAB>chestY<TAB>chestZ or " +
+                    "ROLL_DETAIL_AT<TAB>structure<TAB>version<TAB>seed<TAB>x<TAB>z<TAB>chestX<TAB>chestY<TAB>chestZ or " +
+                    "CHECK<TAB>structure<TAB>version<TAB>seed<TAB>x<TAB>z<TAB>item:count;... or " +
+                    "CHECK_BATCH<TAB>version<TAB>count<TAB>(structure<TAB>seed<TAB>x<TAB>z<TAB>item:count;...)* or " +
+                    "SETTINGS_BATCH<TAB>version<TAB>count<TAB>(structure<TAB>seed<TAB>x<TAB>z<TAB>settings)* or " +
                     "STRUCTURE<TAB>structure<TAB>version<TAB>seed<TAB>x<TAB>z"
                 );
                 continue;
             }
             try {
-                String command = parts[0].trim();
+                if ("SETTINGS_BATCH".equals(command)) {
+                    String versionToken = parts[1].trim();
+                    int count = Integer.parseInt(parts[2].trim());
+                    if (count < 0 || parts.length != 3 + count * 5) {
+                        out.println("ERR\tInvalid SETTINGS_BATCH item count");
+                        continue;
+                    }
+                    StringBuilder bits = new StringBuilder(count);
+                    for (int i = 0; i < count; i++) {
+                        int offset = 3 + i * 5;
+                        String structure = parts[offset].trim().toLowerCase(Locale.ROOT);
+                        long seed = Long.parseLong(parts[offset + 1].trim());
+                        int blockX = Integer.parseInt(parts[offset + 2].trim());
+                        int blockZ = Integer.parseInt(parts[offset + 3].trim());
+                        String settings = parts[offset + 4].trim();
+                        bits.append(checkStructureSettings(structure, versionToken, seed, blockX, blockZ, settings) ? '1' : '0');
+                    }
+                    out.println("OK\tSETTINGS_BATCH\t" + bits);
+                    continue;
+                }
+                if ("CHECK_BATCH".equals(command)) {
+                    String versionToken = parts[1].trim();
+                    int count = Integer.parseInt(parts[2].trim());
+                    if (count < 0 || parts.length != 3 + count * 5) {
+                        out.println("ERR\tInvalid CHECK_BATCH item count");
+                        continue;
+                    }
+                    StringBuilder bits = new StringBuilder(count);
+                    for (int i = 0; i < count; i++) {
+                        int offset = 3 + i * 5;
+                        String structure = parts[offset].trim().toLowerCase();
+                        long seed = Long.parseLong(parts[offset + 1].trim());
+                        int blockX = Integer.parseInt(parts[offset + 2].trim());
+                        int blockZ = Integer.parseInt(parts[offset + 3].trim());
+                        List<LootRequirement> requirements = parseRequirementsCached(parts[offset + 4]);
+                        boolean passed;
+                        if (isExact2612(versionToken)) {
+                            if (!ExactWorldgenLootResolver.supportsStructure(structure)) {
+                                out.println("ERR\tUnsupported exact 26.1.1/26.1.2 world-seed loot validation: " + structure);
+                                bits = null;
+                                break;
+                            }
+                            passed = exactCheckPassed(structure, seed, blockX, blockZ, requirements);
+                        } else {
+                            MCVersion version = resolveVersion(versionToken);
+                            if (version == null) {
+                                out.println("ERR\tUnsupported mc-version for loot validation. Use 1.17 or 1.17.1.");
+                                bits = null;
+                                break;
+                            }
+                            StructureConfig cfg = resolveStructureConfig(structure, version);
+                            if (cfg == null) {
+                                out.println("ERR\tUnsupported structure for loot validation: " + structure);
+                                bits = null;
+                                break;
+                            }
+                            passed = legacyCheckPassed(cfg, seed, blockX, blockZ, requirements);
+                        }
+                        bits.append(passed ? '1' : '0');
+                    }
+                    if (bits != null) {
+                        out.println("OK\tCHECK_BATCH\t" + bits);
+                    }
+                    continue;
+                }
                 String structure = parts[1].trim().toLowerCase();
                 String versionToken = parts[2].trim();
                 if ("STRUCTURE".equals(command)) {
@@ -378,13 +1013,30 @@ public class LootValidationServer {
                 }
                 if (isExact2612(versionToken)) {
                     if (!ExactWorldgenLootResolver.supportsStructure(structure)) {
-                        out.println("ERR\tUnsupported exact 26.1.2 world-seed loot validation: " + structure);
+                        out.println("ERR\tUnsupported exact 26.1.1/26.1.2 world-seed loot validation: " + structure);
                         continue;
                     }
                     long seed = Long.parseLong(parts[3].trim());
                     int blockX = Integer.parseInt(parts[4].trim());
                     int blockZ = Integer.parseInt(parts[5].trim());
-                    if ("ROLL_DETAIL".equals(command)) {
+                    if ("CHECK".equals(command)) {
+                        out.println(encodeExactCheck(
+                            structure,
+                            seed,
+                            blockX,
+                            blockZ,
+                            parseRequirementsCached(parts[6])
+                        ));
+                    } else if ("ROLL_AT".equals(command) || "ROLL_DETAIL_AT".equals(command)) {
+                        int chestX = Integer.parseInt(parts[6].trim());
+                        int chestY = Integer.parseInt(parts[7].trim());
+                        int chestZ = Integer.parseInt(parts[8].trim());
+                        if ("ROLL_DETAIL_AT".equals(command)) {
+                            out.println(encodeExactRollDetailAt(structure, seed, blockX, blockZ, chestX, chestY, chestZ));
+                        } else {
+                            out.println(encodeExactRollAt(structure, seed, blockX, blockZ, chestX, chestY, chestZ));
+                        }
+                    } else if ("ROLL_DETAIL".equals(command)) {
                         out.println(encodeExactRollDetail(structure, seed, blockX, blockZ));
                     } else {
                         out.println(encodeExactRoll(structure, seed, blockX, blockZ));
@@ -397,6 +1049,10 @@ public class LootValidationServer {
                     out.println("ERR\tUnsupported mc-version for loot validation. Use 1.17 or 1.17.1.");
                     continue;
                 }
+                if ("ROLL_AT".equals(command) || "ROLL_DETAIL_AT".equals(command)) {
+                    out.println("ERR\tChest-specific loot validation is only supported by the exact 26.1.1/26.1.2 path.");
+                    continue;
+                }
                 long seed = Long.parseLong(parts[3].trim());
                 int blockX = Integer.parseInt(parts[4].trim());
                 int blockZ = Integer.parseInt(parts[5].trim());
@@ -406,7 +1062,9 @@ public class LootValidationServer {
                     out.println("ERR\tUnsupported structure for loot validation: " + structure);
                     continue;
                 }
-                if ("ROLL_DETAIL".equals(command)) {
+                if ("CHECK".equals(command)) {
+                    out.println(encodeCheck(cfg, seed, blockX, blockZ, parseRequirementsCached(parts[6])));
+                } else if ("ROLL_DETAIL".equals(command)) {
                     out.println(encodeRollDetail(cfg, structure, seed, blockX, blockZ));
                 } else {
                     out.println(encodeRoll(cfg, version, seed, blockX, blockZ));

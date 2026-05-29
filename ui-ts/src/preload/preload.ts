@@ -3,7 +3,7 @@ import type { AppContext, ScanExit, ScannerProgress, ScanStartRequest, ScanStart
 
 const api = {
   getContext: (): Promise<AppContext> => ipcRenderer.invoke("app:get-context"),
-  openPath: (targetPath: string): Promise<void> => ipcRenderer.invoke("app:open-path", targetPath),
+  openPath: (): Promise<void> => ipcRenderer.invoke("app:open-path"),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke("app:open-external", url),
   openDocs: (): Promise<void> => ipcRenderer.invoke("app:open-docs"),
   startScan: (request: ScanStartRequest): Promise<ScanStartResult> => ipcRenderer.invoke("scan:start", request),

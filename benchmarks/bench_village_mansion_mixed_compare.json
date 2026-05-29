@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "logic": "and",
+  "anchor": {
+    "type": "origin"
+  },
+  "constraints": [
+    {
+      "id": "v1",
+      "structure": "village",
+      "dimension": "overworld",
+      "mode": "mixed",
+      "within": {
+        "anchor": "origin",
+        "radius": 1
+      }
+    },
+    {
+      "id": "c2",
+      "structure": "woodland_mansion",
+      "dimension": "overworld",
+      "mode": "mixed",
+      "within": {
+        "anchor": "constraint:v1",
+        "radius": 64
+      }
+    }
+  ],
+  "biome_filters": [],
+  "loot_filters": [],
+  "safety": {
+    "completeness": "approximate"
+  },
+  "performance": {
+    "strict_workers": 16,
+    "execution_mode": "max-throughput",
+    "compiled_stage_a_mode": "multi",
+    "candidate_cap_mode": "adaptive",
+    "strict_surrogate": "lightspeed",
+    "fixed_cap": 128
+  }
+}

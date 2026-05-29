@@ -40,6 +40,12 @@ export type ScannerProgress = {
   placement_gpu_busy_percent?: number;
   gpu_busy_percent?: number;
   gpu_utilization_estimate?: number;
+  gpu_inflight_batches?: number;
+  placement_batch_size?: number;
+  gpu_async_slots_available?: number;
+  gpu_batch_kernel_ms?: number;
+  gpu_host_gap_ms?: number;
+  gpu_pipeline_fill_percent?: number;
   strict_sec?: number;
   sculpt_sec?: number;
   java_worldgen_sec?: number;

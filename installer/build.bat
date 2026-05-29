@@ -14,7 +14,14 @@ if errorlevel 1 (
 
 where cl >nul 2>&1
 if errorlevel 1 (
-    echo [err] cl.exe not found. Install Visual Studio Build Tools 2022 with C++ tools, then rerun.
+    if defined HELIXSEED_VSROOT (
+        if exist "%HELIXSEED_VSROOT%\VC\Auxiliary\Build\vcvars64.bat" call "%HELIXSEED_VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+where cl >nul 2>&1
+if errorlevel 1 (
+    echo [err] cl.exe not found. Install Visual Studio Build Tools 2022 with C++ tools, or set HELIXSEED_VSROOT.
     exit /b 1
 )
 

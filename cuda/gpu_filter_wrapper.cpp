@@ -31,6 +31,7 @@ extern "C" int gpu_filter_multi_checked_impl(
     uint64_t *output_buffer,
     uint32_t *hit_count);
 extern "C" int gpu_filter_double_buffer_available_impl(void);
+extern "C" uint32_t gpu_filter_async_max_slots_impl(void);
 extern "C" int gpu_filter_multi_submit_impl(
     uint32_t slot_id,
     uint64_t start_seed,
@@ -119,6 +120,10 @@ extern "C" GPU_FILTER_API int gpu_filter_multi_checked(
 
 extern "C" GPU_FILTER_API int gpu_filter_double_buffer_available(void) {
     return gpu_filter_double_buffer_available_impl();
+}
+
+extern "C" GPU_FILTER_API uint32_t gpu_filter_async_max_slots(void) {
+    return gpu_filter_async_max_slots_impl();
 }
 
 extern "C" GPU_FILTER_API int gpu_filter_multi_submit(

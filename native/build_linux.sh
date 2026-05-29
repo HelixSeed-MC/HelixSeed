@@ -13,8 +13,8 @@ if ! command -v "${CXX}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -x "${REPO_ROOT}/cubiomes_12111_fork/build_linux.sh" ]]; then
-  "${REPO_ROOT}/cubiomes_12111_fork/build_linux.sh"
+if [[ -x "${REPO_ROOT}/cubiomes_26.1.2_fork/build_linux.sh" ]]; then
+  "${REPO_ROOT}/cubiomes_26.1.2_fork/build_linux.sh"
 fi
 
 pushd "${SCRIPT_DIR}" >/dev/null

@@ -1,6 +1,6 @@
 # Vanilla 26.1.2 Reference Notes
 
-This fork was restored from the tracked HelixSeed `cubiomes_12111_fork` baseline and retargeted to the PrismLauncher vanilla `26.1.2` install (`DataVersion 4790`).
+This fork was restored from the tracked HelixSeed `cubiomes_26.1.2_fork` baseline and retargeted to the PrismLauncher vanilla `26.1.2` install (`DataVersion 4790`).
 
 Reference extraction used Vineflower `1.12.0` against a local Minecraft `26.1.2` client jar (from a PrismLauncher install — path varies per machine). Decompiled references live under a local `scratch/` workspace that is intentionally not tracked in git.
 

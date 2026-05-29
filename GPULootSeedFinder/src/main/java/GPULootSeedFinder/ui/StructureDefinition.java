@@ -26,29 +26,11 @@ public class StructureDefinition {
         List<StructureDefinition> defs = new ArrayList<>();
         defs.add(
             new StructureDefinition(
-                "ruined_portal",
-                "Ruined Portal",
-                "chests/ruined_portal",
-                40005,
-                "https://raw.githubusercontent.com/PrismarineJS/minecraft-assets/master/data/1.17.1/blocks/obsidian.png"
-            )
-        );
-        defs.add(
-            new StructureDefinition(
                 "desert_pyramid",
                 "Desert Pyramid",
                 "chests/desert_pyramid",
                 40003,
                 "https://raw.githubusercontent.com/PrismarineJS/minecraft-assets/master/data/1.17.1/blocks/chiseled_sandstone.png"
-            )
-        );
-        defs.add(
-            new StructureDefinition(
-                "jungle_temple",
-                "Jungle Temple",
-                "chests/jungle_temple",
-                null,
-                "https://raw.githubusercontent.com/PrismarineJS/minecraft-assets/master/data/1.17.1/blocks/mossy_cobblestone.png"
             )
         );
         defs.add(

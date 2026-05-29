@@ -36,12 +36,14 @@ import {
   Radar,
   RefreshCw,
   Route,
+  Settings as SettingsIcon,
   Sparkles,
   Square,
   Star,
   Terminal,
   Trash2,
-  Upload
+  Upload,
+  X
 } from "lucide";
 import type { AppContext, ScannerProgress } from "../shared/contracts";
 import type { HelixSeedApi } from "../preload/preload";
@@ -57,6 +59,29 @@ type ConstraintRow = {
   anchor: string;
   radius: string;
   mode: "strict" | "placement" | "mixed";
+  structureSettings?: ConstraintStructureSettings;
+};
+
+type ConstraintStructureSettings = Record<string, string[]>;
+
+type StructureSettingOption = {
+  id: string;
+  label: string;
+  enforcedStructure?: string;
+  disabled?: boolean;
+  note?: string;
+};
+
+type StructureSettingGroup = {
+  id: string;
+  label: string;
+  options: StructureSettingOption[];
+};
+
+type StructureSettingDefinition = {
+  family: string;
+  title: string;
+  groups: StructureSettingGroup[];
 };
 
 type BiomeRow = {
@@ -84,6 +109,7 @@ type ScriptConstraint = {
   };
   required: boolean;
   track_found: boolean;
+  structure_settings?: ConstraintStructureSettings;
 };
 
 type ControlOp =
@@ -110,12 +136,15 @@ type Settings = {
   outputMode: "raw" | "lift64" | "both" | "world64";
   upper16: string;
   javaValidation: "auto" | "off" | "strict";
+  safetyCompleteness: "exact" | "approximate";
   defaultAnchor: "origin" | "spawn";
   printClosest: boolean;
   terminalMode: boolean;
   executionMode: "auto" | "scalar" | "simd-x4" | "simd-x8" | "max-throughput";
   stageAMode: "auto" | "single" | "multi" | "cpu-a5" | "gpu-off";
   gpuPipeline: "auto" | "async" | "sync";
+  gpuBackend: "auto" | "cuda" | "opencl";
+  gpuInflightBatches: "auto" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8";
   strictSurrogate: "off" | "balanced" | "aggressive" | "ultra" | "turbo" | "lightspeed";
   strictWorkers: string;
   mixedQueueCapacity: string;
@@ -133,6 +162,7 @@ type State = {
   useScriptSource: boolean;
   activeScanMode: Settings["scanMode"];
   resultStageFilter: "all" | "placement" | "strict";
+  activeConstraintSettingsIndex: number | null;
   settings: Settings;
   constraints: ConstraintRow[];
   biomes: BiomeRow[];
@@ -150,12 +180,15 @@ type ScriptScanOverrides = Partial<Pick<
   | "outputMode"
   | "upper16"
   | "javaValidation"
+  | "safetyCompleteness"
   | "printClosest"
   | "terminalMode"
   | "scanMode"
   | "executionMode"
   | "stageAMode"
   | "gpuPipeline"
+  | "gpuBackend"
+  | "gpuInflightBatches"
   | "strictWorkers"
   | "mixedQueueCapacity"
   | "mixedSurvivorCap"
@@ -172,6 +205,7 @@ type QueryObject = {
   loot_filters: Array<{ constraint: string; structure: string; required: Record<string, number> }>;
   control_ops: ControlOp[];
   output: { detail: string };
+  safety: { completeness: string };
   performance: {
     strict_workers: number;
     execution_mode: string;
@@ -197,34 +231,386 @@ type ScriptFunctionDef = {
   body: ScriptLine[];
 };
 
-const structures = [
-  "village",
-  "desert_pyramid",
-  "igloo",
-  "jungle_temple",
-  "swamp_hut",
-  "ocean_ruin",
-  "shipwreck",
-  "ruined_portal",
-  "ruined_portal_nether",
-  "fortress",
-  "bastion_remnant",
-  "nether_fossil",
-  "ocean_monument",
-  "woodland_mansion",
-  "end_city",
-  "trial_chambers",
-  "pillager_outpost",
-  "buried_treasure",
-  "ancient_city",
-  "trail_ruin",
-  "mineshaft",
-  "desert_well",
-  "geode",
-  "stronghold"
+const dimensions: DimensionName[] = ["overworld", "nether", "end"];
+
+type StructureOption = {
+  id: string;
+  canonical: string;
+  dimension: DimensionName;
+  strictOnly?: boolean;
+};
+
+const structureOptions: StructureOption[] = [
+  { id: "village", canonical: "village", dimension: "overworld" },
+  { id: "village_plains", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "village_desert", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "village_savanna", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "village_snowy", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "village_taiga", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "plains_village", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "desert_village", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "savanna_village", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "snowy_village", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "taiga_village", canonical: "village", dimension: "overworld", strictOnly: true },
+  { id: "desert_pyramid", canonical: "desert_pyramid", dimension: "overworld" },
+  { id: "desert_temple", canonical: "desert_pyramid", dimension: "overworld" },
+  { id: "igloo", canonical: "igloo", dimension: "overworld" },
+  { id: "jungle_temple", canonical: "jungle_temple", dimension: "overworld" },
+  { id: "jungle_pyramid", canonical: "jungle_temple", dimension: "overworld" },
+  { id: "swamp_hut", canonical: "swamp_hut", dimension: "overworld" },
+  { id: "witch_hut", canonical: "swamp_hut", dimension: "overworld" },
+  { id: "ocean_ruin", canonical: "ocean_ruin", dimension: "overworld" },
+  { id: "ocean_ruin_cold", canonical: "ocean_ruin", dimension: "overworld" },
+  { id: "ocean_ruin_warm", canonical: "ocean_ruin", dimension: "overworld" },
+  { id: "underwater_ruin", canonical: "ocean_ruin", dimension: "overworld" },
+  { id: "shipwreck", canonical: "shipwreck", dimension: "overworld" },
+  { id: "shipwreck_beached", canonical: "shipwreck", dimension: "overworld" },
+  { id: "beached_shipwreck", canonical: "shipwreck", dimension: "overworld" },
+  { id: "ruined_portal", canonical: "ruined_portal", dimension: "overworld" },
+  { id: "ruined_portal_desert", canonical: "ruined_portal", dimension: "overworld" },
+  { id: "ruined_portal_jungle", canonical: "ruined_portal", dimension: "overworld" },
+  { id: "ruined_portal_mountain", canonical: "ruined_portal", dimension: "overworld" },
+  { id: "ruined_portal_ocean", canonical: "ruined_portal", dimension: "overworld" },
+  { id: "ruined_portal_swamp", canonical: "ruined_portal", dimension: "overworld" },
+  { id: "ocean_monument", canonical: "ocean_monument", dimension: "overworld" },
+  { id: "monument", canonical: "ocean_monument", dimension: "overworld" },
+  { id: "woodland_mansion", canonical: "woodland_mansion", dimension: "overworld" },
+  { id: "mansion", canonical: "woodland_mansion", dimension: "overworld" },
+  { id: "trial_chambers", canonical: "trial_chambers", dimension: "overworld" },
+  { id: "trial_chamber", canonical: "trial_chambers", dimension: "overworld" },
+  { id: "pillager_outpost", canonical: "pillager_outpost", dimension: "overworld" },
+  { id: "outpost", canonical: "pillager_outpost", dimension: "overworld" },
+  { id: "buried_treasure", canonical: "buried_treasure", dimension: "overworld" },
+  { id: "treasure", canonical: "buried_treasure", dimension: "overworld" },
+  { id: "ancient_city", canonical: "ancient_city", dimension: "overworld" },
+  { id: "trail_ruin", canonical: "trail_ruin", dimension: "overworld" },
+  { id: "trail_ruins", canonical: "trail_ruin", dimension: "overworld" },
+  { id: "mineshaft", canonical: "mineshaft", dimension: "overworld" },
+  { id: "abandoned_mineshaft", canonical: "mineshaft", dimension: "overworld" },
+  { id: "mineshaft_mesa", canonical: "mineshaft", dimension: "overworld" },
+  { id: "mesa_mineshaft", canonical: "mineshaft", dimension: "overworld" },
+  { id: "badlands_mineshaft", canonical: "mineshaft", dimension: "overworld" },
+  { id: "desert_well", canonical: "desert_well", dimension: "overworld" },
+  { id: "geode", canonical: "geode", dimension: "overworld" },
+  { id: "stronghold", canonical: "stronghold", dimension: "overworld" },
+  { id: "quad_hut", canonical: "swamp_hut", dimension: "overworld", strictOnly: true },
+  { id: "quad_swamp_hut", canonical: "swamp_hut", dimension: "overworld", strictOnly: true },
+  { id: "quad_witch_hut", canonical: "swamp_hut", dimension: "overworld", strictOnly: true },
+  { id: "quad_monument", canonical: "ocean_monument", dimension: "overworld", strictOnly: true },
+  { id: "quad_ocean_monument", canonical: "ocean_monument", dimension: "overworld", strictOnly: true },
+  { id: "quad_desert_pyramid", canonical: "desert_pyramid", dimension: "overworld", strictOnly: true },
+  { id: "quad_desert_temple", canonical: "desert_pyramid", dimension: "overworld", strictOnly: true },
+  { id: "quad_igloo", canonical: "igloo", dimension: "overworld", strictOnly: true },
+  { id: "quad_jungle_temple", canonical: "jungle_temple", dimension: "overworld", strictOnly: true },
+  { id: "quad_jungle_pyramid", canonical: "jungle_temple", dimension: "overworld", strictOnly: true },
+  { id: "fortress", canonical: "fortress", dimension: "nether" },
+  { id: "nether_fortress", canonical: "fortress", dimension: "nether" },
+  { id: "bastion_remnant", canonical: "bastion_remnant", dimension: "nether" },
+  { id: "bastion", canonical: "bastion_remnant", dimension: "nether" },
+  { id: "nether_fossil", canonical: "nether_fossil", dimension: "nether" },
+  { id: "ruined_portal_nether", canonical: "ruined_portal_nether", dimension: "nether" },
+  { id: "nether_ruined_portal", canonical: "ruined_portal_nether", dimension: "nether" },
+  { id: "end_city", canonical: "end_city", dimension: "end" }
 ];
 
-const dimensions: DimensionName[] = ["overworld", "nether", "end"];
+const structures = structureOptions.map((option) => option.id);
+const structureOptionById = new Map(structureOptions.map((option) => [option.id, option]));
+
+const lootItemSuggestions = [
+  "obsidian",
+  "flint_and_steel",
+  "iron_nugget",
+  "diamond",
+  "emerald",
+  "gold_ingot",
+  "golden_apple",
+  "enchanted_golden_apple",
+  "apple",
+  "bread",
+  "iron_ingot",
+  "saddle",
+  "book",
+  "paper",
+  "map",
+  "compass",
+  "ender_eye",
+  "ender_pearl",
+  "fire_charge",
+  "golden_carrot",
+  "wheat",
+  "coal",
+  "string",
+  "arrow",
+  "crossbow",
+  "tnt",
+  "heart_of_the_sea",
+  "nautilus_shell"
+];
+
+const structureSettingDefinitions: Record<string, StructureSettingDefinition> = {
+  village: {
+    family: "village",
+    title: "Village settings",
+    groups: [
+      {
+        id: "style",
+        label: "Biome style",
+        options: [
+          { id: "plains", label: "Plains", enforcedStructure: "village_plains" },
+          { id: "desert", label: "Desert", enforcedStructure: "village_desert" },
+          { id: "savanna", label: "Savanna", enforcedStructure: "village_savanna" },
+          { id: "snowy", label: "Snowy", enforcedStructure: "village_snowy" },
+          { id: "taiga", label: "Taiga", enforcedStructure: "village_taiga" }
+        ]
+      },
+      {
+        id: "state",
+        label: "State",
+        options: [
+          { id: "abandoned", label: "Abandoned" }
+        ]
+      },
+      {
+        id: "buildings",
+        label: "Buildings",
+        options: [
+          { id: "village_armorer", label: "Armorer" },
+          { id: "village_butcher", label: "Butcher" },
+          { id: "village_cartographer", label: "Cartographer" },
+          { id: "village_fisher", label: "Fisher" },
+          { id: "village_fletcher", label: "Fletcher" },
+          { id: "village_mason", label: "Mason" },
+          { id: "village_shepherd", label: "Shepherd" },
+          { id: "village_tannery", label: "Tannery" },
+          { id: "village_temple", label: "Temple" },
+          { id: "village_toolsmith", label: "Toolsmith" },
+          { id: "village_weaponsmith", label: "Blacksmith / weaponsmith" }
+        ]
+      }
+    ]
+  },
+  ruined_portal: {
+    family: "ruined_portal",
+    title: "Ruined portal settings",
+    groups: [
+      {
+        id: "type",
+        label: "Type",
+        options: [
+          { id: "desert", label: "Desert", disabled: true, note: "variant validation not wired yet" },
+          { id: "jungle", label: "Jungle", disabled: true, note: "variant validation not wired yet" },
+          { id: "mountain", label: "Mountain", disabled: true, note: "variant validation not wired yet" },
+          { id: "ocean", label: "Ocean", disabled: true, note: "variant validation not wired yet" },
+          { id: "swamp", label: "Swamp", disabled: true, note: "variant validation not wired yet" },
+          { id: "nether", label: "Nether", disabled: true, note: "variant validation not wired yet" }
+        ]
+      }
+    ]
+  },
+  shipwreck: {
+    family: "shipwreck",
+    title: "Shipwreck settings",
+    groups: [
+      {
+        id: "type",
+        label: "Type",
+        options: [
+          { id: "ocean", label: "Ocean", disabled: true, note: "variant validation not wired yet" },
+          { id: "beached", label: "Beached", disabled: true, note: "variant validation not wired yet" }
+        ]
+      }
+    ]
+  },
+  ocean_ruin: {
+    family: "ocean_ruin",
+    title: "Ocean ruin settings",
+    groups: [
+      {
+        id: "temperature",
+        label: "Temperature",
+        options: [
+          { id: "cold", label: "Cold", disabled: true, note: "variant validation not wired yet" },
+          { id: "warm", label: "Warm", disabled: true, note: "variant validation not wired yet" }
+        ]
+      },
+      {
+        id: "size",
+        label: "Size",
+        options: [
+          { id: "big", label: "Big", disabled: true, note: "variant validation not wired yet" },
+          { id: "small", label: "Small", disabled: true, note: "variant validation not wired yet" }
+        ]
+      }
+    ]
+  },
+  mineshaft: {
+    family: "mineshaft",
+    title: "Mineshaft settings",
+    groups: [
+      {
+        id: "type",
+        label: "Type",
+        options: [
+          { id: "standard", label: "Standard", disabled: true, note: "variant validation not wired yet" },
+          { id: "badlands", label: "Badlands / mesa", disabled: true, note: "variant validation not wired yet" }
+        ]
+      }
+    ]
+  },
+  bastion_remnant: {
+    family: "bastion_remnant",
+    title: "Bastion settings",
+    groups: [
+      {
+        id: "type",
+        label: "Type",
+        options: [
+          { id: "bridge", label: "Bridge", disabled: true, note: "variant validation not wired yet" },
+          { id: "hoglin_stable", label: "Hoglin stable", disabled: true, note: "variant validation not wired yet" },
+          { id: "housing", label: "Housing", disabled: true, note: "variant validation not wired yet" },
+          { id: "treasure", label: "Treasure", disabled: true, note: "variant validation not wired yet" }
+        ]
+      }
+    ]
+  },
+  trial_chambers: {
+    family: "trial_chambers",
+    title: "Trial chambers settings",
+    groups: [
+      {
+        id: "vaults",
+        label: "Vaults",
+        options: [
+          { id: "reward_common", label: "Common reward", disabled: true, note: "vault validation not wired yet" },
+          { id: "reward_rare", label: "Rare reward", disabled: true, note: "vault validation not wired yet" },
+          { id: "reward_unique", label: "Unique reward", disabled: true, note: "vault validation not wired yet" },
+          { id: "ominous_common", label: "Ominous common", disabled: true, note: "vault validation not wired yet" },
+          { id: "ominous_rare", label: "Ominous rare", disabled: true, note: "vault validation not wired yet" },
+          { id: "ominous_unique", label: "Ominous unique", disabled: true, note: "vault validation not wired yet" }
+        ]
+      }
+    ]
+  }
+};
+
+const exactLootSources = [
+  "buried_treasure",
+  "blacksmith",
+  "ruined_portal",
+  "village_weaponsmith"
+];
+
+const lootSourceAliases: Record<string, string> = {
+  blacksmith: "village_weaponsmith",
+  weaponsmith: "village_weaponsmith",
+  village_blacksmith: "village_weaponsmith"
+};
+
+const lootSourceFamilies: Record<string, string> = {
+  abandoned_mineshaft: "mineshaft",
+  ancient_city: "ancient_city",
+  ancient_city_ice_box: "ancient_city",
+  bastion_bridge: "bastion_remnant",
+  bastion_hoglin_stable: "bastion_remnant",
+  bastion_other: "bastion_remnant",
+  bastion_treasure: "bastion_remnant",
+  buried_treasure: "buried_treasure",
+  desert_pyramid: "desert_pyramid",
+  end_city_treasure: "end_city",
+  igloo_chest: "igloo",
+  jungle_temple: "jungle_temple",
+  jungle_temple_dispenser: "jungle_temple",
+  nether_bridge: "fortress",
+  pillager_outpost: "pillager_outpost",
+  ruined_portal: "ruined_portal",
+  ruined_portal_nether: "ruined_portal",
+  shipwreck_map: "shipwreck",
+  shipwreck_supply: "shipwreck",
+  shipwreck_treasure: "shipwreck",
+  stronghold_corridor: "stronghold",
+  stronghold_crossing: "stronghold",
+  stronghold_library: "stronghold",
+  trial_chambers_corridor: "trial_chambers",
+  trial_chambers_entrance: "trial_chambers",
+  trial_chambers_intersection: "trial_chambers",
+  trial_chambers_intersection_barrel: "trial_chambers",
+  trial_chambers_reward: "trial_chambers",
+  trial_chambers_reward_common: "trial_chambers",
+  trial_chambers_reward_ominous: "trial_chambers",
+  trial_chambers_reward_ominous_common: "trial_chambers",
+  trial_chambers_reward_ominous_rare: "trial_chambers",
+  trial_chambers_reward_ominous_unique: "trial_chambers",
+  trial_chambers_reward_rare: "trial_chambers",
+  trial_chambers_reward_unique: "trial_chambers",
+  trial_chambers_supply: "trial_chambers",
+  underwater_ruin_big: "ocean_ruin",
+  underwater_ruin_small: "ocean_ruin",
+  blacksmith: "village",
+  village_armorer: "village",
+  village_butcher: "village",
+  village_cartographer: "village",
+  village_desert_house: "village",
+  village_fisher: "village",
+  village_fletcher: "village",
+  village_mason: "village",
+  village_plains_house: "village",
+  village_savanna_house: "village",
+  village_shepherd: "village",
+  village_snowy_house: "village",
+  village_taiga_house: "village",
+  village_tannery: "village",
+  village_temple: "village",
+  village_toolsmith: "village",
+  village_weaponsmith: "village",
+  woodland_mansion: "woodland_mansion"
+};
+
+const lootFamilyBaseSources: Record<string, string[]> = {
+  ancient_city: ["ancient_city", "ancient_city_ice_box"],
+  bastion_remnant: ["bastion_bridge", "bastion_hoglin_stable", "bastion_other", "bastion_treasure"],
+  end_city: ["end_city_treasure"],
+  fortress: ["nether_bridge"],
+  igloo: ["igloo_chest"],
+  jungle_temple: ["jungle_temple", "jungle_temple_dispenser"],
+  mineshaft: ["abandoned_mineshaft"],
+  ocean_ruin: ["underwater_ruin_big", "underwater_ruin_small"],
+  shipwreck: ["shipwreck_supply", "shipwreck_map", "shipwreck_treasure"],
+  stronghold: ["stronghold_corridor", "stronghold_crossing", "stronghold_library"],
+  trial_chambers: [
+    "trial_chambers_corridor",
+    "trial_chambers_entrance",
+    "trial_chambers_intersection",
+    "trial_chambers_intersection_barrel",
+    "trial_chambers_reward",
+    "trial_chambers_reward_common",
+    "trial_chambers_reward_rare",
+    "trial_chambers_reward_unique",
+    "trial_chambers_reward_ominous",
+    "trial_chambers_reward_ominous_common",
+    "trial_chambers_reward_ominous_rare",
+    "trial_chambers_reward_ominous_unique",
+    "trial_chambers_supply"
+  ],
+  village: [
+    "blacksmith",
+    "village_armorer",
+    "village_butcher",
+    "village_cartographer",
+    "village_desert_house",
+    "village_fisher",
+    "village_fletcher",
+    "village_mason",
+    "village_plains_house",
+    "village_savanna_house",
+    "village_shepherd",
+    "village_snowy_house",
+    "village_taiga_house",
+    "village_tannery",
+    "village_temple",
+    "village_toolsmith"
+  ],
+  woodland_mansion: ["woodland_mansion"]
+};
 
 const biomeSuggestions = [
   "plains",
@@ -262,32 +648,182 @@ function normalizeDimensionName(value: string | undefined, fallback: DimensionNa
   return "overworld";
 }
 
+function structureOptionFor(structure: string): StructureOption | undefined {
+  return structureOptionById.get(normalizeName(structure));
+}
+
+function canonicalStructureName(structure: string): string {
+  return structureOptionFor(structure)?.canonical ?? normalizeName(structure);
+}
+
+function canonicalLootSourceName(source: string): string {
+  const normalized = normalizeName(source);
+  return lootSourceAliases[normalized] ?? canonicalStructureName(normalized);
+}
+
 function defaultDimensionForStructure(structure: string): DimensionName {
-  const key = normalizeName(structure);
-  if (key === "fortress" || key === "bastion_remnant" || key === "ruined_portal_nether" || key === "nether_fossil") {
-    return "nether";
-  }
-  if (key === "end_city") {
-    return "end";
-  }
-  return "overworld";
+  return structureOptionFor(structure)?.dimension ?? "overworld";
+}
+
+function structureRequiresStrict(structure: string): boolean {
+  return structureOptionFor(structure)?.strictOnly === true;
 }
 
 function structuresForDimension(dimension: string): string[] {
   const normalized = normalizeDimensionName(dimension);
-  return structures.filter((structure) => defaultDimensionForStructure(structure) === normalized);
+  return structureOptions.filter((structure) => structure.dimension === normalized).map((structure) => structure.id);
 }
 
-const lootSources = [
-  "auto",
-  "buried_treasure",
-  "desert_pyramid",
-  "shipwreck",
-  "shipwreck_supply",
-  "shipwreck_map",
-  "shipwreck_treasure",
-  "ruined_portal"
-];
+function isExactLootVersion(version: string): boolean {
+  const token = version.trim();
+  return token === "26.1.2" || token === "26.1.1" || token === "1.21.11";
+}
+
+function isLegacyLootVersion(version: string): boolean {
+  const token = version.trim();
+  return token === "1.17" || token === "1.17.1";
+}
+
+function supportedLootSourcesForVersion(version: string): string[] {
+  return isExactLootVersion(version)
+    ? exactLootSources
+    : isLegacyLootVersion(version)
+      ? ["buried_treasure", "desert_pyramid", "ruined_portal", "shipwreck"]
+      : [];
+}
+
+function lootFamilyForSource(source: string): string {
+  const canonical = canonicalLootSourceName(source);
+  return lootSourceFamilies[normalizeName(source)] ?? lootSourceFamilies[canonical] ?? canonical;
+}
+
+function structureSettingsFamily(structure: string): string {
+  return lootFamilyForSource(structure);
+}
+
+function structureSettingsDefinitionFor(structure: string): StructureSettingDefinition | undefined {
+  return structureSettingDefinitions[structureSettingsFamily(structure)];
+}
+
+function optionIdsForGroup(group: StructureSettingGroup): Set<string> {
+  return new Set(group.options.filter((option) => !option.disabled).map((option) => option.id));
+}
+
+function normalizedStructureSettings(
+  structure: string,
+  settings: ConstraintStructureSettings | undefined
+): ConstraintStructureSettings {
+  const def = structureSettingsDefinitionFor(structure);
+  if (!def || !settings) {
+    return {};
+  }
+  const out: ConstraintStructureSettings = {};
+  for (const group of def.groups) {
+    const allowed = optionIdsForGroup(group);
+    const values = [...new Set(settings[group.id] ?? [])].filter((value) => allowed.has(value));
+    if (values.length > 0) {
+      out[group.id] = values;
+    }
+  }
+  return out;
+}
+
+function settingsForConstraint(row: ConstraintRow): ConstraintStructureSettings {
+  return normalizedStructureSettings(row.structure, row.structureSettings);
+}
+
+function selectedStructureSettingCount(row: ConstraintRow): number {
+  return Object.values(settingsForConstraint(row)).reduce((sum, values) => sum + values.length, 0);
+}
+
+function structureSettingsNeedStrictStage(row: ConstraintRow): boolean {
+  return selectedStructureSettingCount(row) > 0;
+}
+
+function selectedStructureSettingLabels(row: ConstraintRow): string[] {
+  const def = structureSettingsDefinitionFor(row.structure);
+  if (!def) {
+    return [];
+  }
+  const settings = settingsForConstraint(row);
+  const labels: string[] = [];
+  for (const group of def.groups) {
+    const selected = new Set(settings[group.id] ?? []);
+    for (const option of group.options) {
+      if (selected.has(option.id)) {
+        labels.push(option.label);
+      }
+    }
+  }
+  return labels;
+}
+
+function effectiveStructureForConstraint(row: ConstraintRow): string {
+  const base = normalizeName(row.structure || "village");
+  const def = structureSettingsDefinitionFor(base);
+  if (!def) {
+    return base;
+  }
+  const settings = settingsForConstraint(row);
+  for (const group of def.groups) {
+    const selected = settings[group.id] ?? [];
+    const enforced = group.options.filter((option) => selected.includes(option.id) && option.enforcedStructure);
+    if (enforced.length === 1) {
+      return enforced[0].enforcedStructure ?? base;
+    }
+  }
+  return base;
+}
+
+function pruneConstraintStructureSettings(row: ConstraintRow): void {
+  const normalized = settingsForConstraint(row);
+  row.structureSettings = Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function lootSourcesForConstraintStructure(structure: string, version: string): string[] {
+  const supported = new Set(supportedLootSourcesForVersion(version));
+  const family = lootFamilyForSource(structure);
+  const out = new Set<string>();
+  if (supported.has(family)) {
+    out.add(family);
+  }
+  for (const source of lootFamilyBaseSources[family] ?? []) {
+    if (supported.has(source)) {
+      out.add(source);
+    }
+  }
+  return [...out];
+}
+
+function constraintRowById(id: string): ConstraintRow | undefined {
+  return state.constraints.find((row) => row.id.trim() === id.trim());
+}
+
+function lootSourcesForRow(row: LootRow): string[] {
+  const sourceSet = new Set<string>(["auto"]);
+  const constraint = constraintRowById(row.constraint);
+  if (constraint) {
+    for (const source of lootSourcesForConstraintStructure(constraint.structure, state.settings.mcVersion)) {
+      sourceSet.add(source);
+    }
+    const inferred = inferredLootSourceForConstraint(constraint, state.settings.mcVersion);
+    if (inferred) {
+      sourceSet.add(inferred === "village_weaponsmith" ? "blacksmith" : inferred);
+    }
+  }
+  return [...sourceSet];
+}
+
+function inferredLootSourceForConstraint(row: ConstraintRow | undefined, version: string): string | undefined {
+  if (!row) {
+    return undefined;
+  }
+  const supported = new Set(supportedLootSourcesForVersion(version).map(canonicalLootSourceName));
+  const settings = settingsForConstraint(row);
+  const buildingSources = [...new Set((settings.buildings ?? []).map(canonicalLootSourceName))]
+    .filter((source) => supported.has(source));
+  return buildingSources.length === 1 ? buildingSources[0] : undefined;
+}
 
 const state: State = {
   context: null,
@@ -296,6 +832,7 @@ const state: State = {
   useScriptSource: false,
   activeScanMode: "strict",
   resultStageFilter: "all",
+  activeConstraintSettingsIndex: null,
   settings: {
     scanMode: "strict",
     mcVersion: "26.1.2",
@@ -307,19 +844,22 @@ const state: State = {
     outputMode: "raw",
     upper16: "0",
     javaValidation: "auto",
+    safetyCompleteness: "exact",
     defaultAnchor: "origin",
     printClosest: false,
     terminalMode: false,
     executionMode: "auto",
     stageAMode: "auto",
     gpuPipeline: "auto",
-    strictSurrogate: "balanced",
+    gpuBackend: "auto",
+    gpuInflightBatches: "auto",
+    strictSurrogate: "off",
     strictWorkers: "0",
     mixedQueueCapacity: "1000000",
     mixedSurvivorCap: "0",
     mixedAdaptiveThrottling: true,
     saveTxt: "",
-    candidateCapMode: "adaptive",
+    candidateCapMode: "none",
     fixedCap: "128"
   },
   constraints: [{ id: "v1", structure: "village", dimension: "overworld", anchor: "origin", radius: "64", mode: "strict" }],
@@ -352,12 +892,14 @@ const iconSet = {
   Radar,
   RefreshCw,
   Route,
+  Settings: SettingsIcon,
   Sparkles,
   Square,
   Star,
   Terminal,
   Trash2,
-  Upload
+  Upload,
+  X
 };
 
 type DerivedRates = {
@@ -389,6 +931,12 @@ const TELEMETRY_SERIES: SeriesDefinition[] = [
   { key: "queueFullEvents", label: "Queue full events", color: "#ff8a8a", visible: false, group: "primary" },
   { key: "queuePushWaitMs", label: "Queue push wait", color: "#ffaa5b", unit: "ms", visible: false, group: "timing" },
   { key: "gpuUtil", label: "GPU busy", color: "#75d99c", unit: "percent", visible: false, group: "primary" },
+  { key: "gpuPipelineFill", label: "GPU pipeline fill", color: "#7ee787", unit: "percent", visible: false, group: "primary" },
+  { key: "gpuBatchKernelMs", label: "GPU batch kernel", color: "#9ad1ff", unit: "ms", visible: false, group: "timing" },
+  { key: "gpuHostGapMs", label: "GPU host gap", color: "#ffcc7a", unit: "ms", visible: false, group: "timing" },
+  { key: "gpuInflight", label: "GPU in-flight", color: "#b6e3ff", unit: "count", visible: false, group: "primary" },
+  { key: "gpuSlots", label: "GPU slots", color: "#6f8cff", unit: "count", visible: false, group: "primary" },
+  { key: "placementBatchSize", label: "Placement batch", color: "#a5d6ff", unit: "count", visible: false, group: "primary" },
   { key: "stageA", label: "Stage A rejects/s", color: "#f0a25b", unit: "rejects/sec", visible: false, group: "rejects" },
   { key: "stageB", label: "Stage B rejects/s", color: "#d19cff", unit: "rejects/sec", visible: false, group: "rejects" },
   { key: "biome", label: "Biome rejects/s", color: "#75d99c", unit: "rejects/sec", visible: false, group: "rejects" },
@@ -532,10 +1080,10 @@ const helixScriptLanguage = StreamLanguage.define({
     if (stream.match(/\b-?\d+(?:\.\d+)?\b/u)) {
       return "number";
     }
-    if (stream.match(/\b(let|set|const|fn|function|call|if|elif|else|end|and|or|not|is|contains|for|in|find|as|within|of|strict|placement|mixed|anchor|logic|biome|dimension|overworld|nether|end|y|radius|structure|mode|allow|loot|from|require|assert|skip|stop|continue|pause|scan|output|performance|workers|queue|survivor_cap|adaptive|execution|stage|gpu_pipeline|pipeline|cap|surrogate|fixed_cap)\b/u)) {
+    if (stream.match(/\b(let|set|const|fn|function|call|if|elif|else|end|and|or|not|is|contains|for|in|find|as|within|of|strict|placement|mixed|anchor|logic|biome|dimension|overworld|nether|end|y|radius|structure|mode|allow|loot|from|require|assert|skip|stop|continue|pause|scan|output|performance|workers|queue|survivor_cap|adaptive|completeness|safety|execution|stage|gpu_pipeline|pipeline|gpu_backend|backend|gpu_inflight|inflight|cap|surrogate|fixed_cap)\b/u)) {
       return "keyword";
     }
-    if (stream.match(/\b(true|false|found|optional|auto|origin|spawn|adaptive|fixed|none|balanced|aggressive|ultra|turbo|lightspeed|max-throughput|scalar|multi|single|cpu-a5|gpu-off)\b/u)) {
+    if (stream.match(/\b(true|false|found|optional|auto|origin|spawn|exact|approximate|adaptive|fixed|none|balanced|aggressive|ultra|turbo|lightspeed|max-throughput|scalar|multi|single|cpu-a5|gpu-off|cuda|opencl)\b/u)) {
       return "atom";
     }
     if (stream.match(/[A-Za-z_][A-Za-z0-9_:-]*/u)) {
@@ -647,23 +1195,25 @@ end`,
     detail: "add a biome filter",
     boost: 90
   }),
-  // Loot completion disabled in UI — parser still accepts the loot command if a script uses it.
-  // snippetCompletion("loot ${constraint} from ${source} require ${item}:${count}", {
-  //   label: "loot",
-  //   type: "function",
-  //   detail: "add a loot requirement",
-  //   boost: 89
-  // }),
+  snippetCompletion("loot ${constraint} from auto require ${item}:${count}", {
+    label: "loot",
+    type: "function",
+    detail: "add a strict loot requirement",
+    boost: 89
+  }),
   snippetCompletion(
     `performance
   workers 0
   queue 1000000
   adaptive on
+  completeness exact
   execution auto
   stage auto
-  cap adaptive
-  surrogate balanced
+  cap none
+  surrogate off
   gpu_pipeline auto
+  gpu_backend auto
+  gpu_inflight auto
   fixed_cap 128
 end`,
     { label: "performance", type: "class", detail: "scanner tuning block", boost: 88 }
@@ -716,17 +1266,19 @@ nearby_portal(v1, rp1, 96)`,
 end`,
   find: "find village in overworld as v1 within 64 of origin strict",
   biome: "biome origin in overworld y 64 radius 128 allow plains",
-  // loot block disabled in UI; parser still understands the syntax.
-  // loot: "loot v1 from village require emerald:3",
+  loot: "loot v1 from auto require diamond:2",
   performance: `performance
   workers 0
   queue 1000000
   adaptive on
+  completeness exact
   execution auto
   stage auto
-  cap adaptive
-  surrogate balanced
+  cap none
+  surrogate off
   gpu_pipeline auto
+  gpu_backend auto
+  gpu_inflight auto
   fixed_cap 128
 end`
 };
@@ -762,9 +1314,9 @@ function scriptCompletionSource(context: CompletionContext): CompletionResult | 
               : /^biome\s+\S+(?:\s+in\s+\S+)?\s+y\s+-?\d+\s+radius\s+\d+\s+allow\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
                 ? wordCompletions(biomeSuggestions, "biome")
               : /^loot\s+\S+\s+from\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
-                ? wordCompletions(lootSources, "loot source")
-                : /^\s*(mode|scan_mode|execution|stage|gpu_pipeline|pipeline|cap|surrogate|adaptive)\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
-                  ? wordCompletions(["placement", "strict", "mixed", "auto", "async", "sync", "scalar", "simd-x4", "simd-x8", "max-throughput", "single", "multi", "cpu-a5", "gpu-off", "adaptive", "fixed", "none", "off", "on", "balanced", "aggressive", "ultra", "turbo", "lightspeed"], "performance value")
+                ? wordCompletions(["auto", ...supportedLootSourcesForVersion(state.settings.mcVersion)], "loot source")
+                : /^\s*(mode|scan_mode|execution|stage|gpu_pipeline|pipeline|gpu_backend|backend|gpu_inflight|inflight|cap|surrogate|adaptive|completeness|safety)\s+[A-Za-z0-9_:-]*$/u.test(trimmed)
+                  ? wordCompletions(["placement", "strict", "mixed", "exact", "approximate", "auto", "async", "sync", "scalar", "simd-x4", "simd-x8", "max-throughput", "single", "multi", "cpu-a5", "gpu-off", "adaptive", "fixed", "none", "off", "on", "balanced", "aggressive", "ultra", "turbo", "lightspeed", "cuda", "opencl"], "performance value")
                   : commandCompletions;
   return {
     from: token.from,
@@ -890,7 +1442,10 @@ function insertScriptBlock(kind: string): void {
   if (!queryEditor) {
     return;
   }
-  const block = scriptBlockTemplates[kind];
+  const firstConstraintId = state.constraints.find((row) => row.id.trim())?.id.trim();
+  const block = kind === "loot" && firstConstraintId
+    ? `loot ${firstConstraintId} from auto require diamond:2`
+    : scriptBlockTemplates[kind];
   if (!block) {
     return;
   }
@@ -963,7 +1518,8 @@ function escapeHtml(value: unknown): string {
     .replace(/&/gu, "&amp;")
     .replace(/</gu, "&lt;")
     .replace(/>/gu, "&gt;")
-    .replace(/"/gu, "&quot;");
+    .replace(/"/gu, "&quot;")
+    .replace(/'/gu, "&#39;");
 }
 
 async function copyText(value: string): Promise<boolean> {
@@ -1302,10 +1858,75 @@ function parseLootRequirements(text: string): Record<string, number> {
     if (item.startsWith("minecraft:")) {
       item = item.slice("minecraft:".length);
     }
+    if (!item) {
+      throw new Error("Loot requirements need item names like diamond:2.");
+    }
     const count = parseNumberText(rawCount || "1", `loot count for ${item}`, 1);
     required[item] = (required[item] ?? 0) + count;
   }
   return required;
+}
+
+function validateLootFilterRows(
+  lootRows: LootRow[],
+  constraintRows: ConstraintRow[],
+  version: string
+): void {
+  const constraintsById = new Map(constraintRows.map((row) => [row.id.trim(), row]));
+  const supported = supportedLootSourcesForVersion(version);
+  for (const [index, row] of lootRows.entries()) {
+    if (!row.constraint.trim() && !row.required.trim()) {
+      continue;
+    }
+    const constraint = constraintsById.get(row.constraint.trim());
+    if (!constraint) {
+      throw new Error(`Loot row ${index + 1} references a missing constraint.`);
+    }
+    if (supported.length === 0) {
+      throw new Error(`Loot filters are not supported for MC ${version}. Use 26.1.2, 26.1.1, 1.21.11, 1.17, or 1.17.1.`);
+    }
+    const constraintFamily = lootFamilyForSource(constraint.structure);
+    const inferredSource = inferredLootSourceForConstraint(constraint, version);
+    const rowSources = lootSourcesForConstraintStructure(constraint.structure, version);
+    if (!inferredSource && rowSources.length === 0 && !supported.includes(constraintFamily)) {
+      throw new Error(`Loot row ${index + 1}: ${constraintFamily} loot is not supported for MC ${version}.`);
+    }
+    const source = normalizeName(row.source || "auto");
+    if (source !== "auto") {
+      const sourceStructure = canonicalLootSourceName(source);
+      const supportedCanonical = new Set(supported.map(canonicalLootSourceName));
+      if (!supportedCanonical.has(sourceStructure)) {
+        throw new Error(`Loot row ${index + 1}: ${sourceStructure} loot is not supported for MC ${version}.`);
+      }
+      if (lootFamilyForSource(sourceStructure) !== constraintFamily) {
+        throw new Error(`Loot row ${index + 1}: loot source must belong to the referenced ${constraintFamily} constraint.`);
+      }
+    }
+    parseLootRequirements(row.required);
+  }
+}
+
+function validateQueryLootFilters(query: QueryObject, version: string): void {
+  const rows = query.loot_filters.map((row) => ({
+    constraint: row.constraint,
+    source: row.structure,
+    required: Object.entries(row.required).map(([item, count]) => `${item}:${count}`).join(",")
+  }));
+    const constraints = query.constraints.map((row) => ({
+      id: row.id,
+      structure: row.structure,
+      dimension: row.dimension,
+      anchor: row.within.anchor,
+      radius: String(row.within.radius),
+      mode: row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict",
+      structureSettings: row.structure_settings
+    }));
+  for (const [index, row] of constraints.entries()) {
+    if (structureRequiresStrict(row.structure) && row.mode !== "strict") {
+      throw new Error(`Constraint ${row.id || index + 1}: ${row.structure} requires strict mode.`);
+    }
+  }
+  validateLootFilterRows(rows, constraints, version);
 }
 
 function currentConstraintAnchors(): string[] {
@@ -1905,6 +2526,10 @@ function applyScanSetting(key: string, value: string, scan: ScriptScanOverrides,
     scan.stageAMode = raw as Settings["stageAMode"];
   } else if (normalized === "gpu_pipeline" || normalized === "pipeline") {
     scan.gpuPipeline = raw as Settings["gpuPipeline"];
+  } else if (normalized === "gpu_backend" || normalized === "backend") {
+    scan.gpuBackend = raw as Settings["gpuBackend"];
+  } else if (normalized === "gpu_inflight" || normalized === "inflight" || normalized === "gpu_inflight_batches") {
+    scan.gpuInflightBatches = raw as Settings["gpuInflightBatches"];
   } else if (normalized === "workers" || normalized === "strict_workers") {
     scan.strictWorkers = raw;
   } else if (normalized === "queue" || normalized === "queue_capacity" || normalized === "mixed_queue_capacity") {
@@ -1957,7 +2582,7 @@ function evaluateCondition(
   );
 }
 
-function buildBuilderQuery(): unknown {
+function buildBuilderQuery(): QueryObject {
   const seen = new Set<string>();
   const constraints = state.constraints
     .filter((row) => row.id.trim() || row.structure.trim())
@@ -1967,11 +2592,27 @@ function buildBuilderQuery(): unknown {
         throw new Error(`Duplicate constraint id: ${id}`);
       }
       seen.add(id);
-      return {
+      pruneConstraintStructureSettings(row);
+      const structure = effectiveStructureForConstraint(row);
+      if (structureRequiresStrict(structure)) {
+        row.mode = "strict";
+      }
+      let mode = row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict";
+      if (structureSettingsNeedStrictStage(row) && mode === "placement") {
+        mode = state.settings.scanMode === "mixed" ? "mixed" : "strict";
+        row.mode = mode;
+      }
+      if (structureRequiresStrict(structure) && mode !== "strict") {
+        throw new Error(`${structure} requires strict mode.`);
+      }
+      if (structureSettingsNeedStrictStage(row) && mode === "placement") {
+        throw new Error(`${structure} settings require strict or mixed mode.`);
+      }
+      const constraint: ScriptConstraint = {
         id,
-        structure: normalizeName(row.structure || "village"),
+        structure,
         dimension: normalizeDimensionName(row.dimension, defaultDimensionForStructure(row.structure || "village")),
-        mode: row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict",
+        mode,
         within: {
           anchor: row.anchor.trim() || "origin",
           radius: parseNumberText(row.radius, `radius for ${id}`, 1)
@@ -1979,6 +2620,11 @@ function buildBuilderQuery(): unknown {
         required: true,
         track_found: false
       };
+      const structureSettings = settingsForConstraint(row);
+      if (Object.keys(structureSettings).length > 0) {
+        constraint.structure_settings = structureSettings;
+      }
+      return constraint;
     });
 
   const biome_filters = state.biomes
@@ -1998,9 +2644,13 @@ function buildBuilderQuery(): unknown {
       if (!constraint) {
         throw new Error(`Loot row ${index + 1} is missing a constraint id.`);
       }
+      const constraintRow = constraintRowById(constraint);
+      const autoSource = inferredLootSourceForConstraint(constraintRow, state.settings.mcVersion);
       return {
         constraint,
-        structure: normalizeName(row.source || "auto"),
+        structure: normalizeName(row.source || "auto") === "auto"
+          ? autoSource ?? "auto"
+          : canonicalLootSourceName(row.source),
         required: parseLootRequirements(row.required)
       };
     });
@@ -2018,6 +2668,7 @@ function buildBuilderQuery(): unknown {
     loot_filters,
     control_ops: [],
     output: { detail: "matched_set" },
+    safety: { completeness: state.settings.safetyCompleteness },
     performance: {
       strict_workers: parseNumberText(state.settings.strictWorkers, "strict workers", 0),
       execution_mode: state.settings.executionMode,
@@ -2089,10 +2740,11 @@ function compileQueryScript(text: string): ScriptCompileResult {
     strict_workers: 0,
     execution_mode: "auto",
     compiled_stage_a_mode: "auto",
-    candidate_cap_mode: "adaptive",
-    strict_surrogate: "balanced",
+    candidate_cap_mode: "none",
+    strict_surrogate: "off",
     fixed_cap: 128
   };
+  let safetyCompleteness: Settings["safetyCompleteness"] = "exact";
   let anchorType = "origin";
   let logic = "and";
   let outputDetail = "matched_set";
@@ -2363,12 +3015,19 @@ function compileQueryScript(text: string): ScriptCompileResult {
         scan.mixedSurvivorCap = value;
       } else if (key === "adaptive" || key === "adaptive_throttling" || key === "mixed_adaptive_throttling") {
         scan.mixedAdaptiveThrottling = parseScriptBoolean(value, `performance ${key}`, lineNo);
+      } else if (key === "completeness" || key === "safety") {
+        safetyCompleteness = parseChoice(value, ["exact", "approximate"] as const, "completeness");
+        scan.safetyCompleteness = safetyCompleteness;
       } else if (key === "execution" || key === "execution_mode") {
         performanceConfig.execution_mode = value;
       } else if (key === "stage" || key === "compiled_stage_a_mode") {
         performanceConfig.compiled_stage_a_mode = value;
       } else if (key === "gpu_pipeline" || key === "pipeline") {
         scan.gpuPipeline = value as Settings["gpuPipeline"];
+      } else if (key === "gpu_backend" || key === "backend") {
+        scan.gpuBackend = value as Settings["gpuBackend"];
+      } else if (key === "gpu_inflight" || key === "inflight" || key === "gpu_inflight_batches") {
+        scan.gpuInflightBatches = value as Settings["gpuInflightBatches"];
       } else if (key === "cap" || key === "candidate_cap_mode") {
         performanceConfig.candidate_cap_mode = value;
       } else if (key === "surrogate" || key === "strict_surrogate") {
@@ -2500,11 +3159,15 @@ function compileQueryScript(text: string): ScriptCompileResult {
       }
       seen.add(id);
       const mode = match[6]?.toLowerCase();
+      const resolvedMode = mode === "placement" || mode === "mixed" ? mode : "strict";
+      if (structureRequiresStrict(structure) && resolvedMode !== "strict") {
+        scriptError(lineNo, `${structure} requires strict mode.`);
+      }
       constraints.push({
         id,
         structure,
         dimension: normalizeDimensionName(match[2], defaultDimensionForStructure(structure)),
-        mode: mode === "placement" || mode === "mixed" ? mode : "strict",
+        mode: resolvedMode,
         within: {
           anchor: match[5],
           radius: parseNumberText(match[4], `radius for ${id}`, 1)
@@ -2535,7 +3198,7 @@ function compileQueryScript(text: string): ScriptCompileResult {
     if (match) {
       loot_filters.push({
         constraint: match[1],
-        structure: normalizeName(match[2]),
+        structure: normalizeName(match[2]) === "auto" ? "auto" : canonicalLootSourceName(match[2]),
         required: parseLootRequirements(match[3])
       });
       continue;
@@ -2567,6 +3230,7 @@ function compileQueryScript(text: string): ScriptCompileResult {
       loot_filters,
       control_ops: controlOps,
       output: { detail: outputDetail },
+      safety: { completeness: safetyCompleteness },
       performance: performanceConfig
     },
     scan
@@ -2574,9 +3238,11 @@ function compileQueryScript(text: string): ScriptCompileResult {
 }
 
 function buildCompiled(): ScriptCompileResult {
-  return state.useScriptSource
+  const compiled = state.useScriptSource
     ? compileQueryScript(queryEditorText())
     : { query: buildBuilderQuery() as QueryObject, scan: {} };
+  validateQueryLootFilters(compiled.query, state.settings.mcVersion);
+  return compiled;
 }
 
 function buildQuery(): unknown {
@@ -2615,7 +3281,10 @@ function buildArgs(overrides: ScriptScanOverrides = {}, query?: { loot_filters?:
   args.push("--execution-mode", parseChoice(settings.executionMode, ["auto", "scalar", "simd-x4", "simd-x8", "max-throughput"] as const, "execution mode"));
   args.push("--compiled-stage-a-mode", parseChoice(settings.stageAMode, ["auto", "single", "multi", "cpu-a5", "gpu-off"] as const, "Stage A mode"));
   args.push("--gpu-pipeline", parseChoice(settings.gpuPipeline, ["auto", "async", "sync"] as const, "GPU pipeline"));
+  args.push("--gpu-backend", parseChoice(settings.gpuBackend, ["auto", "cuda", "opencl"] as const, "GPU backend"));
+  args.push("--gpu-inflight-batches", parseChoice(settings.gpuInflightBatches, ["auto", "1", "2", "3", "4", "5", "6", "7", "8"] as const, "GPU in-flight batches"));
   args.push("--java-cubiomes-validation", parseChoice(settings.javaValidation, ["auto", "off", "strict"] as const, "Java validation"));
+  args.push("--completeness", parseChoice(settings.safetyCompleteness, ["exact", "approximate"] as const, "completeness"));
   args.push("--progress-interval", String(Math.max(0.1, Number(settings.progressInterval) || 1)));
 
   const workers = parseNumberText(settings.strictWorkers, "strict workers", 0);
@@ -2677,9 +3346,13 @@ function scriptFromBuilder(): string {
     const id = normalizeId(row.id || "c1");
     const radiusVar = `${id}_radius`;
     const structureVar = `${id}_structure`;
-    lines.push(`let ${structureVar} = ${normalizeName(row.structure || "village")}`);
+    lines.push(`let ${structureVar} = ${effectiveStructureForConstraint(row)}`);
     lines.push(`let ${radiusVar} = ${row.radius || "64"}`);
     lines.push(`find $${structureVar} in ${row.dimension || defaultDimensionForStructure(row.structure)} as ${id} within $${radiusVar} of ${row.anchor || "origin"} ${row.mode || "strict"}`);
+    const labels = selectedStructureSettingLabels(row);
+    if (labels.length > 0) {
+      lines.push(`# ${id} settings: ${labels.join(", ")}`);
+    }
   }
 
   for (const row of state.biomes.filter((entry) => entry.allowed.trim())) {
@@ -2698,9 +3371,12 @@ function scriptFromBuilder(): string {
     `  workers ${state.settings.strictWorkers}`,
     `  queue ${state.settings.mixedQueueCapacity}`,
     `  adaptive ${state.settings.mixedAdaptiveThrottling ? "on" : "off"}`,
+    `  completeness ${state.settings.safetyCompleteness}`,
     `  execution ${state.settings.executionMode}`,
     `  stage ${state.settings.stageAMode}`,
     `  gpu_pipeline ${state.settings.gpuPipeline}`,
+    `  gpu_backend ${state.settings.gpuBackend}`,
+    `  gpu_inflight ${state.settings.gpuInflightBatches}`,
     `  cap ${state.settings.candidateCapMode}`,
     `  surrogate ${state.settings.strictSurrogate}`,
     `  fixed_cap ${state.settings.fixedCap}`,
@@ -2745,12 +3421,130 @@ function syncControlsFromState(): void {
   $<HTMLInputElement>("#use-script-source").checked = state.useScriptSource;
 }
 
+type LootAutocompleteToken = {
+  start: number;
+  end: number;
+  leading: string;
+  name: string;
+  count: string;
+};
+
+let lootAutocompleteMenu: HTMLDivElement | null = null;
+let activeLootAutocompleteInput: HTMLInputElement | null = null;
+let activeLootAutocompleteItems: string[] = [];
+
+function lootLabel(value: string): string {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function lootTokenForInput(input: HTMLInputElement): LootAutocompleteToken {
+  const value = input.value;
+  const cursor = input.selectionStart ?? value.length;
+  const start = value.lastIndexOf(",", Math.max(0, cursor - 1)) + 1;
+  const nextComma = value.indexOf(",", cursor);
+  const end = nextComma === -1 ? value.length : nextComma;
+  const raw = value.slice(start, end);
+  const leading = raw.match(/^\s*/u)?.[0] ?? "";
+  const core = raw.trim();
+  const colonIndex = core.indexOf(":");
+  const name = colonIndex === -1 ? core : core.slice(0, colonIndex);
+  const count = colonIndex === -1 ? "1" : core.slice(colonIndex + 1).trim() || "1";
+  return { start, end, leading, name, count };
+}
+
+function filteredLootSuggestions(query: string): string[] {
+  const normalized = normalizeName(query);
+  if (!normalized) {
+    return lootItemSuggestions.slice(0, 10);
+  }
+  return lootItemSuggestions
+    .filter((item) => item.includes(normalized))
+    .sort((a, b) => Number(!a.startsWith(normalized)) - Number(!b.startsWith(normalized)))
+    .slice(0, 10);
+}
+
+function ensureLootAutocompleteMenu(): HTMLDivElement {
+  if (!lootAutocompleteMenu) {
+    lootAutocompleteMenu = document.createElement("div");
+    lootAutocompleteMenu.className = "loot-autocomplete-menu";
+    document.body.append(lootAutocompleteMenu);
+  }
+  return lootAutocompleteMenu;
+}
+
+function hideLootAutocomplete(): void {
+  if (lootAutocompleteMenu) {
+    lootAutocompleteMenu.hidden = true;
+    lootAutocompleteMenu.innerHTML = "";
+  }
+  activeLootAutocompleteInput = null;
+  activeLootAutocompleteItems = [];
+}
+
+function positionLootAutocomplete(input: HTMLInputElement, menu: HTMLDivElement): void {
+  const rect = input.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, rect.left)}px`;
+  menu.style.top = `${rect.bottom + 4}px`;
+  menu.style.width = `${Math.max(240, rect.width)}px`;
+  menu.style.maxHeight = `${Math.max(120, Math.min(260, window.innerHeight - rect.bottom - 12))}px`;
+}
+
+function showLootAutocomplete(input: HTMLInputElement): void {
+  const token = lootTokenForInput(input);
+  const items = filteredLootSuggestions(token.name);
+  if (items.length === 0) {
+    hideLootAutocomplete();
+    return;
+  }
+  activeLootAutocompleteInput = input;
+  activeLootAutocompleteItems = items;
+  const menu = ensureLootAutocompleteMenu();
+  menu.innerHTML = items
+    .map((item) => `
+      <button class="loot-autocomplete-option" type="button" data-loot-suggestion="${escapeHtml(item)}">
+        <span>${escapeHtml(lootLabel(item))}</span>
+        <small>${escapeHtml(`${item}:${token.count || "1"}`)}</small>
+      </button>
+    `)
+    .join("");
+  positionLootAutocomplete(input, menu);
+  menu.hidden = false;
+}
+
+function applyLootAutocompleteSuggestion(input: HTMLInputElement, item: string): void {
+  const token = lootTokenForInput(input);
+  const replacement = `${token.leading}${item}:${token.count || "1"}`;
+  input.value = `${input.value.slice(0, token.start)}${replacement}${input.value.slice(token.end)}`;
+  const cursor = token.start + replacement.length;
+  input.setSelectionRange(cursor, cursor);
+  updateCollection(input);
+  syncScriptFromBuilder();
+  updateCommandPreview();
+  hideLootAutocomplete();
+  input.focus();
+}
+
 function renderConstraints(): void {
   const anchors = currentConstraintAnchors();
   $("#constraints-body").innerHTML = state.constraints
     .map((row, index) => {
       const dimension = row.dimension || defaultDimensionForStructure(row.structure);
       const visibleStructures = structuresForDimension(dimension);
+      pruneConstraintStructureSettings(row);
+      const effectiveStructure = effectiveStructureForConstraint(row);
+      const requiresStrict = structureRequiresStrict(effectiveStructure);
+      if (requiresStrict) {
+        row.mode = "strict";
+      }
+      const settingsCount = selectedStructureSettingCount(row);
+      const settingsTitle =
+        settingsCount > 0
+          ? `Additional settings: ${selectedStructureSettingLabels(row).join(", ")}`
+          : "Additional settings";
       return `
         <div class="grid-row constraint-row">
           <input data-collection="constraints" data-index="${index}" data-field="id" value="${escapeHtml(row.id)}" />
@@ -2763,12 +3557,88 @@ function renderConstraints(): void {
           ${dropdownControl(dimensions, dimension, { "data-collection": "constraints", "data-index": String(index), "data-field": "dimension" })}
           ${dropdownControl(anchors, row.anchor, { "data-collection": "constraints", "data-index": String(index), "data-field": "anchor" })}
           <input data-collection="constraints" data-index="${index}" data-field="radius" value="${escapeHtml(row.radius)}" />
-          ${dropdownControl(["strict", "placement", "mixed"], row.mode, { "data-collection": "constraints", "data-index": String(index), "data-field": "mode" })}
+          ${dropdownControl(
+            requiresStrict ? ["strict"] : ["strict", "placement", "mixed"],
+            requiresStrict ? "strict" : row.mode,
+            { "data-collection": "constraints", "data-index": String(index), "data-field": "mode" }
+          )}
           <button class="icon-button row-action" data-action="remove-constraint" data-index="${index}" title="Remove constraint"><i data-lucide="trash-2"></i></button>
+          <button class="icon-button row-action constraint-settings-button${settingsCount > 0 ? " active" : ""}" data-action="open-constraint-settings" data-index="${index}" title="${escapeHtml(settingsTitle)}"><i data-lucide="settings"></i></button>
         </div>
       `;
     })
     .join("");
+}
+
+function closeConstraintSettingsDialog(): void {
+  state.activeConstraintSettingsIndex = null;
+  document.querySelector<HTMLElement>("[data-constraint-settings-backdrop]")?.remove();
+}
+
+function renderConstraintSettingsDialog(index: number): void {
+  const row = state.constraints[index];
+  if (!row) {
+    closeConstraintSettingsDialog();
+    return;
+  }
+  state.activeConstraintSettingsIndex = index;
+  pruneConstraintStructureSettings(row);
+  const def = structureSettingsDefinitionFor(row.structure);
+  const settings = settingsForConstraint(row);
+  const title = def?.title ?? "Structure settings";
+  const subtitle = `${row.id.trim() || `constraint ${index + 1}`} - ${row.structure || "structure"}`;
+  const body = def
+    ? def.groups
+        .map((group) => {
+          const selected = new Set(settings[group.id] ?? []);
+          const options = group.options
+            .map((option) => `
+              <label class="settings-option${option.disabled ? " disabled" : ""}" title="${escapeHtml(option.note ?? option.label)}">
+                <input
+                  type="checkbox"
+                  data-structure-setting="true"
+                  data-index="${index}"
+                  data-group="${escapeHtml(group.id)}"
+                  data-value="${escapeHtml(option.id)}"
+                  ${option.disabled ? "disabled" : ""}
+                  ${selected.has(option.id) ? "checked" : ""}
+                />
+                <span>${escapeHtml(option.label)}${option.disabled ? `<small>${escapeHtml(option.note ?? "not available")}</small>` : ""}</span>
+              </label>
+            `)
+            .join("");
+          return `
+            <section class="settings-group">
+              <div class="settings-group-title">${escapeHtml(group.label)}</div>
+              <div class="settings-option-grid">${options}</div>
+            </section>
+          `;
+        })
+        .join("")
+    : `<div class="settings-empty">No extra settings are available for ${escapeHtml(row.structure || "this structure")} yet.</div>`;
+
+  document.querySelector<HTMLElement>("[data-constraint-settings-backdrop]")?.remove();
+  const host = document.createElement("div");
+  host.className = "settings-backdrop";
+  host.dataset.constraintSettingsBackdrop = "true";
+  host.innerHTML = `
+    <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+      <header class="settings-dialog-header">
+        <div class="settings-dialog-title">
+          <strong>${escapeHtml(title)}</strong>
+          <span>${escapeHtml(subtitle)}</span>
+        </div>
+        <button class="icon-button" data-action="close-constraint-settings" title="Close"><i data-lucide="x"></i></button>
+      </header>
+      <div class="settings-dialog-body">${body}</div>
+      <footer class="settings-dialog-footer">
+        <button class="black-button small" data-action="clear-constraint-settings" data-index="${index}">Clear</button>
+        <button class="black-button small primary" data-action="close-constraint-settings">Done</button>
+      </footer>
+    </section>
+  `;
+  document.body.append(host);
+  refreshIcons();
 }
 
 function renderBiomes(): void {
@@ -2787,16 +3657,33 @@ function renderBiomes(): void {
 }
 
 function renderLoot(): void {
-  const constraintIds = state.constraints.map((row) => row.id.trim()).filter(Boolean);
+  const constraintIds = state.constraints
+    .map((row) => row.id.trim())
+    .filter(Boolean);
   $("#loot-body").innerHTML = state.loot
-    .map((row, index) => `
-      <div class="grid-row loot-row">
-        ${dropdownControl(constraintIds, row.constraint, { "data-collection": "loot", "data-index": String(index), "data-field": "constraint" })}
-        ${dropdownControl(lootSources, row.source, { "data-collection": "loot", "data-index": String(index), "data-field": "source" })}
-        <input data-collection="loot" data-index="${index}" data-field="required" value="${escapeHtml(row.required)}" placeholder="diamond:2,emerald:5" />
-        <button class="icon-button row-action" data-action="remove-loot" data-index="${index}" title="Remove loot filter"><i data-lucide="trash-2"></i></button>
-      </div>
-    `)
+    .map((row, index) => {
+      const sourceOptions = lootSourcesForRow(row);
+      const selectedSource = sourceOptions.includes(row.source) ? row.source : "auto";
+      row.source = selectedSource;
+      return `
+        <div class="grid-row loot-row">
+          ${dropdownControl(
+            constraintIds,
+            row.constraint,
+            { "data-collection": "loot", "data-index": String(index), "data-field": "constraint" },
+            { "data-searchable": "true", "data-search-placeholder": "Search constraints" }
+          )}
+          ${dropdownControl(
+            sourceOptions,
+            selectedSource,
+            { "data-collection": "loot", "data-index": String(index), "data-field": "source" },
+            { "data-searchable": "true", "data-search-placeholder": "Search loot source" }
+          )}
+          <input data-collection="loot" data-index="${index}" data-field="required" data-loot-autocomplete="true" autocomplete="off" value="${escapeHtml(row.required)}" placeholder="diamond:2,emerald:5" />
+          <button class="icon-button row-action" data-action="remove-loot" data-index="${index}" title="Remove loot filter"><i data-lucide="trash-2"></i></button>
+        </div>
+      `;
+    })
     .join("");
 }
 
@@ -3023,6 +3910,11 @@ function initializeTelemetry(): void {
     setText("#telemetry-queue-full-events", formatNumber(snapshot.latest?.values.queueFullEvents ?? 0));
     setText("#telemetry-queue-push-wait", `${(snapshot.latest?.values.queuePushWaitMs ?? 0).toFixed(3)}ms`);
     setText("#telemetry-gpu-util", `${(snapshot.latest?.values.gpuUtil ?? 0).toFixed(1)}%`);
+    setText("#telemetry-gpu-inflight", `${formatNumber(snapshot.latest?.values.gpuInflight ?? 0)} / ${formatNumber(snapshot.latest?.values.gpuSlots ?? 0)}`);
+    setText("#telemetry-placement-batch", formatNumber(snapshot.latest?.values.placementBatchSize ?? 0));
+    setText("#telemetry-gpu-kernel-ms", `${(snapshot.latest?.values.gpuBatchKernelMs ?? 0).toFixed(3)}ms`);
+    setText("#telemetry-gpu-host-gap-ms", `${(snapshot.latest?.values.gpuHostGapMs ?? 0).toFixed(3)}ms`);
+    setText("#telemetry-gpu-fill", `${(snapshot.latest?.values.gpuPipelineFill ?? 0).toFixed(1)}%`);
     const scanLed = document.querySelector("#telemetry-scan-led");
     scanLed?.classList.toggle("active", snapshot.running && !snapshot.paused);
     const gpuLed = document.querySelector("#telemetry-gpu-led");
@@ -3072,6 +3964,12 @@ function formatTelemetryValue(series: SeriesDefinition, value: number): string {
   if (series.unit === "percent") {
     return `${value.toFixed(1)}%`;
   }
+  if (series.unit === "ms") {
+    return `${value.toFixed(3)}ms`;
+  }
+  if (series.unit === "count") {
+    return formatNumber(value);
+  }
   return formatRatePerSecond(value);
 }
 
@@ -3120,9 +4018,15 @@ function applyProgress(payload: ScannerProgress): void {
   const strictConsumedRate = nonNegativeNumber(payload.strict_consumed_per_sec ?? payload.strict_rate_sps);
   const verifiedRate = nonNegativeNumber(payload.strict_verified_per_sec);
   const queueDepth = nonNegativeNumber(payload.queue_depth ?? payload.queue_size);
+  const gpuInflight = nonNegativeNumber(payload.gpu_inflight_batches);
+  const gpuSlots = nonNegativeNumber(payload.gpu_async_slots_available);
+  const gpuFill = nonNegativeNumber(payload.gpu_pipeline_fill_percent);
   const isMixed = (payload.scan_mode ?? state.settings.scanMode) === "mixed";
   $("#progress-fill").style.width = `${pct}%`;
   $("#run-status").textContent = state.running ? `${state.paused ? "Paused" : "Running"} ${pct.toFixed(2)}%` : "Idle";
+  if (state.running && isMixed && (payload.gpu_pipeline ?? "off") === "off") {
+    $("#run-status").textContent = `Running ${pct.toFixed(2)}% - GPU placement inactive`;
+  }
   $("#progress-rate").textContent = isMixed ? formatRate(rawPlacementRate) : formatRate(payload.rate_sps);
   $("#metric-processed").textContent = `${formatNumber(processed)} / ${formatNumber(total)}`;
   $("#metric-survivors").textContent = formatNumber(payload.stage_a_survivors ?? payload.gpu_hits ?? 0);
@@ -3139,6 +4043,8 @@ function applyProgress(payload: ScannerProgress): void {
   const strictSec = Number(payload.strict_sec ?? 0);
   const javaSec = Number(payload.java_worldgen_sec ?? 0);
   $("#metric-time").textContent = `${strictSec.toFixed(3)}s / ${javaSec.toFixed(3)}s`;
+  $("#metric-gpu-fill").textContent = `${gpuFill.toFixed(1)}%`;
+  $("#metric-gpu-slots").textContent = `${formatNumber(gpuInflight)} / ${formatNumber(gpuSlots)}`;
   const rejects = deriveRejectRates(payload);
   telemetryStore.ingest(
     {
@@ -3155,6 +4061,12 @@ function applyProgress(payload: ScannerProgress): void {
       queueFullEvents: nonNegativeNumber(payload.queue_full_events),
       queuePushWaitMs: nonNegativeNumber(payload.queue_push_wait_time_ms),
       gpuUtil: nonNegativeNumber(payload.gpu_busy_percent ?? payload.placement_gpu_busy_percent ?? payload.gpu_utilization_estimate),
+      gpuInflight,
+      gpuSlots,
+      placementBatchSize: nonNegativeNumber(payload.placement_batch_size),
+      gpuBatchKernelMs: nonNegativeNumber(payload.gpu_batch_kernel_ms),
+      gpuHostGapMs: nonNegativeNumber(payload.gpu_host_gap_ms),
+      gpuPipelineFill: gpuFill,
       stageA: rejects.stageARate,
       stageB: rejects.stageBRate,
       biome: rejects.biomeRate,
@@ -3193,10 +4105,20 @@ function updateCollection(target: HTMLInputElement): void {
   }
   const value = target.value;
   if (collection === "constraints" && state.constraints[index]) {
+    const beforeFamily = structureSettingsFamily(state.constraints[index].structure);
     (state.constraints[index] as unknown as Record<string, string>)[field] = value;
     if (field === "structure") {
       state.constraints[index].dimension = defaultDimensionForStructure(value);
+      if (structureSettingsFamily(value) !== beforeFamily) {
+        state.constraints[index].structureSettings = undefined;
+      } else {
+        pruneConstraintStructureSettings(state.constraints[index]);
+      }
+      if (structureRequiresStrict(effectiveStructureForConstraint(state.constraints[index]))) {
+        state.constraints[index].mode = "strict";
+      }
       renderConstraints();
+      renderLoot();
       refreshIcons();
       syncDropdowns();
     }
@@ -3206,12 +4128,17 @@ function updateCollection(target: HTMLInputElement): void {
       const allowed = structuresForDimension(dimension);
       if (!allowed.includes(state.constraints[index].structure)) {
         state.constraints[index].structure = allowed[0] ?? state.constraints[index].structure;
+        state.constraints[index].structureSettings = undefined;
       }
       renderConstraints();
+      renderLoot();
       refreshIcons();
       syncDropdowns();
     }
-    if (field === "id") {
+    if (field === "id" || field === "mode") {
+      if (field === "mode" && structureRequiresStrict(effectiveStructureForConstraint(state.constraints[index]))) {
+        state.constraints[index].mode = "strict";
+      }
       renderConstraints();
       renderLoot();
       refreshIcons();
@@ -3221,6 +4148,12 @@ function updateCollection(target: HTMLInputElement): void {
     (state.biomes[index] as unknown as Record<string, string>)[field] = value;
   } else if (collection === "loot" && state.loot[index]) {
     (state.loot[index] as unknown as Record<string, string>)[field] = value;
+    if (field === "constraint") {
+      state.loot[index].source = "auto";
+      renderLoot();
+      refreshIcons();
+      syncDropdowns();
+    }
   }
 }
 
@@ -3228,10 +4161,18 @@ function applyScriptToBuilder(): void {
   const compiled = compileQueryScript(queryEditorText());
   const raw = compiled.query as {
     anchor?: { type?: string };
-    constraints?: Array<{ id?: string; structure?: string; dimension?: string; mode?: string; within?: { anchor?: string; radius?: number } | number }>;
+    constraints?: Array<{
+      id?: string;
+      structure?: string;
+      dimension?: string;
+      mode?: string;
+      within?: { anchor?: string; radius?: number } | number;
+      structure_settings?: ConstraintStructureSettings;
+    }>;
     biome_filters?: Array<{ point?: string; dimension?: string; y?: number; radius?: number; allowed?: string[] | string }>;
     loot_filters?: Array<{ constraint?: string; source?: string; structure?: string; required?: Record<string, number> | string[] | string }>;
     performance?: Record<string, unknown>;
+    safety?: { completeness?: string };
   };
 
   state.constraints = Array.isArray(raw.constraints)
@@ -3243,7 +4184,8 @@ function applyScriptToBuilder(): void {
           dimension: normalizeDimensionName(row.dimension, defaultDimensionForStructure(String(row.structure ?? "village"))),
           anchor: String(within.anchor ?? "origin"),
           radius: String(within.radius ?? 64),
-          mode: row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict"
+          mode: row.mode === "placement" ? "placement" : row.mode === "mixed" ? "mixed" : "strict",
+          structureSettings: normalizedStructureSettings(String(row.structure ?? "village"), row.structure_settings)
         };
       })
     : [];
@@ -3273,9 +4215,14 @@ function applyScriptToBuilder(): void {
         };
       })
     : [];
+  state.loot.forEach((row) => {
+    row.source = normalizeName(row.source) === "auto" ? "auto" : canonicalLootSourceName(row.source);
+  });
 
   const perf = raw.performance ?? {};
   state.settings.defaultAnchor = raw.anchor?.type === "spawn" ? "spawn" : "origin";
+  state.settings.safetyCompleteness =
+    raw.safety?.completeness === "approximate" ? "approximate" : "exact";
   state.settings.strictWorkers = String(perf.strict_workers ?? state.settings.strictWorkers);
   state.settings.executionMode = String(perf.execution_mode ?? state.settings.executionMode) as Settings["executionMode"];
   state.settings.stageAMode = String(perf.compiled_stage_a_mode ?? state.settings.stageAMode).replace("_", "-") as Settings["stageAMode"];
@@ -3292,6 +4239,8 @@ function applyMaxPerformanceSettings(): void {
   state.settings.executionMode = "max-throughput";
   state.settings.stageAMode = "multi";
   state.settings.gpuPipeline = "async";
+  state.settings.gpuInflightBatches = "auto";
+  state.settings.safetyCompleteness = "approximate";
   state.settings.strictSurrogate = "lightspeed";
   state.settings.candidateCapMode = "adaptive";
   state.settings.mixedAdaptiveThrottling = true;
@@ -3327,6 +4276,11 @@ document.addEventListener("input", (event) => {
     const key = target.dataset.setting as keyof Settings;
     (state.settings as unknown as Record<string, string | boolean>)[key] =
       target instanceof HTMLInputElement && target.type === "checkbox" ? target.checked : target.value;
+    if (key === "mcVersion") {
+      renderLoot();
+      refreshIcons();
+      syncDropdowns();
+    }
     syncScriptFromBuilder();
     updateCommandPreview();
     return;
@@ -3335,11 +4289,75 @@ document.addEventListener("input", (event) => {
     updateCollection(target);
     syncScriptFromBuilder();
     updateCommandPreview();
+    if (target.dataset.lootAutocomplete === "true") {
+      showLootAutocomplete(target);
+    }
+  }
+});
+
+document.addEventListener("focusin", (event) => {
+  const target = event.target;
+  if (target instanceof HTMLInputElement && target.dataset.lootAutocomplete === "true") {
+    showLootAutocomplete(target);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || target.dataset.lootAutocomplete !== "true") {
+    return;
+  }
+  if (event.key === "Escape") {
+    hideLootAutocomplete();
+    return;
+  }
+  if ((event.key === "Enter" || event.key === "Tab") && activeLootAutocompleteInput === target && activeLootAutocompleteItems.length > 0) {
+    event.preventDefault();
+    applyLootAutocompleteSuggestion(target, activeLootAutocompleteItems[0]);
   }
 });
 
 document.addEventListener("change", (event) => {
   const target = event.target;
+  if (target instanceof HTMLInputElement && target.dataset.structureSetting === "true") {
+    const index = Number(target.dataset.index);
+    const group = target.dataset.group ?? "";
+    const value = target.dataset.value ?? "";
+    const row = state.constraints[index];
+    if (row && group && value) {
+      const def = structureSettingsDefinitionFor(row.structure);
+      const option = def?.groups.find((entry) => entry.id === group)?.options.find((entry) => entry.id === value);
+      if (option?.disabled) {
+        target.checked = false;
+        return;
+      }
+      const next = settingsForConstraint(row);
+      const values = new Set(next[group] ?? []);
+      if (target.checked) {
+        values.add(value);
+      } else {
+        values.delete(value);
+      }
+      if (values.size > 0) {
+        next[group] = [...values];
+      } else {
+        delete next[group];
+      }
+      row.structureSettings = Object.keys(next).length > 0 ? next : undefined;
+      if (structureRequiresStrict(effectiveStructureForConstraint(row))) {
+        row.mode = "strict";
+      } else if (structureSettingsNeedStrictStage(row) && row.mode === "placement") {
+        row.mode = state.settings.scanMode === "mixed" ? "mixed" : "strict";
+      }
+      renderConstraints();
+      renderConstraintSettingsDialog(index);
+      syncScriptFromBuilder();
+      updateCommandPreview();
+      refreshIcons();
+      syncDropdowns();
+    }
+    return;
+  }
   if (target instanceof HTMLInputElement && target.id === "use-script-source") {
     state.useScriptSource = target.checked;
     updateCommandPreview();
@@ -3390,6 +4408,12 @@ function disarmKofi(): void {
 }
 
 document.addEventListener("click", async (event) => {
+  const backdrop = (event.target as HTMLElement).closest<HTMLElement>("[data-constraint-settings-backdrop]");
+  if (backdrop && event.target === backdrop) {
+    closeConstraintSettingsDialog();
+    return;
+  }
+
   const tabButton = (event.target as HTMLElement).closest<HTMLElement>("[data-tab-target]");
   if (tabButton) {
     const targetTab = tabButton.dataset.tabTarget ?? "builder";
@@ -3427,6 +4451,20 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  const lootSuggestion = (event.target as HTMLElement).closest<HTMLElement>("[data-loot-suggestion]");
+  if (lootSuggestion && activeLootAutocompleteInput) {
+    applyLootAutocompleteSuggestion(activeLootAutocompleteInput, lootSuggestion.dataset.lootSuggestion ?? "");
+    return;
+  }
+
+  if (
+    activeLootAutocompleteInput &&
+    event.target !== activeLootAutocompleteInput &&
+    !(event.target as HTMLElement).closest(".loot-autocomplete-menu")
+  ) {
+    hideLootAutocomplete();
+  }
+
   const button = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
   if (!button) {
     const seed = (event.target as HTMLElement).closest<HTMLElement>("[data-seed]");
@@ -3446,7 +4484,23 @@ document.addEventListener("click", async (event) => {
       renderAll();
     } else if (action === "remove-constraint") {
       state.constraints.splice(Number(button.dataset.index), 1);
+      closeConstraintSettingsDialog();
       renderAll();
+    } else if (action === "open-constraint-settings") {
+      renderConstraintSettingsDialog(Number(button.dataset.index));
+    } else if (action === "close-constraint-settings") {
+      closeConstraintSettingsDialog();
+    } else if (action === "clear-constraint-settings") {
+      const index = Number(button.dataset.index);
+      if (state.constraints[index]) {
+        state.constraints[index].structureSettings = undefined;
+        renderConstraints();
+        renderConstraintSettingsDialog(index);
+        syncScriptFromBuilder();
+        updateCommandPreview();
+        refreshIcons();
+        syncDropdowns();
+      }
     } else if (action === "add-biome") {
       state.biomes.push({ point: "origin", dimension: "overworld", y: "64", radius: "0", allowed: "plains" });
       renderAll();
@@ -3454,7 +4508,11 @@ document.addEventListener("click", async (event) => {
       state.biomes.splice(Number(button.dataset.index), 1);
       renderAll();
     } else if (action === "add-loot") {
-      state.loot.push({ constraint: state.constraints[0]?.id ?? "", source: "auto", required: "diamond:2" });
+      state.loot.push({
+        constraint: state.constraints.find((row) => row.id.trim())?.id ?? "",
+        source: "auto",
+        required: "diamond:2"
+      });
       renderAll();
     } else if (action === "remove-loot") {
       state.loot.splice(Number(button.dataset.index), 1);
@@ -3500,7 +4558,7 @@ document.addEventListener("click", async (event) => {
       button.classList.toggle("active", telemetryFpsVisible);
       button.setAttribute("title", telemetryFpsVisible ? "Hide FPS overlay" : "Show FPS overlay");
     } else if (action === "open-repo" && state.context) {
-      await window.helixSeed.openPath(state.context.repoRoot);
+      await window.helixSeed.openPath();
     } else if (action === "run") {
       const compiled = buildCompiled();
       const query = compiled.query;
@@ -3554,17 +4612,33 @@ window.helixSeed.onExit((payload) => {
   setRunning(false);
 });
 
+function finishLoadingScreen(): void {
+  const screen = document.querySelector<HTMLElement>("#loading-screen");
+  document.body.classList.add("loading-ready");
+  if (!screen) {
+    document.body.classList.remove("loading");
+    return;
+  }
+  screen.classList.add("fade-out");
+  screen.addEventListener(
+    "transitionend",
+    () => {
+      screen.remove();
+      document.body.classList.remove("loading", "loading-ready");
+    },
+    { once: true }
+  );
+}
+
 async function boot(): Promise<void> {
   state.context = await window.helixSeed.getContext();
-  const status = $("#backend-status");
-  status.textContent = state.context.scannerExists
-    ? `Native backend: ${state.context.scannerPath}`
-    : `Native backend missing: ${state.context.scannerPath}`;
   initializeQueryEditor();
   initializeTelemetry();
   renderAll();
+  requestAnimationFrame(() => finishLoadingScreen());
 }
 
 void boot().catch((error) => {
   appendOutput(`[ui] Failed to initialize: ${error instanceof Error ? error.message : String(error)}`);
+  requestAnimationFrame(() => finishLoadingScreen());
 });

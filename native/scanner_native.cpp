@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cerrno>
 #include <cctype>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -42,6 +44,9 @@
 #endif
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
+#endif
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
 #endif
 #include <windows.h>
 #else
@@ -72,6 +77,9 @@ static bool g_debug_enabled = false;
 
 constexpr uint64_t JAVA_MASK = ((1ULL << 48U) - 1ULL);
 constexpr uint64_t JAVA_DOMAIN = (JAVA_MASK + 1ULL);
+constexpr uint64_t JAVA_MULT = 25214903917ULL;
+constexpr uint64_t JAVA_ADD = 11ULL;
+constexpr uint32_t INT32_SIGN = 0x80000000U;
 constexpr int64_t REGION_X_MULT = 341873128712LL;
 constexpr int64_t REGION_Z_MULT = 132897987541LL;
 constexpr int CHUNK_SIZE = 16;
@@ -110,12 +118,16 @@ struct StructureContext {
 struct ConstraintSpec {
     std::string cid;
     std::string structure;
+    std::string validation_structure;
     std::string dimension = "overworld";
     std::string mode;
     std::string anchor;
     int radius = 0;
     uint32_t min_required = 1U;
     uint32_t quad_accuracy = 0U;
+    uint32_t viability_flags = 0U;
+    bool strict_only_variant = false;
+    std::unordered_map<std::string, std::vector<std::string>> structure_settings;
 };
 
 struct BiomeFilterSpec {
@@ -152,12 +164,16 @@ struct SculptSpec {
 
 struct PerfSpec {
     int strict_workers = 0;
-    std::string candidate_cap_mode = "adaptive";
+    std::string candidate_cap_mode = "none";
     int fixed_cap = 128;
     int spawn_anchor_slack = 1024;
-    std::string strict_surrogate = "balanced";
+    std::string strict_surrogate = "off";
     std::string execution_mode = "auto";
     std::string compiled_stage_a_mode = "auto";
+};
+
+struct SafetySpec {
+    std::string completeness = "exact";  // exact|approximate
 };
 
 struct QuerySpec {
@@ -170,6 +186,7 @@ struct QuerySpec {
     std::vector<LootFilterSpec> loot_filters;
     SculptSpec sculpt;
     PerfSpec perf;
+    SafetySpec safety;
 };
 
 struct QueryConstraintRuntime {
@@ -253,6 +270,7 @@ using FnGpuFilterMultiChecked = int (*)(
     uint64_t *,
     uint32_t *);
 using FnGpuFilterDoubleBufferAvailable = int (*)();
+using FnGpuFilterAsyncMaxSlots = uint32_t (*)();
 using FnGpuFilterMultiSubmit = int (*)(
     uint32_t,
     uint64_t,
@@ -291,6 +309,7 @@ using FnScannerCoreValidateQueryBatchCompiled = int (*)(
     uint32_t *,
     uint32_t *,
     uint32_t *);
+using FnScannerCoreValidateQueryBatchCompiledPostStageA = FnScannerCoreValidateQueryBatchCompiled;
 using FnScannerCoreCollectQueryDetailsCompiled = int (*)(
     const ScannerCompiledQueryPlan *,
     uint64_t,
@@ -309,14 +328,33 @@ using ModuleHandle = HMODULE;
 static void *lookup_symbol(ModuleHandle module, const char *name) {
     return reinterpret_cast<void *>(GetProcAddress(module, name));
 }
+static void close_module(ModuleHandle module) {
+    if (module != nullptr) {
+        FreeLibrary(module);
+    }
+}
 #else
 using ModuleHandle = void *;
 static void *lookup_symbol(ModuleHandle module, const char *name) {
     return dlsym(module, name);
 }
+static void close_module(ModuleHandle module) {
+    if (module != nullptr) {
+        dlclose(module);
+    }
+}
 #endif
 
-static const char *gpu_filter_library_filename() {
+static const char *gpu_filter_library_filename_for(const std::string &backend) {
+    if (backend == "opencl") {
+#if defined(_WIN32)
+        return "gpu_filter_opencl.dll";
+#elif defined(__APPLE__)
+        return "libgpu_filter_opencl.dylib";
+#else
+        return "libgpu_filter_opencl.so";
+#endif
+    }
 #if defined(_WIN32)
     return "gpu_filter.dll";
 #elif defined(__APPLE__)
@@ -324,6 +362,10 @@ static const char *gpu_filter_library_filename() {
 #else
     return "libgpu_filter.so";
 #endif
+}
+
+static const char *gpu_filter_library_filename() {
+    return gpu_filter_library_filename_for("cuda");
 }
 
 static const char *cubiomes_library_filename() {
@@ -336,12 +378,19 @@ static const char *cubiomes_library_filename() {
 #endif
 }
 
-static const char *gpu_backend_readme_path() {
+static const char *gpu_backend_readme_path_for(const std::string &backend) {
+    if (backend == "opencl") {
+        return "opencl/README.md";
+    }
 #if defined(__APPLE__)
     return "macos/README.md";
 #else
     return "cuda/BUILD.md";
 #endif
+}
+
+static const char *gpu_backend_readme_path() {
+    return gpu_backend_readme_path_for("cuda");
 }
 
 static const char *native_scanner_program_name() {
@@ -377,32 +426,33 @@ static bool is_loot_validation_protocol_line(const std::string &line) {
 
 class GpuFilterApi {
 public:
+    // Compatibility entry point: defaults to "auto" backend selection
+    // (try CUDA first, fall back to OpenCL).
     bool load(const fs::path &repo_root) {
+        return load(repo_root, "auto");
+    }
+
+    // backend = "auto" | "cuda" | "opencl". Returns true if a backend was
+    // loaded and exposes the required symbols.
+    bool load(const fs::path &repo_root, const std::string &backend) {
         if (loaded_) {
             return ready_;
         }
 
-        std::vector<fs::path> candidates;
-        const char *env = std::getenv("GPU_FILTER_DLL");
-        if (env != nullptr && *env != '\0') {
-            candidates.emplace_back(env);
+        std::vector<std::string> backends_to_try;
+        if (backend == "opencl") {
+            backends_to_try = {"opencl"};
+        } else if (backend == "cuda") {
+            backends_to_try = {"cuda"};
+        } else {
+            // auto: try CUDA first (typically faster on NVIDIA hardware),
+            // then OpenCL for everything else.
+            backends_to_try = {"cuda", "opencl"};
         }
-        candidates.emplace_back(repo_root / gpu_filter_library_filename());
-#if defined(__APPLE__)
-        candidates.emplace_back(repo_root / "macos" / gpu_filter_library_filename());
-#endif
-        candidates.emplace_back(repo_root / "cuda" / gpu_filter_library_filename());
-        candidates.emplace_back(fs::current_path() / gpu_filter_library_filename());
-#if defined(__APPLE__)
-        candidates.emplace_back(fs::current_path() / "macos" / gpu_filter_library_filename());
-#endif
-        candidates.emplace_back(fs::current_path() / "cuda" / gpu_filter_library_filename());
 
-        for (const fs::path &candidate : candidates) {
-            if (!fs::exists(candidate)) {
-                continue;
-            }
-            if (try_load(candidate)) {
+        for (const std::string &b : backends_to_try) {
+            if (try_load_backend(repo_root, b)) {
+                active_backend_ = b;
                 break;
             }
         }
@@ -412,6 +462,9 @@ public:
                  (gpu_filter_multi_checked_ != nullptr || gpu_filter_multi_ != nullptr);
         return ready_;
     }
+
+    const std::string &active_backend() const { return active_backend_; }
+    const fs::path &loaded_path() const { return loaded_path_; }
 
     bool is_available() const {
         return ready_ && gpu_is_available_() == 1;
@@ -444,6 +497,10 @@ public:
         }
         if (!ready_) {
             throw std::runtime_error("GPU filter backend not loaded.");
+        }
+        if (count > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error(
+                "GPU filter batch exceeds the 32-bit hit-count ABI limit; reduce the batch size.");
         }
 
         if (gpu_output_capacity_ < count) {
@@ -485,6 +542,9 @@ public:
                 &hit_count
             );
         }
+        if (static_cast<uint64_t>(hit_count) > count) {
+            throw std::runtime_error("GPU filter backend returned more hits than the submitted batch capacity.");
+        }
         out.assign(gpu_output_scratch_.get(), gpu_output_scratch_.get() + hit_count);
     }
 
@@ -517,6 +577,20 @@ public:
         return gpu_filter_double_buffer_available_() != 0;
     }
 
+    uint32_t async_max_slots() const {
+        if (!async_available()) {
+            return 0U;
+        }
+        if (gpu_filter_async_max_slots_ == nullptr) {
+            return 2U;
+        }
+        const uint32_t slots = gpu_filter_async_max_slots_();
+        if (slots < 2U) {
+            return 2U;
+        }
+        return std::min<uint32_t>(slots, 8U);
+    }
+
     // Submit a Stage A batch on the given slot (0 or 1). Does NOT block.
     // After submit returns, the caller may continue with CPU work; collect
     // the matching slot when ready to consume survivors.
@@ -527,16 +601,19 @@ public:
         const std::vector<GpuRegionTerm> &regions,
         const std::vector<GpuConstraintDesc> &constraints
     ) const {
-        if (slot_id >= 2U) {
-            throw std::runtime_error("submit_batch: invalid slot id.");
-        }
         if (!async_available()) {
             throw std::runtime_error("submit_batch: async API not available.");
         }
-        if (async_slot_capacity_[slot_id] < count) {
-            async_slot_scratch_[slot_id].reset(new uint64_t[static_cast<size_t>(count == 0 ? 1 : count)]);
-            async_slot_capacity_[slot_id] = (count == 0 ? 1 : count);
+        const uint32_t max_slots = async_max_slots();
+        if (slot_id >= max_slots) {
+            throw std::runtime_error("submit_batch: invalid slot id.");
         }
+        if (count > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error(
+                "submit_batch: batch exceeds the 32-bit hit-count ABI limit; reduce the batch size.");
+        }
+        ensure_async_slot_capacity(slot_id);
+        async_slot_capacity_[slot_id] = count;
         async_slot_submitted_[slot_id] = count;
 
         GpuRegionTerm dummy_region{};
@@ -571,13 +648,19 @@ public:
     ) const {
         kernel_seconds = 0.0;
         transfer_seconds = 0.0;
-        if (slot_id >= 2U) {
-            throw std::runtime_error("collect_batch: invalid slot id.");
-        }
         if (!async_available()) {
             throw std::runtime_error("collect_batch: async API not available.");
         }
+        const uint32_t max_slots = async_max_slots();
+        if (slot_id >= max_slots) {
+            throw std::runtime_error("collect_batch: invalid slot id.");
+        }
+        ensure_async_slot_capacity(slot_id);
         const uint64_t capacity = async_slot_capacity_[slot_id];
+        if (async_slot_scratch_capacity_[slot_id] < capacity) {
+            async_slot_scratch_[slot_id].reset(new uint64_t[static_cast<size_t>(capacity == 0ULL ? 1ULL : capacity)]);
+            async_slot_scratch_capacity_[slot_id] = capacity;
+        }
         uint64_t *buffer = async_slot_scratch_[slot_id].get();
         uint32_t hit_count = 0;
         const int status = gpu_filter_multi_collect_(
@@ -592,11 +675,67 @@ public:
             throw std::runtime_error(
                 "GPU filter collect failed with status " + std::to_string(status) + ".");
         }
+        if (static_cast<uint64_t>(hit_count) > capacity) {
+            throw std::runtime_error("GPU filter collect returned more hits than the submitted batch capacity.");
+        }
         out.assign(buffer, buffer + hit_count);
         async_slot_submitted_[slot_id] = 0;
     }
 
 private:
+    void ensure_async_slot_capacity(uint32_t slot_id) const {
+        const size_t need = static_cast<size_t>(slot_id) + 1U;
+        if (async_slot_capacity_.size() < need) {
+            async_slot_capacity_.resize(need, 0ULL);
+            async_slot_submitted_.resize(need, 0ULL);
+            async_slot_scratch_.resize(need);
+            async_slot_scratch_capacity_.resize(need, 0ULL);
+        }
+    }
+
+    bool try_load_backend(const fs::path &repo_root, const std::string &backend) {
+        const char *fname = gpu_filter_library_filename_for(backend);
+        const char *backend_dir = (backend == "opencl") ? "opencl" : "cuda";
+        const char *env_var = (backend == "opencl") ? "GPU_FILTER_OPENCL_DLL" : "GPU_FILTER_DLL";
+
+        std::vector<fs::path> candidates;
+        const char *env = std::getenv(env_var);
+        if (env != nullptr && *env != '\0') {
+            candidates.emplace_back(env);
+        }
+        // Generic env override applies to whichever backend is being loaded.
+        if (backend != "cuda") {
+            const char *generic_env = std::getenv("GPU_FILTER_DLL");
+            if (generic_env != nullptr && *generic_env != '\0') {
+                candidates.emplace_back(generic_env);
+            }
+        }
+        candidates.emplace_back(repo_root / fname);
+#if defined(__APPLE__)
+        if (backend == "cuda") {
+            candidates.emplace_back(repo_root / "macos" / fname);
+        }
+#endif
+        candidates.emplace_back(repo_root / backend_dir / fname);
+        candidates.emplace_back(fs::current_path() / fname);
+#if defined(__APPLE__)
+        if (backend == "cuda") {
+            candidates.emplace_back(fs::current_path() / "macos" / fname);
+        }
+#endif
+        candidates.emplace_back(fs::current_path() / backend_dir / fname);
+
+        for (const fs::path &candidate : candidates) {
+            if (!fs::exists(candidate)) {
+                continue;
+            }
+            if (try_load(candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool try_load(const fs::path &candidate) {
 #if defined(_WIN32)
         ModuleHandle module = LoadLibraryA(candidate.string().c_str());
@@ -607,6 +746,7 @@ private:
             return false;
         }
         module_ = module;
+        loaded_path_ = candidate;
         gpu_is_available_ = reinterpret_cast<FnGpuIsAvailable>(lookup_symbol(module_, "gpu_is_available"));
         gpu_total_mem_ = reinterpret_cast<FnGpuTotalMem>(lookup_symbol(module_, "gpu_total_mem"));
         gpu_filter_multi_ = reinterpret_cast<FnGpuFilterMulti>(lookup_symbol(module_, "gpu_filter_multi"));
@@ -614,26 +754,50 @@ private:
             reinterpret_cast<FnGpuFilterMultiChecked>(lookup_symbol(module_, "gpu_filter_multi_checked"));
         gpu_filter_double_buffer_available_ = reinterpret_cast<FnGpuFilterDoubleBufferAvailable>(
             lookup_symbol(module_, "gpu_filter_double_buffer_available"));
+        gpu_filter_async_max_slots_ = reinterpret_cast<FnGpuFilterAsyncMaxSlots>(
+            lookup_symbol(module_, "gpu_filter_async_max_slots"));
         gpu_filter_multi_submit_ = reinterpret_cast<FnGpuFilterMultiSubmit>(
             lookup_symbol(module_, "gpu_filter_multi_submit"));
         gpu_filter_multi_collect_ = reinterpret_cast<FnGpuFilterMultiCollect>(
             lookup_symbol(module_, "gpu_filter_multi_collect"));
+        const bool required_symbols =
+            gpu_is_available_ != nullptr &&
+            gpu_total_mem_ != nullptr &&
+            (gpu_filter_multi_checked_ != nullptr || gpu_filter_multi_ != nullptr);
+        if (!required_symbols || gpu_is_available_() != 1) {
+            close_module(module_);
+            module_ = nullptr;
+            loaded_path_.clear();
+            gpu_is_available_ = nullptr;
+            gpu_total_mem_ = nullptr;
+            gpu_filter_multi_ = nullptr;
+            gpu_filter_multi_checked_ = nullptr;
+            gpu_filter_double_buffer_available_ = nullptr;
+            gpu_filter_async_max_slots_ = nullptr;
+            gpu_filter_multi_submit_ = nullptr;
+            gpu_filter_multi_collect_ = nullptr;
+            return false;
+        }
         return true;
     }
 
+    std::string active_backend_;
+    fs::path loaded_path_;
     ModuleHandle module_ = nullptr;
     FnGpuIsAvailable gpu_is_available_ = nullptr;
     FnGpuTotalMem gpu_total_mem_ = nullptr;
     FnGpuFilterMulti gpu_filter_multi_ = nullptr;
     FnGpuFilterMultiChecked gpu_filter_multi_checked_ = nullptr;
     FnGpuFilterDoubleBufferAvailable gpu_filter_double_buffer_available_ = nullptr;
+    FnGpuFilterAsyncMaxSlots gpu_filter_async_max_slots_ = nullptr;
     FnGpuFilterMultiSubmit gpu_filter_multi_submit_ = nullptr;
     FnGpuFilterMultiCollect gpu_filter_multi_collect_ = nullptr;
     mutable std::unique_ptr<uint64_t[]> gpu_output_scratch_;
-    mutable uint64_t gpu_output_capacity_ = 0;
-    mutable std::unique_ptr<uint64_t[]> async_slot_scratch_[2];
-    mutable uint64_t async_slot_capacity_[2] = {0, 0};
-    mutable uint64_t async_slot_submitted_[2] = {0, 0};
+    mutable uint64_t gpu_output_capacity_ = 0ULL;
+    mutable std::vector<std::unique_ptr<uint64_t[]>> async_slot_scratch_;
+    mutable std::vector<uint64_t> async_slot_scratch_capacity_;
+    mutable std::vector<uint64_t> async_slot_capacity_;
+    mutable std::vector<uint64_t> async_slot_submitted_;
     bool loaded_ = false;
     bool ready_ = false;
 };
@@ -661,6 +825,9 @@ public:
                 reinterpret_cast<FnScannerCoreFreeQueryPlan>(lookup_symbol(module, "scanner_core_free_query_plan"));
             validate_query_batch_compiled_ = reinterpret_cast<FnScannerCoreValidateQueryBatchCompiled>(
                 lookup_symbol(module, "scanner_core_validate_query_batch_compiled"));
+            validate_query_batch_compiled_post_stage_a_ =
+                reinterpret_cast<FnScannerCoreValidateQueryBatchCompiledPostStageA>(
+                    lookup_symbol(module, "scanner_core_validate_query_batch_compiled_post_stage_a"));
             collect_query_details_compiled_ = reinterpret_cast<FnScannerCoreCollectQueryDetailsCompiled>(
                 lookup_symbol(module, "scanner_core_collect_query_details_compiled"));
             get_compiled_batch_stats_ = reinterpret_cast<FnScannerCoreGetCompiledBatchStats>(
@@ -741,6 +908,46 @@ public:
         );
     }
 
+    int validate_query_batch_compiled_post_stage_a(
+        const ScannerCompiledQueryPlan *plan,
+        const uint64_t *seeds,
+        uint32_t seed_count,
+        int32_t cubi_mc_version,
+        uint32_t worker_count,
+        uint64_t *valid_out,
+        uint32_t *valid_count,
+        uint32_t *mismatch_count,
+        uint32_t *biome_reject_count,
+        uint32_t *cap_pruned_total
+    ) const {
+        if (!ready_ || plan == nullptr || validate_query_batch_compiled_post_stage_a_ == nullptr) {
+            return validate_query_batch_compiled(
+                plan,
+                seeds,
+                seed_count,
+                cubi_mc_version,
+                worker_count,
+                valid_out,
+                valid_count,
+                mismatch_count,
+                biome_reject_count,
+                cap_pruned_total
+            );
+        }
+        return validate_query_batch_compiled_post_stage_a_(
+            plan,
+            seeds,
+            seed_count,
+            cubi_mc_version,
+            worker_count,
+            valid_out,
+            valid_count,
+            mismatch_count,
+            biome_reject_count,
+            cap_pruned_total
+        );
+    }
+
     int collect_query_details_compiled(
         const ScannerCompiledQueryPlan *plan,
         uint64_t seed,
@@ -783,6 +990,7 @@ private:
     FnScannerCoreCompileQueryPlan compile_query_plan_ = nullptr;
     FnScannerCoreFreeQueryPlan free_query_plan_ = nullptr;
     FnScannerCoreValidateQueryBatchCompiled validate_query_batch_compiled_ = nullptr;
+    FnScannerCoreValidateQueryBatchCompiledPostStageA validate_query_batch_compiled_post_stage_a_ = nullptr;
     FnScannerCoreCollectQueryDetailsCompiled collect_query_details_compiled_ = nullptr;
     FnScannerCoreGetCompiledBatchStats get_compiled_batch_stats_ = nullptr;
 };
@@ -917,6 +1125,42 @@ struct CompiledQueryPlanContext {
         );
     }
 
+    int validate_batch_post_stage_a(
+        const uint64_t *seeds,
+        uint32_t seed_count,
+        uint32_t worker_count,
+        uint64_t *valid_out,
+        uint32_t *valid_count,
+        uint32_t *mismatch_count,
+        uint32_t *biome_reject_count,
+        uint32_t *cap_pruned_total
+    ) const {
+        if (compiled_plan != nullptr && scanner_core_query_plan_api().ready()) {
+            return scanner_core_query_plan_api().validate_query_batch_compiled_post_stage_a(
+                compiled_plan,
+                seeds,
+                seed_count,
+                cubi_mc_version,
+                worker_count,
+                valid_out,
+                valid_count,
+                mismatch_count,
+                biome_reject_count,
+                cap_pruned_total
+            );
+        }
+        return validate_batch(
+            seeds,
+            seed_count,
+            worker_count,
+            valid_out,
+            valid_count,
+            mismatch_count,
+            biome_reject_count,
+            cap_pruned_total
+        );
+    }
+
     int validate_batch_legacy(
         const uint64_t *seeds,
         uint32_t seed_count,
@@ -959,7 +1203,7 @@ struct CompiledQueryPlanContext {
         uint32_t *cap_pruned_total,
         bool use_biome_filters
     ) const {
-        if (compiled_plan != nullptr && scanner_core_query_plan_api().ready()) {
+        if (use_biome_filters && compiled_plan != nullptr && scanner_core_query_plan_api().ready()) {
             return scanner_core_query_plan_api().collect_query_details_compiled(
                 compiled_plan,
                 seed,
@@ -1063,12 +1307,121 @@ static std::string normalize_loot_item_id(std::string s) {
 }
 
 static std::string normalize_loot_structure_id(std::string s) {
-    return normalize_key(std::move(s));
+    s = lower_ascii(trim(std::move(s)));
+    if (s.rfind("minecraft:", 0) == 0) {
+        s = s.substr(std::strlen("minecraft:"));
+    }
+    for (char &c : s) {
+        if (c == '\\') {
+            c = '/';
+        }
+    }
+    if (s.rfind("data/minecraft/loot_table/", 0) == 0) {
+        s = s.substr(std::strlen("data/minecraft/loot_table/"));
+    }
+    if (s.rfind("loot_table/", 0) == 0) {
+        s = s.substr(std::strlen("loot_table/"));
+    }
+    if (s.rfind("chests/", 0) == 0) {
+        s = s.substr(std::strlen("chests/"));
+    }
+    if (s.size() > 5U && s.substr(s.size() - 5U) == ".json") {
+        s.resize(s.size() - 5U);
+    }
+    for (char &c : s) {
+        if (c == '/' || c == '-' || c == ' ') {
+            c = '_';
+        }
+    }
+    if (s == "desert_temple") {
+        return "desert_pyramid";
+    }
+    if (s == "jungle_pyramid") {
+        return "jungle_temple";
+    }
+    if (s == "mansion") {
+        return "woodland_mansion";
+    }
+    if (s == "blacksmith" || s == "weaponsmith" || s == "village_blacksmith") {
+        return "village_weaponsmith";
+    }
+    if (s == "nether_bridge" || s == "nether_fortress") {
+        return s == "nether_bridge" ? "nether_bridge" : "fortress";
+    }
+    if (s == "bastion") {
+        return "bastion_remnant";
+    }
+    if (s == "underwater_ruin") {
+        return "ocean_ruin";
+    }
+    return s;
 }
 
 static bool is_shipwreck_loot_structure_id(const std::string &structure_id) {
     const std::string s = normalize_loot_structure_id(structure_id);
     return s == "shipwreck" || s == "shipwreck_supply" || s == "shipwreck_map" || s == "shipwreck_treasure";
+}
+
+static bool is_ruined_portal_loot_structure_id(const std::string &structure_id) {
+    const std::string s = normalize_loot_structure_id(structure_id);
+    return s == "ruined_portal" || s == "ruined_portal_desert" || s == "ruined_portal_jungle" ||
+           s == "ruined_portal_mountain" || s == "ruined_portal_nether" || s == "ruined_portal_ocean" ||
+           s == "ruined_portal_swamp";
+}
+
+static bool is_exact_village_candidate_loot_structure_id(const std::string &structure_id) {
+    const std::string s = normalize_loot_structure_id(structure_id);
+    return s == "village_weaponsmith";
+}
+
+static std::string loot_family_for_structure_id(const std::string &structure_id) {
+    const std::string s = normalize_loot_structure_id(structure_id);
+    if (s == "abandoned_mineshaft") {
+        return "mineshaft";
+    }
+    if (s == "ancient_city" || s == "ancient_city_ice_box") {
+        return "ancient_city";
+    }
+    if (s == "bastion_bridge" || s == "bastion_hoglin_stable" || s == "bastion_other" ||
+        s == "bastion_treasure" || s == "bastion_remnant") {
+        return "bastion_remnant";
+    }
+    if (s == "end_city_treasure" || s == "end_city") {
+        return "end_city";
+    }
+    if (s == "nether_bridge" || s == "fortress") {
+        return "fortress";
+    }
+    if (s == "igloo_chest" || s == "igloo") {
+        return "igloo";
+    }
+    if (s == "jungle_temple" || s == "jungle_temple_dispenser") {
+        return "jungle_temple";
+    }
+    if (is_ruined_portal_loot_structure_id(s)) {
+        return "ruined_portal";
+    }
+    if (s == "underwater_ruin_big" || s == "underwater_ruin_small" || s == "ocean_ruin") {
+        return "ocean_ruin";
+    }
+    if (s == "shipwreck" || s == "shipwreck_supply" || s == "shipwreck_map" || s == "shipwreck_treasure") {
+        return "shipwreck";
+    }
+    if (s == "stronghold" || s == "stronghold_corridor" || s == "stronghold_crossing" ||
+        s == "stronghold_library") {
+        return "stronghold";
+    }
+    if (s.rfind("trial_chambers", 0) == 0) {
+        return "trial_chambers";
+    }
+    if (s.rfind("village_", 0) == 0 || s == "village") {
+        return "village";
+    }
+    return s;
+}
+
+static bool loot_source_matches_constraint(const std::string &source, const std::string &constraint_structure) {
+    return loot_family_for_structure_id(source) == loot_family_for_structure_id(constraint_structure);
 }
 
 static std::string exact_shipwreck_roll_structure_id(const std::string &structure_id, bool is_beached) {
@@ -1091,12 +1444,12 @@ static std::string exact_shipwreck_roll_structure_id(const std::string &structur
 
 static bool is_supported_loot_version_token(const std::string &version_token) {
     const std::string token = trim(version_token);
-    return token == "26.1.2" || token == "1.21.11" || token == "1.17" || token == "1.17.1";
+    return token == "26.1.2" || token == "26.1.1" || token == "1.21.11" || token == "1.17" || token == "1.17.1";
 }
 
 static bool is_exact_loot_version_token(const std::string &version_token) {
     const std::string token = trim(version_token);
-    return token == "26.1.2" || token == "1.21.11";
+    return token == "26.1.2" || token == "26.1.1" || token == "1.21.11";
 }
 
 static bool is_supported_loot_structure_for_version(
@@ -1105,7 +1458,18 @@ static bool is_supported_loot_structure_for_version(
 ) {
     const std::string structure = normalize_loot_structure_id(structure_id);
     if (is_exact_loot_version_token(version_token)) {
-        return structure == "buried_treasure" || structure == "desert_pyramid";
+        static const std::unordered_set<std::string> supported = {
+            "buried_treasure",
+            "ruined_portal",
+            "ruined_portal_desert",
+            "ruined_portal_jungle",
+            "ruined_portal_mountain",
+            "ruined_portal_nether",
+            "ruined_portal_ocean",
+            "ruined_portal_swamp",
+            "village_weaponsmith",
+        };
+        return supported.find(structure) != supported.end();
     }
     return structure == "ruined_portal" || structure == "buried_treasure" || structure == "desert_pyramid" ||
            structure == "shipwreck";
@@ -1139,6 +1503,7 @@ struct PreparedLootFilter {
     std::string query_structure;
     std::string effective_structure;
     std::vector<PreparedLootRequirement> required;
+    std::string encoded_required;
 };
 
 enum class StructureValidationOutcome {
@@ -1167,6 +1532,29 @@ struct LootRollDetail {
     std::vector<LootChestDetail> chests;
 };
 
+struct LootCheckRequest {
+    std::string structure;
+    uint64_t seed = 0ULL;
+    int32_t block_x = 0;
+    int32_t block_z = 0;
+    std::string encoded_requirements;
+};
+
+struct StructureSettingsRequest {
+    std::string structure;
+    uint64_t seed = 0ULL;
+    int32_t block_x = 0;
+    int32_t block_z = 0;
+    std::string encoded_settings;
+};
+
+struct PreparedStructureSettingsFilter {
+    uint32_t constraint_index = 0U;
+    std::string constraint_id;
+    std::string structure;
+    std::string encoded_settings;
+};
+
 static bool loot_counts_satisfy_requirements(
     const std::unordered_map<std::string, int> &counts,
     const std::vector<PreparedLootRequirement> &required
@@ -1178,6 +1566,25 @@ static bool loot_counts_satisfy_requirements(
         }
     }
     return true;
+}
+
+static std::string encode_loot_requirements_for_server(const std::vector<PreparedLootRequirement> &required) {
+    if (required.empty()) {
+        return "_";
+    }
+    std::ostringstream oss;
+    bool first = true;
+    for (const PreparedLootRequirement &req : required) {
+        if (req.item.empty() || req.count <= 0) {
+            continue;
+        }
+        if (!first) {
+            oss << ';';
+        }
+        first = false;
+        oss << req.item << ':' << req.count;
+    }
+    return first ? std::string("_") : oss.str();
 }
 
 static bool detect_exact_shipwreck_beached(
@@ -1516,10 +1923,6 @@ static std::string discover_prism_minecraft_2612_classpath_windows() {
     if (const char *user_profile = std::getenv("USERPROFILE")) {
         prism_roots.emplace_back(fs::path(user_profile) / "AppData" / "Roaming" / "PrismLauncher");
     }
-    prism_roots.emplace_back(
-        fs::path("C:\\Users\\David\\AppData\\Roaming\\PrismLauncher")
-    );
-
     std::vector<fs::path> jars;
     std::unordered_set<std::string> seen;
     auto append_jar = [&](const fs::path &path) {
@@ -1539,10 +1942,15 @@ static std::string discover_prism_minecraft_2612_classpath_windows() {
             continue;
         }
 
-        const fs::path minecraft_client =
+        const fs::path minecraft_client_2612 =
             libraries_root / "com" / "mojang" / "minecraft" / "26.1.2" / "minecraft-26.1.2-client.jar";
-        if (fs::is_regular_file(minecraft_client, ec)) {
-            append_jar(minecraft_client);
+        if (fs::is_regular_file(minecraft_client_2612, ec)) {
+            append_jar(minecraft_client_2612);
+        }
+        const fs::path minecraft_client_2611 =
+            libraries_root / "com" / "mojang" / "minecraft" / "26.1.1" / "minecraft-26.1.1-client.jar";
+        if (fs::is_regular_file(minecraft_client_2611, ec)) {
+            append_jar(minecraft_client_2611);
         }
 
         fs::recursive_directory_iterator it(
@@ -1665,7 +2073,7 @@ public:
             nullptr,
             nullptr,
             TRUE,
-            0,
+            CREATE_NO_WINDOW,
             nullptr,
             project_root.string().c_str(),
             &si,
@@ -1783,6 +2191,199 @@ public:
             return false;
         }
         return parse_loot_roll_detail_response(response, out_detail, error);
+    }
+
+    bool check(
+        const std::string &structure,
+        const std::string &version_token,
+        uint64_t seed,
+        int32_t block_x,
+        int32_t block_z,
+        const std::string &encoded_requirements,
+        bool &out_passed,
+        std::string &error
+    ) {
+        out_passed = false;
+        if (!is_running()) {
+            error = "LootValidationServer is not running.";
+            return false;
+        }
+
+        std::ostringstream cmd;
+        cmd << "CHECK\t" << structure << '\t' << trim(version_token) << '\t' << seed << '\t' << block_x << '\t'
+            << block_z << '\t' << encoded_requirements << '\n';
+        const std::string cmd_text = cmd.str();
+        DWORD written = 0;
+        if (!WriteFile(stdin_write_, cmd_text.data(), static_cast<DWORD>(cmd_text.size()), &written, nullptr) ||
+            written != cmd_text.size()) {
+            error = "Failed to send CHECK command to LootValidationServer.";
+            return false;
+        }
+
+        std::string response;
+        if (!read_protocol_response(response, error)) {
+            error = "LootValidationServer closed unexpectedly while waiting for CHECK response.";
+            return false;
+        }
+        if (response.rfind("ERR\t", 0) == 0) {
+            error = response.substr(4);
+            return false;
+        }
+        std::vector<std::string> parts;
+        std::stringstream ss(response);
+        std::string part;
+        while (std::getline(ss, part, '\t')) {
+            parts.push_back(part);
+        }
+        if (parts.size() != 3U || parts[0] != "OK" || parts[1] != "CHECK") {
+            error = "Unexpected LootValidationServer response: " + response;
+            return false;
+        }
+        const std::string token = lower_ascii(trim(parts[2]));
+        if (token == "1" || token == "true" || token == "yes" || token == "pass") {
+            out_passed = true;
+            return true;
+        }
+        if (token == "0" || token == "false" || token == "no" || token == "reject") {
+            out_passed = false;
+            return true;
+        }
+        error = "Unexpected LootValidationServer CHECK token: " + parts[2];
+        return false;
+    }
+
+    bool check_many(
+        const std::string &version_token,
+        const std::vector<LootCheckRequest> &requests,
+        std::vector<bool> &out_passed,
+        std::string &error
+    ) {
+        out_passed.assign(requests.size(), false);
+        if (requests.empty()) {
+            return true;
+        }
+        if (!is_running()) {
+            error = "LootValidationServer is not running.";
+            return false;
+        }
+
+        std::ostringstream cmd;
+        cmd << "CHECK_BATCH\t" << trim(version_token) << '\t' << requests.size();
+        for (const LootCheckRequest &req : requests) {
+            cmd << '\t' << req.structure << '\t' << req.seed << '\t' << req.block_x << '\t' << req.block_z
+                << '\t' << req.encoded_requirements;
+        }
+        cmd << '\n';
+        const std::string cmd_text = cmd.str();
+        DWORD written = 0;
+        if (!WriteFile(stdin_write_, cmd_text.data(), static_cast<DWORD>(cmd_text.size()), &written, nullptr) ||
+            written != cmd_text.size()) {
+            error = "Failed to send CHECK_BATCH command to LootValidationServer.";
+            return false;
+        }
+
+        std::string response;
+        if (!read_protocol_response(response, error)) {
+            error = "LootValidationServer closed unexpectedly while waiting for CHECK_BATCH response.";
+            return false;
+        }
+        if (response.rfind("ERR\t", 0) == 0) {
+            error = response.substr(4);
+            return false;
+        }
+        std::vector<std::string> parts;
+        std::stringstream ss(response);
+        std::string part;
+        while (std::getline(ss, part, '\t')) {
+            parts.push_back(part);
+        }
+        if (parts.size() != 3U || parts[0] != "OK" || parts[1] != "CHECK_BATCH") {
+            error = "Unexpected LootValidationServer response: " + response;
+            return false;
+        }
+        const std::string bits = trim(parts[2]);
+        if (bits.size() != requests.size()) {
+            error = "LootValidationServer CHECK_BATCH response length mismatch.";
+            return false;
+        }
+        for (size_t i = 0; i < bits.size(); ++i) {
+            if (bits[i] == '1') {
+                out_passed[i] = true;
+            } else if (bits[i] == '0') {
+                out_passed[i] = false;
+            } else {
+                error = "Unexpected LootValidationServer CHECK_BATCH token.";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool settings_many(
+        const std::string &version_token,
+        const std::vector<StructureSettingsRequest> &requests,
+        std::vector<bool> &out_passed,
+        std::string &error
+    ) {
+        out_passed.assign(requests.size(), false);
+        if (requests.empty()) {
+            return true;
+        }
+        if (!is_running()) {
+            error = "LootValidationServer is not running.";
+            return false;
+        }
+
+        std::ostringstream cmd;
+        cmd << "SETTINGS_BATCH\t" << trim(version_token) << '\t' << requests.size();
+        for (const StructureSettingsRequest &req : requests) {
+            cmd << '\t' << req.structure << '\t' << req.seed << '\t' << req.block_x << '\t' << req.block_z
+                << '\t' << req.encoded_settings;
+        }
+        cmd << '\n';
+        const std::string cmd_text = cmd.str();
+        DWORD written = 0;
+        if (!WriteFile(stdin_write_, cmd_text.data(), static_cast<DWORD>(cmd_text.size()), &written, nullptr) ||
+            written != cmd_text.size()) {
+            error = "Failed to send SETTINGS_BATCH command to LootValidationServer.";
+            return false;
+        }
+
+        std::string response;
+        if (!read_protocol_response(response, error)) {
+            error = "LootValidationServer closed unexpectedly while waiting for SETTINGS_BATCH response.";
+            return false;
+        }
+        if (response.rfind("ERR\t", 0) == 0) {
+            error = response.substr(4);
+            return false;
+        }
+        std::vector<std::string> parts;
+        std::stringstream ss(response);
+        std::string part;
+        while (std::getline(ss, part, '\t')) {
+            parts.push_back(part);
+        }
+        if (parts.size() != 3U || parts[0] != "OK" || parts[1] != "SETTINGS_BATCH") {
+            error = "Unexpected LootValidationServer response: " + response;
+            return false;
+        }
+        const std::string bits = trim(parts[2]);
+        if (bits.size() != requests.size()) {
+            error = "LootValidationServer SETTINGS_BATCH response length mismatch.";
+            return false;
+        }
+        for (size_t i = 0; i < bits.size(); ++i) {
+            if (bits[i] == '1') {
+                out_passed[i] = true;
+            } else if (bits[i] == '0') {
+                out_passed[i] = false;
+            } else {
+                error = "Unexpected LootValidationServer SETTINGS_BATCH token.";
+                return false;
+            }
+        }
+        return true;
     }
 
     bool structure_valid(
@@ -2205,6 +2806,125 @@ public:
         }
         return parse_loot_roll_detail_response(response, out_detail, error);
     }
+
+    bool check(
+        const std::string &structure,
+        const std::string &version_token,
+        uint64_t seed,
+        int32_t block_x,
+        int32_t block_z,
+        const std::string &encoded_requirements,
+        bool &out_passed,
+        std::string &error
+    ) {
+        out_passed = false;
+        if (!is_running()) {
+            error = "LootValidationServer is not running.";
+            return false;
+        }
+
+        std::ostringstream cmd;
+        cmd << "CHECK\t" << structure << '\t' << trim(version_token) << '\t' << seed << '\t' << block_x << '\t'
+            << block_z << '\t' << encoded_requirements << '\n';
+        if (!write_all(stdin_write_fd_, cmd.str(), error)) {
+            return false;
+        }
+
+        std::string response;
+        if (!read_protocol_response(response, error)) {
+            error = "LootValidationServer closed unexpectedly while waiting for CHECK response.";
+            return false;
+        }
+        if (response.rfind("ERR\t", 0) == 0) {
+            error = response.substr(4);
+            return false;
+        }
+        std::vector<std::string> parts;
+        std::stringstream ss(response);
+        std::string part;
+        while (std::getline(ss, part, '\t')) {
+            parts.push_back(part);
+        }
+        if (parts.size() != 3U || parts[0] != "OK" || parts[1] != "CHECK") {
+            error = "Unexpected LootValidationServer response: " + response;
+            return false;
+        }
+        const std::string token = lower_ascii(trim(parts[2]));
+        if (token == "1" || token == "true" || token == "yes" || token == "pass") {
+            out_passed = true;
+            return true;
+        }
+        if (token == "0" || token == "false" || token == "no" || token == "reject") {
+            out_passed = false;
+            return true;
+        }
+        error = "Unexpected LootValidationServer CHECK token: " + parts[2];
+        return false;
+    }
+
+    bool check_many(
+        const std::string &version_token,
+        const std::vector<LootCheckRequest> &requests,
+        std::vector<bool> &out_passed,
+        std::string &error
+    ) {
+        out_passed.assign(requests.size(), false);
+        if (requests.empty()) {
+            return true;
+        }
+        if (!is_running()) {
+            error = "LootValidationServer is not running.";
+            return false;
+        }
+
+        std::ostringstream cmd;
+        cmd << "CHECK_BATCH\t" << trim(version_token) << '\t' << requests.size();
+        for (const LootCheckRequest &req : requests) {
+            cmd << '\t' << req.structure << '\t' << req.seed << '\t' << req.block_x << '\t' << req.block_z
+                << '\t' << req.encoded_requirements;
+        }
+        cmd << '\n';
+        if (!write_all(stdin_write_fd_, cmd.str(), error)) {
+            return false;
+        }
+
+        std::string response;
+        if (!read_protocol_response(response, error)) {
+            error = "LootValidationServer closed unexpectedly while waiting for CHECK_BATCH response.";
+            return false;
+        }
+        if (response.rfind("ERR\t", 0) == 0) {
+            error = response.substr(4);
+            return false;
+        }
+        std::vector<std::string> parts;
+        std::stringstream ss(response);
+        std::string part;
+        while (std::getline(ss, part, '\t')) {
+            parts.push_back(part);
+        }
+        if (parts.size() != 3U || parts[0] != "OK" || parts[1] != "CHECK_BATCH") {
+            error = "Unexpected LootValidationServer response: " + response;
+            return false;
+        }
+        const std::string bits = trim(parts[2]);
+        if (bits.size() != requests.size()) {
+            error = "LootValidationServer CHECK_BATCH response length mismatch.";
+            return false;
+        }
+        for (size_t i = 0; i < bits.size(); ++i) {
+            if (bits[i] == '1') {
+                out_passed[i] = true;
+            } else if (bits[i] == '0') {
+                out_passed[i] = false;
+            } else {
+                error = "Unexpected LootValidationServer CHECK_BATCH token.";
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool structure_valid(
         const std::string &structure,
         const std::string &version_token,
@@ -2394,7 +3114,7 @@ struct CliArgs {
     int strict_workers = 0;
     bool strict_workers_set = false;
     std::string output_mode = "raw";
-    uint16_t upper16 = 0x1234;
+    uint16_t upper16 = 0;
     bool print_closest = false;
     bool list_structures = false;
     bool dump_query_template = false;
@@ -2404,6 +3124,7 @@ struct CliArgs {
     bool debug_enabled = false;
     bool plan_diagnostics = false;
     bool shadow_compare = false;
+    std::string completeness_policy;
     std::string compiled_stage_a_mode = "auto";
     bool compiled_stage_a_mode_set = false;
     std::string java_cubiomes_validation = "auto";
@@ -2412,6 +3133,8 @@ struct CliArgs {
     std::string query_json;
     std::string query_file;
     std::string gpu_pipeline = "auto";  // auto|async|sync
+    std::string gpu_backend = "auto";   // auto|cuda|opencl
+    std::string gpu_inflight_batches = "auto"; // auto|1..8
     std::string scan_mode = "strict";   // placement|strict|mixed
     uint64_t mixed_queue_capacity = 1'000'000;
     uint32_t mixed_survivor_cap = 0;
@@ -2723,6 +3446,27 @@ static bool compiled_stage_a_mode_uses_gpu(CompiledStageAMode mode) {
            mode == CompiledStageAMode::multi;
 }
 
+static std::string normalize_completeness_policy(std::string policy) {
+    policy = lower_ascii(trim(std::move(policy)));
+    if (policy.empty()) {
+        return "exact";
+    }
+    if (policy == "safe") {
+        return "exact";
+    }
+    if (policy == "fast" || policy == "lossy" || policy == "approx") {
+        return "approximate";
+    }
+    if (policy == "exact" || policy == "approximate") {
+        return policy;
+    }
+    return {};
+}
+
+static bool is_exact_policy(const QuerySpec &spec) {
+    return spec.safety.completeness == "exact";
+}
+
 static std::string json_escape(std::string value) {
     std::string out;
     out.reserve(value.size() + 8U);
@@ -2846,15 +3590,15 @@ static std::unordered_map<std::string, StructurePreset> build_structure_presets(
         {"woodland_mansion", {80, 20, 10387319, SCAN_SPREAD_TRIANGULAR}},
         {"end_city", {20, 11, 10387313, SCAN_SPREAD_TRIANGULAR}},
         {"trial_chambers", {34, 12, 94251327, SCAN_SPREAD_LINEAR}},
-    };
-}
-
-static std::unordered_map<std::string, StructurePreset> build_strict_surrogate_presets() {
-    return {
+        {"buried_treasure", {1, 0, 10387320, SCAN_SPREAD_BURIED_TREASURE}},
         {"pillager_outpost", {32, 8, 165745296, SCAN_SPREAD_LINEAR}},
         {"ancient_city", {24, 8, 20083232, SCAN_SPREAD_LINEAR}},
         {"trail_ruin", {34, 8, 83469867, SCAN_SPREAD_LINEAR}},
     };
+}
+
+static std::unordered_map<std::string, StructurePreset> build_strict_surrogate_presets() {
+    return {};
 }
 
 static std::unordered_map<std::string, int> build_structure_ids() {
@@ -2968,6 +3712,16 @@ static std::unordered_map<std::string, std::string> build_structure_aliases() {
     return {
         {"village", "village"},
         {"villages", "village"},
+        {"village_plains", "village_plains"},
+        {"village_desert", "village_desert"},
+        {"village_savanna", "village_savanna"},
+        {"village_snowy", "village_snowy"},
+        {"village_taiga", "village_taiga"},
+        {"plains_village", "village_plains"},
+        {"desert_village", "village_desert"},
+        {"savanna_village", "village_savanna"},
+        {"snowy_village", "village_snowy"},
+        {"taiga_village", "village_taiga"},
         {"desert_pyramid", "desert_pyramid"},
         {"desert_temple", "desert_pyramid"},
         {"desert", "desert_pyramid"},
@@ -2981,8 +3735,18 @@ static std::unordered_map<std::string, std::string> build_structure_aliases() {
         {"quad_swamp_hut", "quad_swamp_hut"},
         {"quad_witch_hut", "quad_swamp_hut"},
         {"ocean_ruin", "ocean_ruin"},
+        {"ocean_ruin_cold", "ocean_ruin"},
+        {"ocean_ruin_warm", "ocean_ruin"},
+        {"underwater_ruin", "ocean_ruin"},
         {"shipwreck", "shipwreck"},
+        {"shipwreck_beached", "shipwreck"},
+        {"beached_shipwreck", "shipwreck"},
         {"ruined_portal", "ruined_portal"},
+        {"ruined_portal_desert", "ruined_portal_desert"},
+        {"ruined_portal_jungle", "ruined_portal_jungle"},
+        {"ruined_portal_mountain", "ruined_portal_mountain"},
+        {"ruined_portal_ocean", "ruined_portal_ocean"},
+        {"ruined_portal_swamp", "ruined_portal_swamp"},
         {"ruined_portal_nether", "ruined_portal_nether"},
         {"ruined_portal_n", "ruined_portal_nether"},
         {"nether_ruined_portal", "ruined_portal_nether"},
@@ -3013,7 +3777,12 @@ static std::unordered_map<std::string, std::string> build_structure_aliases() {
         {"treasure", "buried_treasure"},
         {"ancient_city", "ancient_city"},
         {"trail_ruin", "trail_ruin"},
+        {"trail_ruins", "trail_ruin"},
         {"mineshaft", "mineshaft"},
+        {"abandoned_mineshaft", "mineshaft"},
+        {"mineshaft_mesa", "mineshaft"},
+        {"mesa_mineshaft", "mineshaft"},
+        {"badlands_mineshaft", "mineshaft"},
         {"desert_well", "desert_well"},
         {"geode", "geode"},
         {"stronghold", "stronghold"},
@@ -3037,11 +3806,11 @@ static bool supports_direct_placement_mode(const std::string &structure) {
 }
 
 static bool supports_exact_attempt_prefilter(const std::string &structure) {
-    // Keep the strict attempt-radius prefilter conservative. Only structures whose
-    // placement attempt is known to come directly from region RNG use it.
-    return structure == "village" || structure == "desert_pyramid" || structure == "jungle_temple" ||
-           structure == "swamp_hut" || structure == "igloo" || structure == "ocean_monument" ||
-           structure == "woodland_mansion" || structure == "pillager_outpost";
+    // Strict and mixed scans may use exact random-spread structure placement
+    // as a lossless Stage A prefilter. Final CPU/Java validation still decides
+    // biome, terrain, loot, and variant-specific correctness.
+    return kStructurePresets.find(structure) != kStructurePresets.end() ||
+           kStrictSurrogatePresets.find(structure) != kStrictSurrogatePresets.end();
 }
 
 static bool supports_placement_mode(const std::string &structure) {
@@ -3535,6 +4304,98 @@ static std::vector<LootRequirementSpec> parse_loot_requirements_json(
     return out;
 }
 
+static std::vector<std::string> parse_structure_setting_values(
+    const JsonValue *raw,
+    const std::string &field_name
+) {
+    std::vector<std::string> values;
+    if (raw == nullptr || raw->type == JsonValue::Type::null_t) {
+        return values;
+    }
+    auto add_value = [&](std::string value) {
+        value = normalize_loot_structure_id(std::move(value));
+        if (!value.empty() && std::find(values.begin(), values.end(), value) == values.end()) {
+            values.push_back(std::move(value));
+        }
+    };
+    if (raw->type == JsonValue::Type::string_t) {
+        add_value(raw->str);
+    } else if (raw->type == JsonValue::Type::array_t) {
+        for (const JsonValue &entry : raw->array) {
+            if (entry.type != JsonValue::Type::string_t) {
+                throw std::runtime_error(field_name + " entries must be strings.");
+            }
+            add_value(entry.str);
+        }
+    } else {
+        throw std::runtime_error(field_name + " must be a string or string array.");
+    }
+    return values;
+}
+
+static std::unordered_map<std::string, std::vector<std::string>> parse_structure_settings_json(
+    const JsonValue *settings,
+    const std::string &field_name
+) {
+    std::unordered_map<std::string, std::vector<std::string>> out;
+    if (settings == nullptr || settings->type == JsonValue::Type::null_t) {
+        return out;
+    }
+    if (!json_is_object(settings)) {
+        throw std::runtime_error(field_name + " must be an object.");
+    }
+    for (const auto &kv : settings->object) {
+        const std::string group = normalize_loot_structure_id(kv.first);
+        if (group.empty()) {
+            continue;
+        }
+        std::vector<std::string> values = parse_structure_setting_values(&kv.second, field_name + "." + group);
+        if (!values.empty()) {
+            out[group] = std::move(values);
+        }
+    }
+    return out;
+}
+
+static std::string encode_structure_settings_for_server(
+    const std::unordered_map<std::string, std::vector<std::string>> &settings
+) {
+    if (settings.empty()) {
+        return "_";
+    }
+    std::vector<std::string> groups;
+    groups.reserve(settings.size());
+    for (const auto &kv : settings) {
+        if (!kv.second.empty()) {
+            groups.push_back(kv.first);
+        }
+    }
+    std::sort(groups.begin(), groups.end());
+    std::ostringstream oss;
+    bool first_group = true;
+    for (const std::string &group : groups) {
+        const auto it = settings.find(group);
+        if (it == settings.end() || it->second.empty()) {
+            continue;
+        }
+        std::vector<std::string> values = it->second;
+        std::sort(values.begin(), values.end());
+        if (!first_group) {
+            oss << ';';
+        }
+        first_group = false;
+        oss << group << '=';
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i != 0U) {
+                oss << ',';
+            }
+            oss << values[i];
+        }
+    }
+    const std::string encoded = oss.str();
+    return encoded.empty() ? std::string("_") : encoded;
+}
+
 static std::pair<int32_t, int32_t> parse_shape_center_xz(const JsonValue *center, const std::string &field_name) {
     if (center == nullptr) {
         throw std::runtime_error(field_name + " is required.");
@@ -3653,24 +4514,70 @@ static std::string normalize_structure_name(const std::string &name) {
     return it->second;
 }
 
-static std::pair<std::string, uint32_t> resolve_structure_variant(const std::string &name) {
+struct StructureVariantResolution {
+    std::string structure;
+    uint32_t min_required = 1U;
+    uint32_t viability_flags = 0U;
+    bool strict_only_variant = false;
+    std::string validation_structure;
+};
+
+static uint32_t biome_flag_or_throw(
+    const std::unordered_map<std::string, int32_t> &biome_map,
+    const std::string &biome_key
+) {
+    const auto it = biome_map.find(biome_key);
+    if (it == biome_map.end() || it->second < 0) {
+        throw std::runtime_error("Biome constant '" + biome_key + "' is unavailable in this cubiomes build.");
+    }
+    return static_cast<uint32_t>(it->second);
+}
+
+static StructureVariantResolution resolve_structure_variant(
+    const std::string &name,
+    const std::unordered_map<std::string, int32_t> &biome_map
+) {
     const std::string normalized = normalize_structure_name(name);
+    if (normalized == "village_plains") {
+        return {"village", 1U, biome_flag_or_throw(biome_map, "plains"), true};
+    }
+    if (normalized == "village_desert") {
+        return {"village", 1U, biome_flag_or_throw(biome_map, "desert"), true};
+    }
+    if (normalized == "village_savanna") {
+        return {"village", 1U, biome_flag_or_throw(biome_map, "savanna"), true};
+    }
+    if (normalized == "village_snowy") {
+        const auto snowy_it = biome_map.find("snowy_tundra");
+        if (snowy_it != biome_map.end() && snowy_it->second >= 0) {
+            return {"village", 1U, static_cast<uint32_t>(snowy_it->second), true};
+        }
+        return {"village", 1U, biome_flag_or_throw(biome_map, "snowy_plains"), true};
+    }
+    if (normalized == "village_taiga") {
+        return {"village", 1U, biome_flag_or_throw(biome_map, "taiga"), true};
+    }
+    if (normalized == "ruined_portal_desert" || normalized == "ruined_portal_jungle" ||
+        normalized == "ruined_portal_mountain" || normalized == "ruined_portal_ocean" ||
+        normalized == "ruined_portal_swamp") {
+        return {"ruined_portal", 1U, 0U, true, normalized};
+    }
     if (normalized == "quad_swamp_hut") {
-        return {"swamp_hut", 4U};
+        return {"swamp_hut", 4U, 0U, true};
     }
     if (normalized == "quad_ocean_monument") {
-        return {"ocean_monument", 4U};
+        return {"ocean_monument", 4U, 0U, true};
     }
     if (normalized == "quad_desert_pyramid") {
-        return {"desert_pyramid", 4U};
+        return {"desert_pyramid", 4U, 0U, true};
     }
     if (normalized == "quad_igloo") {
-        return {"igloo", 4U};
+        return {"igloo", 4U, 0U, true};
     }
     if (normalized == "quad_jungle_temple") {
-        return {"jungle_temple", 4U};
+        return {"jungle_temple", 4U, 0U, true};
     }
-    return {normalized, 1U};
+    return {normalized, 1U, 0U, false};
 }
 
 static std::string default_dimension_for_structure(const std::string &structure) {
@@ -3715,7 +4622,7 @@ static int resolve_mc_version(const std::string &version_text) {
     if (v == "1.21" || v == "1.21 wd" || v == "1.21.4" || v == "1.21.5") {
         return 28;
     }
-    if (v == "26.1.2" || v == "1.21.11" || v == "4790") {
+    if (v == "26.1.2" || v == "26.1.1" || v == "1.21.11" || v == "4790") {
         return 29;
     }
     throw std::runtime_error("Unsupported --mc-version value: " + version_text);
@@ -4102,6 +5009,36 @@ static uint32_t loot_gate_salt(const QuerySpec &spec) {
     return hash;
 }
 
+static uint32_t strict_gate_bit_width(uint32_t gate_div) {
+    uint32_t width = 0U;
+    uint32_t value = std::max<uint32_t>(2U, gate_div) - 1U;
+    while (value > 0U) {
+        ++width;
+        value >>= 1U;
+    }
+    return std::max<uint32_t>(1U, width);
+}
+
+static uint32_t strict_constraint_gate_salt(
+    const QueryConstraintRuntime &constraint,
+    uint32_t gate_div,
+    uint32_t gate_order
+) {
+    uint32_t hash = 2166136261U;
+    static constexpr char kPrefix[] = "strict-constraint-gate";
+    hash = fnv1a32_append_bytes(hash, kPrefix, sizeof(kPrefix) - 1U);
+    hash = fnv1a32_append_string(hash, constraint.spec.cid);
+    hash = fnv1a32_append_string(hash, constraint.spec.structure);
+    hash = fnv1a32_append_i32(hash, static_cast<int32_t>(constraint.dimension));
+    hash = fnv1a32_append_string(hash, constraint.spec.anchor);
+    hash = fnv1a32_append_i32(hash, static_cast<int32_t>(constraint.spec.radius));
+    hash = fnv1a32_append_u32(hash, constraint.min_required);
+    const uint32_t width = strict_gate_bit_width(gate_div);
+    const uint32_t max_shift = width >= 48U ? 0U : 48U - width;
+    const uint32_t shift = max_shift == 0U ? 0U : ((gate_order * width) % (max_shift + 1U));
+    return (hash & 0x00FFFFFFU) | ((shift & 63U) << 24U);
+}
+
 static int estimated_sculpt_sample_count(const SculptSpec &sculpt) {
     if (!sculpt.enabled) {
         return 0;
@@ -4304,6 +5241,7 @@ static GpuPrefilterPlan build_gpu_prefilter_plan(
     std::vector<GpuPlanConstraintEntry> entries;
     entries.reserve(runtime.ordered_constraint_ids.size());
     uint32_t original_order = 0U;
+    uint32_t strict_gate_order = 0U;
 
     for (const std::string &cid : runtime.ordered_constraint_ids) {
         if (selected_constraint_ids != nullptr && selected_constraint_ids->find(cid) == selected_constraint_ids->end()) {
@@ -4350,6 +5288,12 @@ static GpuPrefilterPlan build_gpu_prefilter_plan(
         entry.desc.gate_div = 1U;
         entry.desc.gate_salt = 0U;
         entry.desc.is_gate_only = 0U;
+        if (!is_exact_policy(runtime.spec) && rc.spec.mode == "strict") {
+            entry.desc.gate_div = std::max<uint32_t>(
+                1U,
+                strict_gate_divisor(rc.spec.structure, runtime.spec.perf.strict_surrogate));
+            entry.desc.gate_salt = strict_constraint_gate_salt(rc, entry.desc.gate_div, strict_gate_order++);
+        }
         entry.desc.min_required = std::max<uint32_t>(1U, rc.min_required);
         entry.desc.quad_max_span = rc.quad_max_span;
         if (entry.desc.min_required == 1U) {
@@ -4377,37 +5321,99 @@ static GpuPrefilterPlan build_gpu_prefilter_plan(
     return plan;
 }
 
-static int axis_min_dist_to_zero(int min_v, int max_v) {
-    if (min_v > 0) {
-        return min_v;
+static uint64_t gpu_prefilter_gate_product(const GpuPrefilterPlan &plan) {
+    uint64_t product = 1ULL;
+    for (const GpuConstraintDesc &desc : plan.constraints) {
+        if (desc.gate_div <= 1U) {
+            continue;
+        }
+        const uint64_t div = static_cast<uint64_t>(desc.gate_div);
+        if (product > (std::numeric_limits<uint64_t>::max() / div)) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        product *= div;
     }
-    if (max_v < 0) {
-        return -max_v;
+    return product;
+}
+
+static constexpr uint32_t kGpuMaxConstRegions = 2048U;
+
+static bool gpu_prefilter_plan_fits_const_region_buffer(const GpuPrefilterPlan &plan) {
+    if (plan.regions.empty() || plan.regions.size() > kGpuMaxConstRegions) {
+        return false;
+    }
+    for (const GpuConstraintDesc &desc : plan.constraints) {
+        if (desc.region_start > plan.regions.size() ||
+            desc.region_count > plan.regions.size() - desc.region_start) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int64_t floor_div_i64(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    const int64_t r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) {
+        --q;
+    }
+    return q;
+}
+
+static int axis_min_dist_to_point(int min_v, int max_v, int center_v) {
+    if (min_v > center_v) {
+        return min_v - center_v;
+    }
+    if (max_v < center_v) {
+        return center_v - max_v;
     }
     return 0;
 }
 
-static std::vector<RegionTerm> build_candidate_regions(int radius_blocks, int spacing, int separation, int salt) {
+static std::vector<RegionTerm> build_candidate_regions(
+    int radius_blocks,
+    int spacing,
+    int separation,
+    int salt,
+    int spread_type,
+    int32_t center_x = 0,
+    int32_t center_z = 0
+) {
     const int bound = spacing - separation;
-    const int chunk_radius = static_cast<int>(std::ceil(static_cast<double>(radius_blocks) / static_cast<double>(CHUNK_SIZE)));
-    const int limit = (chunk_radius / spacing) + 2;
     const int64_t radius_sq = static_cast<int64_t>(radius_blocks) * static_cast<int64_t>(radius_blocks);
     const int span_blocks = (bound - 1) * CHUNK_SIZE;
+    const int locate_offset = spread_type == SCAN_SPREAD_BURIED_TREASURE ? 9 : 0;
+    const int64_t min_chunk_x = floor_div_i64(static_cast<int64_t>(center_x) - radius_blocks, CHUNK_SIZE);
+    const int64_t max_chunk_x = floor_div_i64(static_cast<int64_t>(center_x) + radius_blocks, CHUNK_SIZE);
+    const int64_t min_chunk_z = floor_div_i64(static_cast<int64_t>(center_z) - radius_blocks, CHUNK_SIZE);
+    const int64_t max_chunk_z = floor_div_i64(static_cast<int64_t>(center_z) + radius_blocks, CHUNK_SIZE);
+    const int min_rx = static_cast<int>(std::max<int64_t>(
+        std::numeric_limits<int>::min(),
+        floor_div_i64(min_chunk_x - (bound - 1), spacing) - 2));
+    const int max_rx = static_cast<int>(std::min<int64_t>(
+        std::numeric_limits<int>::max(),
+        floor_div_i64(max_chunk_x, spacing) + 2));
+    const int min_rz = static_cast<int>(std::max<int64_t>(
+        std::numeric_limits<int>::min(),
+        floor_div_i64(min_chunk_z - (bound - 1), spacing) - 2));
+    const int max_rz = static_cast<int>(std::min<int64_t>(
+        std::numeric_limits<int>::max(),
+        floor_div_i64(max_chunk_z, spacing) + 2));
 
     std::vector<int> valid_rx;
     std::vector<int> valid_rz;
-    for (int rx = -limit; rx <= limit; ++rx) {
+    for (int rx = min_rx; rx <= max_rx; ++rx) {
         const int min_cx = rx * spacing;
         const int max_cx = min_cx + bound - 1;
-        if (max_cx < -chunk_radius || min_cx > chunk_radius) {
+        if (max_cx < min_chunk_x || min_cx > max_chunk_x) {
             continue;
         }
         valid_rx.push_back(rx);
     }
-    for (int rz = -limit; rz <= limit; ++rz) {
+    for (int rz = min_rz; rz <= max_rz; ++rz) {
         const int min_cz = rz * spacing;
         const int max_cz = min_cz + bound - 1;
-        if (max_cz < -chunk_radius || min_cz > chunk_radius) {
+        if (max_cz < min_chunk_z || min_cz > max_chunk_z) {
             continue;
         }
         valid_rz.push_back(rz);
@@ -4419,8 +5425,10 @@ static std::vector<RegionTerm> build_candidate_regions(int radius_blocks, int sp
         for (int rz : valid_rz) {
             const int base_block_x = rx * spacing * CHUNK_SIZE;
             const int base_block_z = rz * spacing * CHUNK_SIZE;
-            const int dx = axis_min_dist_to_zero(base_block_x, base_block_x + span_blocks);
-            const int dz = axis_min_dist_to_zero(base_block_z, base_block_z + span_blocks);
+            const int located_base_block_x = base_block_x + locate_offset;
+            const int located_base_block_z = base_block_z + locate_offset;
+            const int dx = axis_min_dist_to_point(located_base_block_x, located_base_block_x + span_blocks, center_x);
+            const int dz = axis_min_dist_to_point(located_base_block_z, located_base_block_z + span_blocks, center_z);
             const int64_t d2 = static_cast<int64_t>(dx) * static_cast<int64_t>(dx) +
                                static_cast<int64_t>(dz) * static_cast<int64_t>(dz);
             if (d2 > radius_sq) {
@@ -4433,8 +5441,8 @@ static std::vector<RegionTerm> build_candidate_regions(int radius_blocks, int sp
             regions.push_back(RegionTerm{
                 rx,
                 rz,
-                base_block_x,
-                base_block_z,
+                located_base_block_x,
+                located_base_block_z,
                 static_cast<uint64_t>(add_term),
             });
         }
@@ -4507,11 +5515,7 @@ static std::unordered_map<std::string, int> compute_constraint_prefilter_radii(
             int32_t fixed_x = 0;
             int32_t fixed_z = 0;
             if (parse_fixed_anchor_coords(c.anchor, fixed_x, fixed_z)) {
-                const long double x = static_cast<long double>(fixed_x);
-                const long double z = static_cast<long double>(fixed_z);
-                const int anchor_origin_dist =
-                    static_cast<int>(std::ceil(std::sqrt(x * x + z * z)));
-                out[cid] = anchor_origin_dist + c.radius;
+                out[cid] = c.radius;
                 continue;
             }
             const std::string dep = c.anchor.substr(std::strlen("constraint:"));
@@ -4577,14 +5581,36 @@ static QueryRuntime build_query_runtime(const QuerySpec &spec) {
         if (rc.prefilter_supported && preset_ptr != nullptr) {
             rc.context.name = c.structure;
             rc.context.preset = *preset_ptr;
+            int32_t region_center_x = 0;
+            int32_t region_center_z = 0;
+            (void)parse_fixed_anchor_coords(c.anchor, region_center_x, region_center_z);
             rc.context.regions = build_candidate_regions(
                 rc.prefilter_radius,
                 preset_ptr->spacing,
                 preset_ptr->separation,
-                preset_ptr->salt
+                preset_ptr->salt,
+                preset_ptr->spread_type,
+                region_center_x,
+                region_center_z
             );
         }
         rc.candidate_cap = std::max<int>(static_cast<int>(rc.min_required), compute_candidate_cap(c.radius, preset_ptr, spec.perf));
+        if (spec.perf.candidate_cap_mode == "none") {
+            if (rc.prefilter_supported && !rc.context.regions.empty()) {
+                const uint64_t exact_region_cap = static_cast<uint64_t>(rc.context.regions.size());
+                rc.candidate_cap = static_cast<int>(std::min<uint64_t>(
+                    static_cast<uint64_t>(std::numeric_limits<int>::max()),
+                    std::max<uint64_t>(static_cast<uint64_t>(rc.min_required), exact_region_cap)
+                ));
+            } else if (c.structure == "stronghold") {
+                rc.candidate_cap = std::max<int>(static_cast<int>(rc.min_required), 128);
+            } else if (is_exact_policy(spec)) {
+                throw std::runtime_error(
+                    "Exact candidate_cap_mode=none requires an exact bounded placement preset for structure '" +
+                    c.structure + "'. Set safety.completeness=approximate for capped direct scans."
+                );
+            }
+        }
 
         if (c.mode == "strict" && c.structure != "stronghold" && rc.struct_id < 0) {
             throw std::runtime_error("Strict mode unsupported for structure '" + c.structure + "'.");
@@ -4879,7 +5905,7 @@ static std::unordered_map<std::string, int32_t> build_biome_map(const fs::path &
     const fs::path py_path = repo_root / "venv" / "Lib" / "site-packages" / "cubiomespi" / "cubiomes.py";
     out = parse_python_constant_class(py_path, "BiomeID");
     if (out.empty()) {
-        const fs::path header_path = repo_root / "cubiomes_12111_fork" / "src" / "biomes.h";
+        const fs::path header_path = repo_root / "cubiomes_26.1.2_fork" / "src" / "biomes.h";
         out = parse_c_enum_named(header_path, "BiomeID");
     }
     if (out.empty()) {
@@ -4986,6 +6012,35 @@ static QuerySpec parse_query_spec(
         json_to_string(json_get(raw, "dimension"), json_to_string(json_get(raw, "default_dimension"), "overworld"))
     );
 
+    const JsonValue *safety_raw = json_get(raw, "safety");
+    if (safety_raw != nullptr && safety_raw->type != JsonValue::Type::null_t) {
+        if (!json_is_object(safety_raw)) {
+            throw std::runtime_error("safety must be an object.");
+        }
+        spec.safety.completeness = normalize_completeness_policy(
+            json_to_string(json_get(*safety_raw, "completeness"), spec.safety.completeness)
+        );
+        if (spec.safety.completeness.empty()) {
+            throw std::runtime_error("safety.completeness must be exact|approximate.");
+        }
+    }
+    const JsonValue *completeness_raw = json_get(raw, "completeness");
+    if (completeness_raw != nullptr) {
+        spec.safety.completeness = normalize_completeness_policy(
+            json_to_string(completeness_raw, spec.safety.completeness)
+        );
+        if (spec.safety.completeness.empty()) {
+            throw std::runtime_error("completeness must be exact|approximate.");
+        }
+    }
+
+    const JsonValue *control_ops_raw = json_get(raw, "control_ops");
+    if (is_exact_policy(spec) && json_is_array(control_ops_raw) && !control_ops_raw->array.empty()) {
+        throw std::runtime_error(
+            "Exact scans do not support control_ops yet. Set safety.completeness=approximate for scripted skip/stop rules."
+        );
+    }
+
     const JsonValue *constraints_raw = json_get(raw, "constraints");
     if (constraints_raw != nullptr && !json_is_array(constraints_raw)) {
         throw std::runtime_error("constraints must be an array when provided.");
@@ -5005,10 +6060,31 @@ static QuerySpec parse_query_spec(
             if (!ids.insert(c.cid).second) {
                 throw std::runtime_error("Duplicate constraint id: " + c.cid);
             }
-            const auto [resolved_structure, min_required] =
-                resolve_structure_variant(json_to_string(json_get(obj, "structure"), ""));
-            c.structure = resolved_structure;
-            c.min_required = min_required;
+            if (is_exact_policy(spec)) {
+                const JsonValue *required_raw = json_get(obj, "required");
+                if (required_raw != nullptr && !json_to_bool(required_raw, true)) {
+                    throw std::runtime_error(
+                        "Constraint " + c.cid +
+                        ": optional constraints are not part of exact native execution yet. "
+                        "Set safety.completeness=approximate to use optional/script control flow."
+                    );
+                }
+                if (json_to_bool(json_get(obj, "track_found"), false)) {
+                    throw std::runtime_error(
+                        "Constraint " + c.cid +
+                        ": track_found/control-flow semantics are not part of exact native execution yet. "
+                        "Set safety.completeness=approximate to use them."
+                    );
+                }
+            }
+            const std::string raw_structure = json_to_string(json_get(obj, "structure"), "");
+            const StructureVariantResolution resolved = resolve_structure_variant(raw_structure, biome_map);
+            c.structure = resolved.structure;
+            c.validation_structure =
+                resolved.validation_structure.empty() ? resolved.structure : resolved.validation_structure;
+            c.min_required = resolved.min_required;
+            c.viability_flags = resolved.viability_flags;
+            c.strict_only_variant = resolved.strict_only_variant;
             c.dimension = normalize_dimension_name(json_to_string(
                 json_get(obj, "dimension"),
                 spec.default_dimension == "overworld" ? default_dimension_for_structure(c.structure) : spec.default_dimension
@@ -5026,11 +6102,34 @@ static QuerySpec parse_query_spec(
             if (c.mode != "strict" && c.mode != "placement") {
                 throw std::runtime_error("Constraint " + c.cid + ": mode must be strict or placement.");
             }
+            if (c.strict_only_variant && c.mode != "strict") {
+                throw std::runtime_error(
+                    "Constraint " + c.cid + ": structure variant '" + raw_structure + "' requires mode=strict."
+                );
+            }
             if (c.min_required > 1U && c.mode != "strict") {
                 throw std::runtime_error("Constraint " + c.cid + ": quad structures require mode=strict.");
             }
             if (c.mode == "placement" && !supports_placement_mode(c.structure)) {
                 throw std::runtime_error("Constraint " + c.cid + ": structure does not support mode=placement.");
+            }
+            c.structure_settings = parse_structure_settings_json(
+                json_get(obj, "structure_settings"),
+                "constraints[].structure_settings"
+            );
+            if (!c.structure_settings.empty()) {
+                const std::string family = loot_family_for_structure_id(c.structure);
+                if (family != "village") {
+                    throw std::runtime_error(
+                        "Constraint " + c.cid + ": structure_settings currently support village constraints only."
+                    );
+                }
+                if (c.mode == "placement") {
+                    throw std::runtime_error(
+                        "Constraint " + c.cid +
+                        ": structure_settings require strict or mixed validation; placement-only mode cannot enforce them."
+                    );
+                }
             }
             c.quad_accuracy = static_cast<uint32_t>(json_to_int(json_get(obj, "accuracy"), 0));
             if (c.quad_accuracy > 100U) {
@@ -5286,27 +6385,14 @@ static QuerySpec parse_query_spec(
                 throw std::runtime_error("loot_filters references unknown constraint id '" + lf.constraint_id + "'.");
             }
             const ConstraintSpec &constraint = *constraint_it->second;
-            if (constraint.mode != "strict") {
-                throw std::runtime_error(
-                    "loot_filters can only reference strict constraints because loot requires exact viable structures."
-                );
-            }
             lf.structure = normalize_loot_structure_id(json_to_string(json_get(obj, "structure"), "auto"));
             if (lf.structure.empty()) {
                 lf.structure = "auto";
             }
-            if (lf.structure != "auto") {
-                const bool same_structure = lf.structure == constraint.structure;
-                const bool shipwreck_variant =
-                    constraint.structure == "shipwreck" &&
-                    (lf.structure == "shipwreck" || lf.structure == "shipwreck_supply" ||
-                     lf.structure == "shipwreck_map" || lf.structure == "shipwreck_treasure");
-                if (!same_structure && !shipwreck_variant) {
-                    throw std::runtime_error(
-                        "loot_filters[].structure must be auto, match the referenced structure, "
-                        "or use a shipwreck_* variant on a strict shipwreck constraint."
-                    );
-                }
+            if (lf.structure != "auto" && !loot_source_matches_constraint(lf.structure, constraint.structure)) {
+                throw std::runtime_error(
+                    "loot_filters[].structure must be auto or belong to the referenced structure family."
+                );
             }
             const JsonValue *required_raw = json_get(obj, "required");
             if (required_raw == nullptr) {
@@ -5374,7 +6460,10 @@ static QuerySpec parse_query_spec(
         if (!json_is_object(perf)) {
             throw std::runtime_error("performance must be an object.");
         }
-        spec.perf.candidate_cap_mode = lower_ascii(trim(json_to_string(json_get(*perf, "candidate_cap_mode"), "adaptive")));
+        spec.perf.candidate_cap_mode = lower_ascii(trim(json_to_string(
+            json_get(*perf, "candidate_cap_mode"),
+            spec.perf.candidate_cap_mode
+        )));
         if (
             spec.perf.candidate_cap_mode != "adaptive" && spec.perf.candidate_cap_mode != "fixed" &&
             spec.perf.candidate_cap_mode != "none"
@@ -5390,7 +6479,10 @@ static QuerySpec parse_query_spec(
         if (spec.perf.spawn_anchor_slack < 0) {
             throw std::runtime_error("performance.spawn_anchor_slack must be >= 0.");
         }
-        spec.perf.strict_surrogate = lower_ascii(trim(json_to_string(json_get(*perf, "strict_surrogate"), "balanced")));
+        spec.perf.strict_surrogate = lower_ascii(trim(json_to_string(
+            json_get(*perf, "strict_surrogate"),
+            spec.perf.strict_surrogate
+        )));
         if (!is_supported_strict_surrogate_mode(spec.perf.strict_surrogate)) {
             throw std::runtime_error(
                 "performance.strict_surrogate must be off|balanced|aggressive|ultra|turbo|lightspeed|gate:<n>."
@@ -5496,6 +6588,7 @@ build_native_query_arrays(const QueryRuntime &runtime) {
              (rc.spec.mode != "strict" || rc.exact_attempt_prefilter_supported))
                 ? 1U
                 : 0U;
+        desc.viability_flags = rc.spec.viability_flags;
         native_constraints.push_back(desc);
     }
     return {native_regions, native_constraints, constraint_index};
@@ -5594,6 +6687,38 @@ static std::pair<NativeSculptDesc, std::vector<int32_t>> build_native_sculpt_con
     return {out, allowed};
 }
 
+static std::string infer_auto_loot_structure_for_constraint(
+    const std::string &version_token,
+    const QueryConstraintRuntime &constraint
+) {
+    const std::string base = normalize_loot_structure_id(constraint.spec.structure);
+    if (is_supported_loot_structure_for_version(version_token, base)) {
+        return base;
+    }
+
+    if (loot_family_for_structure_id(base) == "village") {
+        const auto buildings_it = constraint.spec.structure_settings.find("buildings");
+        if (buildings_it != constraint.spec.structure_settings.end()) {
+            std::vector<std::string> supported_buildings;
+            for (const std::string &building : buildings_it->second) {
+                const std::string source = normalize_loot_structure_id(building);
+                if (!is_supported_loot_structure_for_version(version_token, source)) {
+                    continue;
+                }
+                if (std::find(supported_buildings.begin(), supported_buildings.end(), source) ==
+                    supported_buildings.end()) {
+                    supported_buildings.push_back(source);
+                }
+            }
+            if (supported_buildings.size() == 1U) {
+                return supported_buildings.front();
+            }
+        }
+    }
+
+    return base;
+}
+
 static std::vector<PreparedLootFilter> prepare_loot_filters(
     const QueryRuntime &runtime,
     const std::unordered_map<std::string, int> &constraint_index,
@@ -5604,7 +6729,7 @@ static std::vector<PreparedLootFilter> prepare_loot_filters(
     }
     if (!is_supported_loot_version_token(version_token)) {
         throw std::runtime_error(
-            "loot_filters currently support mc-version 26.1.2 exactly, or legacy 1.17 / 1.17.1."
+            "loot_filters currently support mc-version 26.1.1 / 26.1.2 exactly, or legacy 1.17 / 1.17.1."
         );
     }
 
@@ -5620,19 +6745,21 @@ static std::vector<PreparedLootFilter> prepare_loot_filters(
             throw std::runtime_error("Missing runtime data for loot filter constraint '" + lf.constraint_id + "'.");
         }
         const QueryConstraintRuntime &constraint = runtime_it->second;
-        if (constraint.spec.mode != "strict") {
+
+        std::string effective_structure = lf.structure.empty() || lf.structure == "auto"
+            ? infer_auto_loot_structure_for_constraint(version_token, constraint)
+            : lf.structure;
+        effective_structure = normalize_loot_structure_id(std::move(effective_structure));
+        if (!loot_source_matches_constraint(effective_structure, constraint.spec.structure)) {
             throw std::runtime_error(
-                "loot_filters require strict constraints because placement mode does not guarantee viable loot."
+                "loot_filters structure '" + effective_structure + "' does not belong to referenced constraint '" +
+                lf.constraint_id + "' (" + constraint.spec.structure + ")."
             );
         }
-
-        std::string effective_structure =
-            lf.structure.empty() || lf.structure == "auto" ? constraint.spec.structure : lf.structure;
-        effective_structure = normalize_loot_structure_id(std::move(effective_structure));
         if (!is_supported_loot_structure_for_version(version_token, effective_structure)) {
             throw std::runtime_error(
                 "Unsupported loot filter structure '" + effective_structure + "' for mc-version " + trim(version_token) +
-                ". Exact 26.1.2 currently supports buried_treasure and desert_pyramid."
+                ". Exact 26.1.1 / 26.1.2 currently supports buried_treasure, ruined_portal, and blacksmith/village_weaponsmith."
             );
         }
 
@@ -5645,14 +6772,69 @@ static std::vector<PreparedLootFilter> prepare_loot_filters(
         for (const LootRequirementSpec &req : lf.required) {
             prepared.required.push_back(PreparedLootRequirement{normalize_loot_item_id(req.item), req.count});
         }
-        out.push_back(std::move(prepared));
+        prepared.encoded_required = encode_loot_requirements_for_server(prepared.required);
+        auto merge_it = std::find_if(out.begin(), out.end(), [&](const PreparedLootFilter &existing) {
+            return existing.constraint_index == prepared.constraint_index &&
+                   existing.constraint_id == prepared.constraint_id &&
+                   existing.query_structure == prepared.query_structure &&
+                   existing.effective_structure == prepared.effective_structure;
+        });
+        if (merge_it == out.end()) {
+            out.push_back(std::move(prepared));
+            continue;
+        }
+        for (const PreparedLootRequirement &req : prepared.required) {
+            auto req_it = std::find_if(
+                merge_it->required.begin(),
+                merge_it->required.end(),
+                [&](const PreparedLootRequirement &existing) { return existing.item == req.item; });
+            if (req_it == merge_it->required.end()) {
+                merge_it->required.push_back(req);
+            } else {
+                req_it->count = std::max(req_it->count, req.count);
+            }
+        }
+        merge_it->encoded_required = encode_loot_requirements_for_server(merge_it->required);
     }
     return out;
 }
 
 static bool is_exact_java_cubiomes_validation_version(const std::string &version_token) {
     const std::string token = lower_ascii(trim(version_token));
-    return token == "26.1.2" || token == "1.21.11" || token == "4790";
+    return token == "26.1.2" || token == "26.1.1" || token == "1.21.11" || token == "4790";
+}
+
+static std::vector<PreparedStructureSettingsFilter> prepare_structure_settings_filters(
+    const QueryRuntime &runtime,
+    const std::unordered_map<std::string, int> &constraint_index
+) {
+    std::vector<PreparedStructureSettingsFilter> out;
+    out.reserve(runtime.ordered_constraint_ids.size());
+    for (const std::string &cid : runtime.ordered_constraint_ids) {
+        const auto runtime_it = runtime.constraints.find(cid);
+        const auto idx_it = constraint_index.find(cid);
+        if (runtime_it == runtime.constraints.end() || idx_it == constraint_index.end()) {
+            continue;
+        }
+        const QueryConstraintRuntime &constraint = runtime_it->second;
+        if (constraint.spec.structure_settings.empty()) {
+            continue;
+        }
+        if (loot_family_for_structure_id(constraint.spec.structure) != "village") {
+            throw std::runtime_error(
+                "structure_settings currently support village constraints only: " + constraint.spec.cid
+            );
+        }
+        PreparedStructureSettingsFilter prepared{};
+        prepared.constraint_index = static_cast<uint32_t>(idx_it->second);
+        prepared.constraint_id = constraint.spec.cid;
+        prepared.structure = normalize_loot_structure_id(constraint.spec.structure);
+        prepared.encoded_settings = encode_structure_settings_for_server(constraint.spec.structure_settings);
+        if (prepared.encoded_settings != "_") {
+            out.push_back(std::move(prepared));
+        }
+    }
+    return out;
 }
 
 static std::vector<PreparedJavaStructureValidationConstraint> prepare_java_structure_validation_constraints(
@@ -5674,7 +6856,9 @@ static std::vector<PreparedJavaStructureValidationConstraint> prepare_java_struc
         PreparedJavaStructureValidationConstraint prepared{};
         prepared.constraint_index = static_cast<uint32_t>(idx_it->second);
         prepared.constraint_id = cid;
-        prepared.structure = constraint.spec.structure;
+        prepared.structure = constraint.spec.validation_structure.empty()
+                                 ? constraint.spec.structure
+                                 : constraint.spec.validation_structure;
         prepared.min_required = std::max<uint32_t>(1U, constraint.min_required);
         out.push_back(std::move(prepared));
     }
@@ -5695,6 +6879,129 @@ static uint64_t pack_match_position_key(int32_t x, int32_t z) {
            static_cast<uint64_t>(static_cast<uint32_t>(z));
 }
 
+static uint32_t native_java_next_int_exact(uint64_t &state48, uint32_t bound) {
+    bound = std::max<uint32_t>(1U, bound);
+    if ((bound & (bound - 1U)) == 0U) {
+        state48 = (state48 * JAVA_MULT + JAVA_ADD) & JAVA_MASK;
+        const uint32_t bits = static_cast<uint32_t>(state48 >> 17U);
+        return static_cast<uint32_t>((static_cast<uint64_t>(bound) * bits) >> 31U);
+    }
+    while (true) {
+        state48 = (state48 * JAVA_MULT + JAVA_ADD) & JAVA_MASK;
+        const uint32_t bits = static_cast<uint32_t>(state48 >> 17U);
+        const uint32_t val = bits % bound;
+        if ((bits - val + (bound - 1U)) < INT32_SIGN) {
+            return val;
+        }
+    }
+}
+
+static bool native_buried_treasure_frequency_pass(uint64_t seed, const NativeRegionTerm &region) {
+    uint64_t state = ((seed + (region.add_term_mod48 & JAVA_MASK)) ^ JAVA_MULT) & JAVA_MASK;
+    state = (state * JAVA_MULT + JAVA_ADD) & JAVA_MASK;
+    const uint32_t bits24 = static_cast<uint32_t>(state >> 24U);
+    return bits24 < 167773U;
+}
+
+static void native_structure_attempt_block_pos(
+    uint64_t seed,
+    const NativeRegionTerm &region,
+    int32_t &out_x,
+    int32_t &out_z
+) {
+    if (region.spread_type == SCAN_SPREAD_BURIED_TREASURE) {
+        out_x = region.base_block_x;
+        out_z = region.base_block_z;
+        return;
+    }
+
+    const uint32_t bound = std::max<uint32_t>(1U, region.bound);
+    uint64_t state = ((seed + (region.add_term_mod48 & JAVA_MASK)) ^ JAVA_MULT) & JAVA_MASK;
+    uint32_t off_x = 0U;
+    uint32_t off_z = 0U;
+    if (region.spread_type == SCAN_SPREAD_TRIANGULAR) {
+        const uint32_t x1 = native_java_next_int_exact(state, bound);
+        const uint32_t x2 = native_java_next_int_exact(state, bound);
+        const uint32_t z1 = native_java_next_int_exact(state, bound);
+        const uint32_t z2 = native_java_next_int_exact(state, bound);
+        off_x = (x1 + x2) / 2U;
+        off_z = (z1 + z2) / 2U;
+    } else {
+        off_x = native_java_next_int_exact(state, bound);
+        off_z = native_java_next_int_exact(state, bound);
+    }
+
+    out_x = region.base_block_x + static_cast<int32_t>(off_x * static_cast<uint32_t>(CHUNK_SIZE));
+    out_z = region.base_block_z + static_cast<int32_t>(off_z * static_cast<uint32_t>(CHUNK_SIZE));
+}
+
+static uint64_t native_dist2_i64(int32_t x0, int32_t z0, int32_t x1, int32_t z1) {
+    const int64_t dx = static_cast<int64_t>(x0) - static_cast<int64_t>(x1);
+    const int64_t dz = static_cast<int64_t>(z0) - static_cast<int64_t>(z1);
+    return static_cast<uint64_t>(dx * dx + dz * dz);
+}
+
+static bool try_collect_fast_loot_matches_for_filter(
+    uint64_t seed,
+    const PreparedLootFilter &filter,
+    const CompiledQueryPlanContext &query_plan,
+    std::vector<NativeQueryMatchOut> &match_buffer,
+    uint32_t &match_count
+) {
+    match_count = 0U;
+    if (filter.constraint_index >= query_plan.constraints.size()) {
+        return false;
+    }
+    const NativeQueryConstraintDesc &desc = query_plan.constraints[filter.constraint_index];
+    if (desc.prefilter_supported == 0U || desc.region_count == 0U ||
+        (desc.anchor_type != SCAN_ANCHOR_ORIGIN && desc.anchor_type != SCAN_ANCHOR_FIXED)) {
+        return false;
+    }
+
+    const int32_t anchor_x = desc.anchor_type == SCAN_ANCHOR_FIXED ? desc.anchor_x : 0;
+    const int32_t anchor_z = desc.anchor_type == SCAN_ANCHOR_FIXED ? desc.anchor_z : 0;
+    const uint32_t region_end = desc.region_start + desc.region_count;
+    if (region_end > query_plan.regions.size()) {
+        return false;
+    }
+
+    std::unordered_set<uint64_t> seen_positions;
+    seen_positions.reserve(std::min<uint32_t>(desc.region_count, std::max<uint32_t>(1U, desc.candidate_cap)));
+    for (uint32_t i = desc.region_start; i < region_end; ++i) {
+        const NativeRegionTerm &region = query_plan.regions[i];
+        if (region.spread_type == SCAN_SPREAD_BURIED_TREASURE &&
+            !native_buried_treasure_frequency_pass(seed, region)) {
+            continue;
+        }
+        int32_t x = 0;
+        int32_t z = 0;
+        native_structure_attempt_block_pos(seed, region, x, z);
+        const uint64_t dist2 = native_dist2_i64(x, z, anchor_x, anchor_z);
+        if (dist2 > desc.candidate_radius_sq) {
+            continue;
+        }
+        const uint64_t packed = pack_match_position_key(x, z);
+        if (!seen_positions.insert(packed).second) {
+            continue;
+        }
+        if (match_count >= match_buffer.size()) {
+            match_buffer.resize(static_cast<size_t>(match_count) + 16U);
+        }
+        match_buffer[match_count++] = NativeQueryMatchOut{
+            filter.constraint_index,
+            x,
+            z,
+            anchor_x,
+            anchor_z,
+            dist2,
+        };
+        if (match_count >= std::max<uint32_t>(1U, desc.candidate_cap)) {
+            break;
+        }
+    }
+    return true;
+}
+
 static std::string resolve_effective_loot_roll_structure(
     const PreparedLootFilter &filter,
     const std::string &version_token,
@@ -5705,6 +7012,12 @@ static std::string resolve_effective_loot_roll_structure(
     std::unordered_map<uint64_t, bool> &exact_shipwreck_variant_cache
 ) {
     std::string roll_structure = filter.effective_structure;
+    if (is_exact_loot_version_token(version_token) && is_ruined_portal_loot_structure_id(filter.effective_structure)) {
+        const std::string query_structure = normalize_loot_structure_id(filter.query_structure);
+        if (is_ruined_portal_loot_structure_id(query_structure)) {
+            roll_structure = query_structure;
+        }
+    }
     if (is_exact_loot_version_token(version_token) && is_shipwreck_loot_structure_id(filter.effective_structure)) {
         const uint64_t packed = pack_match_position_key(match_x, match_z);
         const auto beached_it = exact_shipwreck_variant_cache.find(packed);
@@ -5766,6 +7079,7 @@ static bool validate_java_structure_matches_for_seed(
     if (constraints.empty()) {
         return true;
     }
+    (void)skip_cache;
 
     uint32_t match_count = 0U;
     uint32_t biome_count = 0U;
@@ -5806,8 +7120,6 @@ static bool validate_java_structure_matches_for_seed(
         uint32_t valid_matches = 0U;
         std::unordered_set<uint64_t> seen_positions;
         seen_positions.reserve(32U);
-        const std::string skip_key = constraint.structure + "|" + trim(version_token);
-        const bool skip_known = skip_cache.find(skip_key) != skip_cache.end();
         for (uint32_t i = 0; i < match_count; ++i) {
             const NativeQueryMatchOut &match = match_buffer[i];
             if (match.constraint_index != constraint.constraint_index) {
@@ -5817,31 +7129,32 @@ static bool validate_java_structure_matches_for_seed(
             if (!seen_positions.insert(packed).second) {
                 continue;
             }
-            if (skip_known) {
+            StructureValidationOutcome outcome = StructureValidationOutcome::skipped;
+            std::string validation_error;
+            if (!loot_client.structure_valid(
+                    constraint.structure,
+                    version_token,
+                    seed,
+                    match.x,
+                    match.z,
+                    outcome,
+                    validation_error)) {
+                throw std::runtime_error(
+                    "LootValidationServer STRUCTURE validation failed for constraint '" +
+                    constraint.constraint_id + "' at (" + std::to_string(match.x) + "," +
+                    std::to_string(match.z) + "): " + validation_error
+                );
+            }
+            if (outcome == StructureValidationOutcome::skipped) {
+                throw std::runtime_error(
+                    "LootValidationServer STRUCTURE validation skipped for exact constraint '" +
+                    constraint.constraint_id + "' at (" + std::to_string(match.x) + "," +
+                    std::to_string(match.z) + "). Exact structure validation requires the Minecraft 26.1.2 "
+                    "runtime/data to be available."
+                );
+            }
+            if (outcome == StructureValidationOutcome::valid) {
                 ++valid_matches;
-            } else {
-                StructureValidationOutcome outcome = StructureValidationOutcome::skipped;
-                std::string validation_error;
-                if (!loot_client.structure_valid(
-                        constraint.structure,
-                        version_token,
-                        seed,
-                        match.x,
-                        match.z,
-                        outcome,
-                        validation_error)) {
-                    throw std::runtime_error(
-                        "LootValidationServer STRUCTURE validation failed for constraint '" +
-                        constraint.constraint_id + "' at (" + std::to_string(match.x) + "," +
-                        std::to_string(match.z) + "): " + validation_error
-                    );
-                }
-                if (outcome == StructureValidationOutcome::skipped) {
-                    skip_cache.insert(skip_key);
-                    ++valid_matches;
-                } else if (outcome == StructureValidationOutcome::valid) {
-                    ++valid_matches;
-                }
             }
             if (valid_matches >= constraint.min_required) {
                 break;
@@ -5852,6 +7165,127 @@ static bool validate_java_structure_matches_for_seed(
         }
     }
     return true;
+}
+
+static uint32_t validate_structure_settings_for_seed_batch(
+    const uint64_t *seeds,
+    uint32_t seed_count,
+    const std::vector<PreparedStructureSettingsFilter> &filters,
+    const std::string &version_token,
+    const CompiledQueryPlanContext &query_plan,
+    LootValidationServerClient &loot_client,
+    std::vector<NativeQueryMatchOut> &match_buffer,
+    std::vector<StructureSettingsRequest> &requests,
+    std::vector<uint32_t> &request_seed_indices,
+    std::vector<bool> &request_results,
+    std::vector<uint64_t> &current,
+    std::vector<uint64_t> &next,
+    uint64_t *out
+) {
+    if (filters.empty() || seed_count == 0U) {
+        if (out != seeds) {
+            std::copy_n(seeds, seed_count, out);
+        }
+        return seed_count;
+    }
+
+    current.assign(seeds, seeds + seed_count);
+    next.clear();
+    for (const PreparedStructureSettingsFilter &filter : filters) {
+        requests.clear();
+        request_seed_indices.clear();
+        std::vector<char> seed_passed(current.size(), 0);
+
+        for (size_t seed_index = 0; seed_index < current.size(); ++seed_index) {
+            const uint64_t seed = current[seed_index];
+            uint32_t match_count = 0U;
+            uint32_t biome_count = 0U;
+            uint32_t cap_pruned = 0U;
+            auto collect_details = [&](uint32_t cap) -> int {
+                return query_plan.collect_details(
+                    seed,
+                    cap == 0U ? nullptr : match_buffer.data(),
+                    cap,
+                    &match_count,
+                    nullptr,
+                    0U,
+                    &biome_count,
+                    &cap_pruned,
+                    false
+                );
+            };
+
+            int detail_rc = collect_details(static_cast<uint32_t>(match_buffer.size()));
+            if (detail_rc < 0) {
+                throw std::runtime_error("scanner_core_collect_query_details failed with code " + fmt_i64(detail_rc));
+            }
+            if (detail_rc != 0) {
+                continue;
+            }
+            if (match_count > match_buffer.size()) {
+                match_buffer.resize(match_count);
+                detail_rc = collect_details(static_cast<uint32_t>(match_buffer.size()));
+                if (detail_rc < 0) {
+                    throw std::runtime_error("scanner_core_collect_query_details failed with code " + fmt_i64(detail_rc));
+                }
+                if (detail_rc != 0) {
+                    continue;
+                }
+            }
+
+            std::unordered_set<uint64_t> seen_positions;
+            seen_positions.reserve(16U);
+            for (uint32_t i = 0; i < match_count; ++i) {
+                const NativeQueryMatchOut &match = match_buffer[i];
+                if (match.constraint_index != filter.constraint_index) {
+                    continue;
+                }
+                const uint64_t packed = pack_match_position_key(match.x, match.z);
+                if (!seen_positions.insert(packed).second) {
+                    continue;
+                }
+                StructureSettingsRequest req{};
+                req.structure = filter.structure;
+                req.seed = seed;
+                req.block_x = match.x;
+                req.block_z = match.z;
+                req.encoded_settings = filter.encoded_settings;
+                requests.push_back(std::move(req));
+                request_seed_indices.push_back(static_cast<uint32_t>(seed_index));
+            }
+        }
+
+        if (!requests.empty()) {
+            std::string error;
+            if (!loot_client.settings_many(version_token, requests, request_results, error)) {
+                throw std::runtime_error(
+                    "LootValidationServer SETTINGS_BATCH failed for constraint '" + filter.constraint_id + "': " + error
+                );
+            }
+            for (size_t i = 0; i < request_results.size(); ++i) {
+                if (request_results[i]) {
+                    seed_passed[request_seed_indices[i]] = 1;
+                }
+            }
+        }
+
+        next.clear();
+        next.reserve(current.size());
+        for (size_t i = 0; i < current.size(); ++i) {
+            if (seed_passed[i]) {
+                next.push_back(current[i]);
+            }
+        }
+        current.swap(next);
+        if (current.empty()) {
+            break;
+        }
+    }
+
+    if (!current.empty()) {
+        std::copy(current.begin(), current.end(), out);
+    }
+    return static_cast<uint32_t>(current.size());
 }
 
 static bool validate_loot_filters_for_seed(
@@ -5866,6 +7300,7 @@ static bool validate_loot_filters_for_seed(
     if (loot_filters.empty()) {
         return true;
     }
+    (void)roll_cache;
 
     uint32_t match_count = 0U;
     uint32_t biome_count = 0U;
@@ -5929,33 +7364,24 @@ static bool validate_loot_filters_for_seed(
                 exact_shipwreck_variant_cache
             );
 
-            std::ostringstream cache_key_builder;
-            cache_key_builder << roll_structure << '|' << match.x << '|' << match.z;
-            const std::string cache_key = cache_key_builder.str();
-
-            std::unordered_map<std::string, int> counts;
-            const auto cache_it = roll_cache.find(cache_key);
-            if (cache_it != roll_cache.end()) {
-                counts = cache_it->second;
-            } else {
-                std::string roll_error;
-                if (!loot_client.roll(
-                        roll_structure,
-                        version_token,
-                        seed,
-                        match.x,
-                        match.z,
-                        counts,
-                        roll_error)) {
-                    throw std::runtime_error(
-                        "LootValidationServer failed for constraint '" + filter.constraint_id + "' at (" +
-                        std::to_string(match.x) + "," + std::to_string(match.z) + "): " + roll_error
-                    );
-                }
-                roll_cache.emplace(cache_key, counts);
+            bool roll_passed = false;
+            std::string roll_error;
+            if (!loot_client.check(
+                    roll_structure,
+                    version_token,
+                    seed,
+                    match.x,
+                    match.z,
+                    filter.encoded_required,
+                    roll_passed,
+                    roll_error)) {
+                throw std::runtime_error(
+                    "LootValidationServer failed for constraint '" + filter.constraint_id + "' at (" +
+                    std::to_string(match.x) + "," + std::to_string(match.z) + "): " + roll_error
+                );
             }
 
-            if (loot_counts_satisfy_requirements(counts, filter.required)) {
+            if (roll_passed) {
                 passed = true;
                 break;
             }
@@ -5965,6 +7391,141 @@ static bool validate_loot_filters_for_seed(
         }
     }
     return true;
+}
+
+static uint32_t validate_loot_filters_for_seed_batch(
+    const uint64_t *seeds,
+    uint32_t seed_count,
+    const std::vector<PreparedLootFilter> &loot_filters,
+    const std::string &version_token,
+    const CompiledQueryPlanContext &query_plan,
+    LootValidationServerClient &loot_client,
+    std::vector<NativeQueryMatchOut> &match_buffer,
+    std::vector<LootCheckRequest> &check_requests,
+    std::vector<uint32_t> &check_seed_indices,
+    std::vector<bool> &check_results,
+    std::vector<uint64_t> &current,
+    std::vector<uint64_t> &next,
+    uint64_t *out_valid
+) {
+    if (seed_count == 0U) {
+        return 0U;
+    }
+    if (loot_filters.empty()) {
+        if (out_valid != seeds) {
+            std::copy_n(seeds, seed_count, out_valid);
+        }
+        return seed_count;
+    }
+
+    current.assign(seeds, seeds + seed_count);
+    next.clear();
+    for (const PreparedLootFilter &filter : loot_filters) {
+        check_requests.clear();
+        check_seed_indices.clear();
+        std::vector<char> seed_passed(current.size(), 0);
+
+        for (size_t seed_index = 0; seed_index < current.size(); ++seed_index) {
+            const uint64_t seed = current[seed_index];
+            uint32_t match_count = 0U;
+            uint32_t biome_count = 0U;
+            uint32_t cap_pruned = 0U;
+            if (!try_collect_fast_loot_matches_for_filter(seed, filter, query_plan, match_buffer, match_count)) {
+                auto collect_details = [&](uint32_t cap) -> int {
+                    return query_plan.collect_details(
+                        seed,
+                        cap == 0U ? nullptr : match_buffer.data(),
+                        cap,
+                        &match_count,
+                        nullptr,
+                        0U,
+                        &biome_count,
+                        &cap_pruned,
+                        false
+                    );
+                };
+
+                int detail_rc = collect_details(static_cast<uint32_t>(match_buffer.size()));
+                if (detail_rc < 0) {
+                    throw std::runtime_error("scanner_core_collect_query_details failed with code " + fmt_i64(detail_rc));
+                }
+                if (detail_rc != 0) {
+                    continue;
+                }
+                if (match_count > match_buffer.size()) {
+                    match_buffer.resize(match_count);
+                    detail_rc = collect_details(static_cast<uint32_t>(match_buffer.size()));
+                    if (detail_rc < 0) {
+                        throw std::runtime_error(
+                            "scanner_core_collect_query_details failed with code " + fmt_i64(detail_rc));
+                    }
+                    if (detail_rc != 0) {
+                        continue;
+                    }
+                }
+            }
+
+            std::unordered_map<uint64_t, bool> exact_shipwreck_variant_cache;
+            exact_shipwreck_variant_cache.reserve(8U);
+            std::unordered_set<uint64_t> seen_positions;
+            seen_positions.reserve(32U);
+            for (uint32_t i = 0; i < match_count; ++i) {
+                const NativeQueryMatchOut &match = match_buffer[i];
+                if (match.constraint_index != filter.constraint_index) {
+                    continue;
+                }
+                const uint64_t packed = pack_match_position_key(match.x, match.z);
+                if (!seen_positions.insert(packed).second) {
+                    continue;
+                }
+                check_requests.push_back(LootCheckRequest{
+                    resolve_effective_loot_roll_structure(
+                        filter,
+                        version_token,
+                        seed,
+                        query_plan.cubi_mc_version,
+                        match.x,
+                        match.z,
+                        exact_shipwreck_variant_cache),
+                    seed,
+                    match.x,
+                    match.z,
+                    filter.encoded_required,
+                });
+                check_seed_indices.push_back(static_cast<uint32_t>(seed_index));
+            }
+        }
+
+        if (!check_requests.empty()) {
+            std::string roll_error;
+            if (!loot_client.check_many(version_token, check_requests, check_results, roll_error)) {
+                throw std::runtime_error(
+                    "LootValidationServer failed during batched loot validation: " + roll_error);
+            }
+            for (size_t i = 0; i < check_results.size(); ++i) {
+                if (check_results[i]) {
+                    seed_passed[check_seed_indices[i]] = 1;
+                }
+            }
+        }
+
+        next.clear();
+        next.reserve(current.size());
+        for (size_t i = 0; i < current.size(); ++i) {
+            if (seed_passed[i] != 0) {
+                next.push_back(current[i]);
+            }
+        }
+        current.swap(next);
+        if (current.empty()) {
+            break;
+        }
+    }
+
+    if (!current.empty()) {
+        std::copy(current.begin(), current.end(), out_valid);
+    }
+    return static_cast<uint32_t>(current.size());
 }
 
 static std::string summarize_loot_requirements(const std::vector<PreparedLootRequirement> &required) {
@@ -6069,6 +7630,34 @@ static void print_seed_detail_report(
                 );
             }
 
+            if (is_exact_loot_version_token(loot_version_token) &&
+                is_exact_village_candidate_loot_structure_id(roll_structure)) {
+                const LootChestDetail *matched_chest = nullptr;
+                for (const LootChestDetail &chest : detail.chests) {
+                    if (loot_counts_satisfy_requirements(chest.counts, filter.required)) {
+                        matched_chest = &chest;
+                        break;
+                    }
+                }
+                if (matched_chest == nullptr) {
+                    continue;
+                }
+
+                std::cout << "LOOT constraint=" << filter.constraint_id << " structure=" << roll_structure
+                          << " requirements=" << summarize_loot_requirements(filter.required)
+                          << " counts=" << format_loot_count_map(matched_chest->counts) << "\n";
+                std::cout << "  CHEST table=" << matched_chest->table_id << " pos=(" << matched_chest->x << ',';
+                if (matched_chest->y < 0) {
+                    std::cout << '?';
+                } else {
+                    std::cout << matched_chest->y;
+                }
+                std::cout << ',' << matched_chest->z << ") counts="
+                          << format_loot_count_map(matched_chest->counts) << "\n";
+                printed = true;
+                break;
+            }
+
             if (!loot_counts_satisfy_requirements(detail.aggregate_counts, filter.required)) {
                 continue;
             }
@@ -6166,12 +7755,15 @@ static void print_usage() {
     std::cout << "  --debug\n";
     std::cout << "  --plan-diagnostics\n";
     std::cout << "  --shadow-compare\n";
+    std::cout << "  --completeness <exact|approximate> (default exact; approximate enables lossy speed shortcuts)\n";
     std::cout << "  --scan-mode <placement|strict|mixed> (default strict)\n";
     std::cout << "  --mixed-queue-capacity <n>          (default 1000000 survivors)\n";
     std::cout << "  --mixed-survivor-cap <n>            (0 disables per-batch survivor cap)\n";
     std::cout << "  --mixed-adaptive-throttling <on|off>\n";
     std::cout << "  --save-txt <path>                   (write verified/output seeds)\n";
     std::cout << "  --gpu-pipeline <auto|async|sync>   (auto: pick async when the loaded gpu_filter supports it)\n";
+    std::cout << "  --gpu-backend <auto|cuda|opencl>   (auto: try CUDA first, fall back to OpenCL)\n";
+    std::cout << "  --gpu-inflight-batches <auto|1..8> (mixed async GPU queue depth; default auto)\n";
     std::cout << "  --compiled-stage-a-mode <auto|single|multi|cpu-a5|gpu-off> (default auto)\n";
     std::cout << "  --java-cubiomes-validation <auto|off|strict> (default auto)\n";
     std::cout << "  --list-structures\n";
@@ -6266,6 +7858,11 @@ static CliArgs parse_cli(int argc, char **argv) {
             args.plan_diagnostics = true;
         } else if (opt == "--shadow-compare") {
             args.shadow_compare = true;
+        } else if (opt == "--completeness" || opt == "--safety-completeness") {
+            args.completeness_policy = normalize_completeness_policy(require_value(opt.c_str()));
+            if (args.completeness_policy.empty()) {
+                throw std::runtime_error("Invalid --completeness. Use exact|approximate.");
+            }
         } else if (opt == "--scan-mode") {
             const std::string val = lower_ascii(trim(require_value("--scan-mode")));
             if (val != "placement" && val != "strict" && val != "mixed") {
@@ -6294,6 +7891,21 @@ static CliArgs parse_cli(int argc, char **argv) {
                 throw std::runtime_error("Invalid --gpu-pipeline. Use auto|async|sync.");
             }
             args.gpu_pipeline = val;
+        } else if (opt == "--gpu-backend") {
+            const std::string val = lower_ascii(trim(require_value("--gpu-backend")));
+            if (val != "auto" && val != "cuda" && val != "opencl") {
+                throw std::runtime_error("Invalid --gpu-backend. Use auto|cuda|opencl.");
+            }
+            args.gpu_backend = val;
+        } else if (opt == "--gpu-inflight-batches") {
+            const std::string val = lower_ascii(trim(require_value("--gpu-inflight-batches")));
+            if (val != "auto") {
+                const uint64_t parsed = parse_u64(val);
+                if (parsed < 1ULL || parsed > 8ULL) {
+                    throw std::runtime_error("Invalid --gpu-inflight-batches. Use auto or 1..8.");
+                }
+            }
+            args.gpu_inflight_batches = val;
         } else if (opt == "--compiled-stage-a-mode") {
             const std::string normalized = normalize_compiled_stage_a_mode(require_value("--compiled-stage-a-mode"));
             if (normalized.empty()) {
@@ -6335,12 +7947,12 @@ static fs::path resolve_cubiomes_lib_path(const fs::path &repo_root) {
         }
     }
     const std::vector<fs::path> candidates = {
-        repo_root / "cubiomes_12111_fork" / "lib" / cubiomes_library_filename(),
+        repo_root / "cubiomes_26.1.2_fork" / "lib" / cubiomes_library_filename(),
 #if !defined(_WIN32)
 #if defined(__APPLE__)
-        repo_root / "cubiomes_12111_fork" / "build_macos" / "libcubiomes.dylib",
+        repo_root / "cubiomes_26.1.2_fork" / "build_macos" / "libcubiomes.dylib",
 #endif
-        repo_root / "cubiomes_12111_fork" / "build" / "libcubiomes.so",
+        repo_root / "cubiomes_26.1.2_fork" / "build" / "libcubiomes.so",
 #endif
         repo_root / "cubiomespi" / "lib" / cubiomes_library_filename(),
         repo_root / cubiomes_library_filename(),
@@ -6434,28 +8046,272 @@ static uint64_t estimate_max_batch_cap(bool strict_or_biome, uint64_t total_mem_
     return std::max<uint64_t>(150'000ULL, cap);
 }
 
-static std::optional<double> benchmark_batch_candidate(
+static uint64_t estimate_max_probe_batch_cap(bool strict_or_biome, uint64_t total_mem_bytes) {
+    double gib = 8.0;
+    if (total_mem_bytes > 0) {
+        gib = static_cast<double>(total_mem_bytes) / static_cast<double>(1024ULL * 1024ULL * 1024ULL);
+    }
+
+    uint64_t cap = 0;
+    if (gib >= 24.0) {
+        cap = 1'000'000'000ULL;
+    } else if (gib >= 16.0) {
+        cap = 768'000'000ULL;
+    } else if (gib >= 12.0) {
+        cap = 512'000'000ULL;
+    } else if (gib >= 8.0) {
+        cap = 384'000'000ULL;
+    } else {
+        cap = 192'000'000ULL;
+    }
+    if (strict_or_biome) {
+        cap = static_cast<uint64_t>(static_cast<double>(cap) * 0.55);
+    }
+    return std::max<uint64_t>(estimate_max_batch_cap(strict_or_biome, total_mem_bytes), cap);
+}
+
+struct NvidiaSmiSample {
+    bool ok = false;
+    double gpu_util_pct = 0.0;
+    double memory_used_pct = 0.0;
+};
+
+static NvidiaSmiSample read_nvidia_smi_sample() {
+    NvidiaSmiSample sample{};
+#if defined(_WIN32)
+    FILE *pipe = _popen(
+        "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>nul",
+        "r"
+    );
+#else
+    FILE *pipe = popen(
+        "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null",
+        "r"
+    );
+#endif
+    if (pipe == nullptr) {
+        return sample;
+    }
+    char buffer[256] = {};
+    std::string line;
+    if (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        line = trim(buffer);
+    }
+#if defined(_WIN32)
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    if (line.empty()) {
+        return sample;
+    }
+    for (char &ch : line) {
+        if (ch == ',') {
+            ch = ' ';
+        }
+    }
+    std::istringstream iss(line);
+    double util = 0.0;
+    double mem_used = 0.0;
+    double mem_total = 0.0;
+    if (!(iss >> util >> mem_used >> mem_total)) {
+        return sample;
+    }
+    sample.ok = true;
+    sample.gpu_util_pct = std::max(0.0, util);
+    sample.memory_used_pct = mem_total > 0.0
+        ? std::max(0.0, std::min(100.0, (mem_used / mem_total) * 100.0))
+        : 0.0;
+    return sample;
+}
+
+class NvidiaSmiSampler {
+public:
+    explicit NvidiaSmiSampler(bool enabled) : enabled_(enabled) {
+        if (!enabled_) {
+            return;
+        }
+        NvidiaSmiSample initial = read_nvidia_smi_sample();
+        if (!initial.ok) {
+            enabled_ = false;
+            return;
+        }
+        record(initial);
+        running_.store(true);
+        worker_ = std::thread([this]() {
+            while (running_.load()) {
+                NvidiaSmiSample sample = read_nvidia_smi_sample();
+                if (sample.ok) {
+                    record(sample);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            }
+        });
+    }
+
+    ~NvidiaSmiSampler() {
+        stop();
+    }
+
+    void stop() {
+        running_.store(false);
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    bool available() const {
+        return enabled_ && sample_count_.load() > 0U;
+    }
+
+    double max_gpu_util_pct() const {
+        return max_gpu_util_pct_.load();
+    }
+
+    double max_memory_used_pct() const {
+        return max_memory_used_pct_.load();
+    }
+
+private:
+    void record(const NvidiaSmiSample &sample) {
+        sample_count_.fetch_add(1U);
+        double old_util = max_gpu_util_pct_.load();
+        while (sample.gpu_util_pct > old_util &&
+               !max_gpu_util_pct_.compare_exchange_weak(old_util, sample.gpu_util_pct)) {
+        }
+        double old_mem = max_memory_used_pct_.load();
+        while (sample.memory_used_pct > old_mem &&
+               !max_memory_used_pct_.compare_exchange_weak(old_mem, sample.memory_used_pct)) {
+        }
+    }
+
+    bool enabled_ = false;
+    std::atomic<bool> running_{false};
+    std::atomic<uint32_t> sample_count_{0U};
+    std::atomic<double> max_gpu_util_pct_{0.0};
+    std::atomic<double> max_memory_used_pct_{0.0};
+    std::thread worker_;
+};
+
+struct BatchProbeResult {
+    double rate_sps = 0.0;
+    bool has_gpu_sample = false;
+    double gpu_util_pct = 0.0;
+    double gpu_memory_used_pct = 0.0;
+};
+
+struct MixedAsyncTuningChoice {
+    bool valid = false;
+    uint64_t batch_size = 0ULL;
+    uint32_t depth = 0U;
+    double rate_sps = 0.0;
+};
+
+struct MixedAsyncProbeRecord {
+    uint64_t batch_size = 0ULL;
+    uint32_t depth = 0U;
+    BatchProbeResult result{};
+};
+
+static bool is_gpu_probe_resource_failure(const std::string &msg) {
+    return msg.find("out of memory") != std::string::npos ||
+           msg.find("cuda out of memory") != std::string::npos ||
+           msg.find("cannot allocate memory") != std::string::npos ||
+           msg.find("bad_alloc") != std::string::npos ||
+           msg.find("failed with status -4") != std::string::npos ||
+           msg.find("failed with status -5") != std::string::npos ||
+           msg.find("failed with status -6") != std::string::npos ||
+           msg.find("failed with status -7") != std::string::npos;
+}
+
+static std::optional<BatchProbeResult> benchmark_batch_candidate(
     const std::function<void(uint64_t)> &run_probe,
-    uint64_t batch_size
+    uint64_t batch_size,
+    bool sample_gpu_utilization
 ) {
     try {
+        NvidiaSmiSampler sampler(sample_gpu_utilization);
         const auto t0 = std::chrono::high_resolution_clock::now();
-        run_probe(batch_size);
-        const double dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+        uint32_t repetitions = 0U;
+        double dt = 0.0;
+        const double min_sample_seconds = sample_gpu_utilization ? 2.25 : 0.0;
+        const uint32_t max_repetitions = sample_gpu_utilization ? 96U : 1U;
+        do {
+            run_probe(batch_size);
+            ++repetitions;
+            dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+        } while (sampler.available() && dt < min_sample_seconds && repetitions < max_repetitions);
+        sampler.stop();
         if (dt <= 0.0) {
             return std::nullopt;
         }
-        return static_cast<double>(batch_size) / dt;
+        BatchProbeResult result{};
+        result.rate_sps = (static_cast<double>(batch_size) * static_cast<double>(repetitions)) / dt;
+        result.has_gpu_sample = sampler.available();
+        result.gpu_util_pct = sampler.max_gpu_util_pct();
+        result.gpu_memory_used_pct = sampler.max_memory_used_pct();
+        return result;
     } catch (const std::bad_alloc &) {
         return std::nullopt;
     } catch (const std::runtime_error &exc) {
         const std::string msg = lower_ascii(exc.what());
-        if (msg.find("out of memory") != std::string::npos || msg.find("cuda out of memory") != std::string::npos ||
-            msg.find("cannot allocate memory") != std::string::npos || msg.find("bad_alloc") != std::string::npos) {
+        if (is_gpu_probe_resource_failure(msg)) {
             return std::nullopt;
         }
         throw;
     }
+}
+
+static std::vector<uint64_t> build_max_batch_candidates(uint64_t base, uint64_t cap, bool include_extended_points) {
+    std::vector<uint64_t> candidates;
+    auto push_candidate = [&](uint64_t value) {
+        if (value == 0ULL || cap == 0ULL) {
+            return;
+        }
+        candidates.push_back(std::max<uint64_t>(1ULL, std::min<uint64_t>(value, cap)));
+    };
+
+    push_candidate(base);
+    const uint64_t core_probe_points[] = {
+        8'000'000ULL,
+        16'000'000ULL,
+        32'000'000ULL,
+        64'000'000ULL,
+        96'000'000ULL,
+        128'000'000ULL,
+        192'000'000ULL,
+        256'000'000ULL,
+    };
+    for (uint64_t point : core_probe_points) {
+        push_candidate(point);
+    }
+    if (include_extended_points) {
+        const uint64_t extended_probe_points[] = {
+            384'000'000ULL,
+            512'000'000ULL,
+            768'000'000ULL,
+            1'000'000'000ULL,
+        };
+        for (uint64_t point : extended_probe_points) {
+            push_candidate(point);
+        }
+    }
+
+    uint64_t walk_bs = std::max<uint64_t>(1ULL, std::min<uint64_t>(base, cap));
+    while (walk_bs < cap) {
+        const uint64_t next_bs =
+            std::min<uint64_t>(cap, static_cast<uint64_t>(static_cast<double>(walk_bs) * 1.5));
+        if (next_bs <= walk_bs) {
+            break;
+        }
+        push_candidate(next_bs);
+        walk_bs = next_bs;
+    }
+    push_candidate(cap);
+
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    return candidates;
 }
 
 static uint64_t auto_find_batch_size(
@@ -6464,13 +8320,23 @@ static uint64_t auto_find_batch_size(
     bool strict_or_biome,
     uint64_t total_mem_bytes,
     const std::function<void(uint64_t)> &run_probe,
-    bool verbose
+    bool verbose,
+    uint32_t min_async_memory_slots = 1U
 ) {
     const uint64_t base = recommended_batch_size(1, total_count, strict_or_biome, total_mem_bytes);
     uint64_t cap = 0;
     if (mode == "max") {
-        const uint64_t soft_cap = estimate_max_batch_cap(strict_or_biome, total_mem_bytes);
-        cap = std::min<uint64_t>(total_count, std::max<uint64_t>(base, soft_cap * 2ULL));
+        const uint64_t probe_cap = estimate_max_probe_batch_cap(strict_or_biome, total_mem_bytes);
+        cap = std::min<uint64_t>(total_count, std::max<uint64_t>(base, probe_cap));
+        if (min_async_memory_slots > 1U && total_mem_bytes > 0ULL) {
+            const long double budget = static_cast<long double>(total_mem_bytes) * 0.72L;
+            const long double bytes_per_seed =
+                static_cast<long double>(min_async_memory_slots) * static_cast<long double>(sizeof(uint64_t));
+            const uint64_t async_slot_cap = static_cast<uint64_t>(budget / bytes_per_seed);
+            if (async_slot_cap > 0ULL) {
+                cap = std::min<uint64_t>(cap, async_slot_cap);
+            }
+        }
     } else {
         cap = std::min<uint64_t>(total_count, estimate_max_batch_cap(strict_or_biome, total_mem_bytes));
     }
@@ -6489,10 +8355,6 @@ static uint64_t auto_find_batch_size(
 
     if (mode == "max") {
         const int fail_limit = 3;
-        if (verbose) {
-            std::cout << "Auto batch finder (max): probing upward with safety guard (cap=" << fmt_u64(cap)
-                      << ", fail_limit=" << fmt_i64(fail_limit) << ")...\n";
-        }
         uint64_t lo = std::max<uint64_t>(1, std::min<uint64_t>(base, cap));
         uint64_t hi_fail = 0;
         bool has_hi_fail = false;
@@ -6501,44 +8363,72 @@ static uint64_t auto_find_batch_size(
         double best_rate = -1.0;
         int tested = 0;
         int fail_count = 0;
+        auto consider_probe = [&](uint64_t probe_bs, const BatchProbeResult &result) {
+            if (result.rate_sps > best_rate) {
+                best_rate = result.rate_sps;
+                best_rate_bs = probe_bs;
+            }
+        };
+        auto print_probe = [&](uint64_t probe_bs, const BatchProbeResult &result) {
+            if (!verbose) {
+                return;
+            }
+            std::cout << "- " << fmt_u64(probe_bs) << ": " << fmt_double(result.rate_sps, 0)
+                      << " seeds/sec";
+            if (result.has_gpu_sample) {
+                std::cout << ", gpu=" << fmt_double(result.gpu_util_pct, 1)
+                          << "%, vram=" << fmt_double(result.gpu_memory_used_pct, 1) << "%";
+            } else {
+                std::cout << ", gpu=nvidia-smi unavailable";
+            }
+            std::cout << "\n";
+        };
 
-        uint64_t bs = lo;
-        while (true) {
-            const std::optional<double> rate = benchmark_batch_candidate(run_probe, bs);
-            if (!rate.has_value()) {
+        std::vector<uint64_t> candidates = build_max_batch_candidates(lo, cap, true);
+
+        if (verbose) {
+            std::cout << "Auto batch finder (max): probing " << fmt_size(candidates.size())
+                      << " candidate(s) with safety guard (cap=" << fmt_u64(cap)
+                      << ", fail_limit=" << fmt_i64(fail_limit);
+            if (min_async_memory_slots > 1U) {
+                std::cout << ", preserving_async_slots=" << fmt_u64(min_async_memory_slots);
+            }
+            std::cout << ")...\n";
+        }
+
+        auto probe_candidate = [&](uint64_t probe_bs) -> bool {
+            const std::optional<BatchProbeResult> result = benchmark_batch_candidate(run_probe, probe_bs, true);
+            if (!result.has_value()) {
                 ++fail_count;
                 if (verbose) {
-                    std::cout << "- " << fmt_u64(bs) << ": OOM/failed (" << fmt_i64(fail_count) << "/"
+                    std::cout << "- " << fmt_u64(probe_bs) << ": OOM/failed (" << fmt_i64(fail_count) << "/"
                               << fmt_i64(fail_limit) << ")\n";
                 }
-                hi_fail = bs;
+                hi_fail = probe_bs;
                 has_hi_fail = true;
                 if (fail_count >= fail_limit) {
                     if (verbose) {
                         std::cout << "Auto batch finder (max): fail limit reached; stopping probes.\n";
                     }
-                    break;
+                    return false;
                 }
-                break;
+                return false;
             }
 
             ++tested;
-            if (verbose) {
-                std::cout << "- " << fmt_u64(bs) << ": " << fmt_double(*rate, 0) << " seeds/sec\n";
-            }
-            largest_stable_bs = bs;
-            if (*rate > best_rate) {
-                best_rate = *rate;
-                best_rate_bs = bs;
-            }
-            if (bs >= cap) {
+            print_probe(probe_bs, *result);
+            largest_stable_bs = probe_bs;
+            consider_probe(probe_bs, *result);
+            return true;
+        };
+
+        for (uint64_t probe_bs : candidates) {
+            if (has_hi_fail && probe_bs >= hi_fail) {
                 break;
             }
-            const uint64_t next_bs = std::min<uint64_t>(cap, static_cast<uint64_t>(static_cast<double>(bs) * 1.5));
-            if (next_bs <= bs) {
+            if (!probe_candidate(probe_bs)) {
                 break;
             }
-            bs = next_bs;
         }
 
         if (has_hi_fail && largest_stable_bs + 1U < hi_fail && fail_count < fail_limit) {
@@ -6546,8 +8436,8 @@ static uint64_t auto_find_batch_size(
             uint64_t right = hi_fail - 1U;
             while (left <= right) {
                 const uint64_t mid = left + ((right - left) / 2U);
-                const std::optional<double> rate = benchmark_batch_candidate(run_probe, mid);
-                if (!rate.has_value()) {
+                const std::optional<BatchProbeResult> result = benchmark_batch_candidate(run_probe, mid, true);
+                if (!result.has_value()) {
                     ++fail_count;
                     if (mid == 0) {
                         break;
@@ -6561,14 +8451,9 @@ static uint64_t auto_find_batch_size(
                     }
                 } else {
                     ++tested;
-                    if (verbose) {
-                        std::cout << "- " << fmt_u64(mid) << ": " << fmt_double(*rate, 0) << " seeds/sec\n";
-                    }
+                    print_probe(mid, *result);
                     largest_stable_bs = mid;
-                    if (*rate > best_rate) {
-                        best_rate = *rate;
-                        best_rate_bs = mid;
-                    }
+                    consider_probe(mid, *result);
                     left = mid + 1U;
                 }
             }
@@ -6581,11 +8466,14 @@ static uint64_t auto_find_batch_size(
             }
             return fallback;
         }
+        uint64_t selected_bs = best_rate_bs;
+        std::string selected_reason = "best throughput";
         if (verbose) {
-            std::cout << "Auto batch finder (max): selected " << fmt_u64(best_rate_bs)
-                      << " (best throughput; largest stable tested " << fmt_u64(largest_stable_bs) << ")\n";
+            std::cout << "Auto batch finder (max): selected " << fmt_u64(selected_bs)
+                      << " (" << selected_reason << "; largest stable tested "
+                      << fmt_u64(largest_stable_bs) << ")\n";
         }
-        return best_rate_bs;
+        return selected_bs;
     }
 
     std::vector<uint64_t> raw_candidates{
@@ -6618,8 +8506,8 @@ static uint64_t auto_find_batch_size(
     double best_rate = -1.0;
     int tested = 0;
     for (uint64_t bs : candidates) {
-        const std::optional<double> rate = benchmark_batch_candidate(run_probe, bs);
-        if (!rate.has_value()) {
+        const std::optional<BatchProbeResult> result = benchmark_batch_candidate(run_probe, bs, false);
+        if (!result.has_value()) {
             if (verbose) {
                 std::cout << "- " << fmt_u64(bs) << ": OOM/failed (skipped)\n";
             }
@@ -6627,10 +8515,10 @@ static uint64_t auto_find_batch_size(
         }
         ++tested;
         if (verbose) {
-            std::cout << "- " << fmt_u64(bs) << ": " << fmt_double(*rate, 0) << " seeds/sec\n";
+            std::cout << "- " << fmt_u64(bs) << ": " << fmt_double(result->rate_sps, 0) << " seeds/sec\n";
         }
-        if (*rate > best_rate) {
-            best_rate = *rate;
+        if (result->rate_sps > best_rate) {
+            best_rate = result->rate_sps;
             best_bs = bs;
         }
     }
@@ -6653,7 +8541,8 @@ static uint64_t choose_batch_size(
     uint64_t total_mem_bytes,
     uint64_t total_count,
     const std::function<void(uint64_t)> &run_probe,
-    bool verbose
+    bool verbose,
+    uint32_t min_async_memory_slots = 1U
 ) {
     if (args.batch_size != "balanced" && args.batch_size != "max") {
         const uint64_t manual = parse_u64(args.batch_size);
@@ -6665,7 +8554,600 @@ static uint64_t choose_batch_size(
         }
         return std::min<uint64_t>(manual, total_count);
     }
-    return auto_find_batch_size(args.batch_size, total_count, strict_or_biome, total_mem_bytes, run_probe, verbose);
+    return auto_find_batch_size(
+        args.batch_size,
+        total_count,
+        strict_or_biome,
+        total_mem_bytes,
+        run_probe,
+        verbose,
+        min_async_memory_slots);
+}
+
+static double benchmark_async_gpu_depth(
+    const GpuFilterApi &gpu_backend,
+    const GpuPrefilterPlan &gpu_prefilter_plan,
+    uint64_t start_seed,
+    uint64_t batch_size,
+    uint32_t depth,
+    uint32_t probe_batch_count = 0U
+) {
+    if (depth == 0U || batch_size == 0ULL) {
+        return 0.0;
+    }
+    struct PendingGpuBatch {
+        uint32_t slot_id = 0U;
+        uint64_t start_seed = 0ULL;
+        uint64_t count = 0ULL;
+    };
+
+    const uint32_t probe_batches = probe_batch_count == 0U
+        ? std::max<uint32_t>(3U, depth + 1U)
+        : std::max<uint32_t>(1U, probe_batch_count);
+    std::deque<PendingGpuBatch> pending;
+    std::vector<uint64_t> scratch;
+    std::vector<uint64_t> cleanup_scratch;
+    uint32_t next_slot = 0U;
+    uint32_t submitted_batches = 0U;
+    uint64_t next_start = start_seed;
+    uint64_t processed = 0ULL;
+
+    auto submit_one = [&]() -> bool {
+        if (submitted_batches >= probe_batches || pending.size() >= depth) {
+            return false;
+        }
+        const uint32_t slot_id = next_slot;
+        gpu_backend.submit_batch(
+            slot_id,
+            next_start,
+            batch_size,
+            gpu_prefilter_plan.regions,
+            gpu_prefilter_plan.constraints
+        );
+        pending.push_back(PendingGpuBatch{slot_id, next_start, batch_size});
+        next_start = (next_start + batch_size) & JAVA_MASK;
+        ++submitted_batches;
+        next_slot = (next_slot + 1U) % depth;
+        return true;
+    };
+
+    auto drain_pending = [&]() {
+        while (!pending.empty()) {
+            PendingGpuBatch pending_batch = pending.front();
+            pending.pop_front();
+            double kernel_seconds = 0.0;
+            double transfer_seconds = 0.0;
+            try {
+                gpu_backend.collect_batch(
+                    pending_batch.slot_id,
+                    cleanup_scratch,
+                    kernel_seconds,
+                    transfer_seconds
+                );
+            } catch (...) {
+            }
+        }
+    };
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    try {
+        while (pending.size() < depth && submit_one()) {
+        }
+        while (!pending.empty()) {
+            PendingGpuBatch pending_batch = pending.front();
+            pending.pop_front();
+            double kernel_seconds = 0.0;
+            double transfer_seconds = 0.0;
+            gpu_backend.collect_batch(pending_batch.slot_id, scratch, kernel_seconds, transfer_seconds);
+            (void)kernel_seconds;
+            (void)transfer_seconds;
+            processed += pending_batch.count;
+            while (pending.size() < depth && submit_one()) {
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        drain_pending();
+        return 0.0;
+    } catch (const std::runtime_error &exc) {
+        const std::string msg = lower_ascii(exc.what());
+        if (is_gpu_probe_resource_failure(msg)) {
+            drain_pending();
+            return 0.0;
+        }
+        drain_pending();
+        throw;
+    }
+    const double dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+    return dt > 0.0 ? static_cast<double>(processed) / dt : 0.0;
+}
+
+static std::optional<BatchProbeResult> benchmark_mixed_async_candidate(
+    const GpuFilterApi &gpu_backend,
+    const GpuPrefilterPlan &gpu_prefilter_plan,
+    uint64_t start_seed,
+    uint64_t batch_size,
+    uint32_t depth,
+    bool sample_gpu_utilization,
+    uint32_t probe_batch_count = 0U,
+    bool run_warmup = true
+) {
+    try {
+        NvidiaSmiSampler sampler(sample_gpu_utilization);
+        if (run_warmup) {
+            const uint32_t warmup_batches = probe_batch_count == 0U
+                ? std::min<uint32_t>(3U, std::max<uint32_t>(1U, depth))
+                : std::min<uint32_t>(probe_batch_count, 2U);
+            const double warmup_rate = benchmark_async_gpu_depth(
+                gpu_backend,
+                gpu_prefilter_plan,
+                start_seed,
+                batch_size,
+                depth,
+                warmup_batches
+            );
+            if (warmup_rate <= 0.0) {
+                sampler.stop();
+                return std::nullopt;
+            }
+        }
+        const double rate = benchmark_async_gpu_depth(
+            gpu_backend,
+            gpu_prefilter_plan,
+            start_seed,
+            batch_size,
+            depth,
+            probe_batch_count
+        );
+        sampler.stop();
+        if (rate <= 0.0) {
+            return std::nullopt;
+        }
+        BatchProbeResult result{};
+        result.rate_sps = rate;
+        result.has_gpu_sample = sampler.available();
+        result.gpu_util_pct = sampler.max_gpu_util_pct();
+        result.gpu_memory_used_pct = sampler.max_memory_used_pct();
+        return result;
+    } catch (const std::bad_alloc &) {
+        return std::nullopt;
+    } catch (const std::runtime_error &exc) {
+        const std::string msg = lower_ascii(exc.what());
+        if (is_gpu_probe_resource_failure(msg)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
+static uint32_t max_async_slots_for_batch_memory(
+    const GpuFilterApi &gpu_backend,
+    uint64_t capped_batch_size,
+    uint32_t available_slots
+) {
+    if (capped_batch_size == 0ULL || available_slots <= 1U) {
+        return std::max<uint32_t>(1U, available_slots);
+    }
+    const uint64_t total_mem = gpu_backend.total_mem_bytes();
+    if (total_mem == 0ULL) {
+        return available_slots;
+    }
+    const long double per_slot_device_bytes =
+        static_cast<long double>(capped_batch_size) * static_cast<long double>(sizeof(uint64_t));
+    if (per_slot_device_bytes <= 0.0L) {
+        return available_slots;
+    }
+    const long double budget = static_cast<long double>(total_mem) * 0.72L;
+    uint64_t slots_by_memory = static_cast<uint64_t>(budget / per_slot_device_bytes);
+    if (slots_by_memory == 0ULL) {
+        slots_by_memory = 1ULL;
+    }
+    return std::max<uint32_t>(
+        1U,
+        std::min<uint32_t>(available_slots, static_cast<uint32_t>(std::min<uint64_t>(slots_by_memory, 8ULL))));
+}
+
+static uint32_t choose_gpu_inflight_batches(
+    const CliArgs &args,
+    const GpuFilterApi &gpu_backend,
+    const GpuPrefilterPlan &gpu_prefilter_plan,
+    uint64_t start_seed,
+    uint64_t total_count,
+    uint64_t capped_batch_size,
+    bool use_async_gpu_pipeline,
+    bool verbose
+) {
+    if (!use_async_gpu_pipeline || gpu_prefilter_plan.constraints.empty()) {
+        return 0U;
+    }
+    const uint32_t max_slots = max_async_slots_for_batch_memory(
+        gpu_backend,
+        capped_batch_size,
+        std::max<uint32_t>(1U, gpu_backend.async_max_slots()));
+    if (args.gpu_inflight_batches != "auto") {
+        const uint32_t requested = static_cast<uint32_t>(parse_u64(args.gpu_inflight_batches));
+        return std::max<uint32_t>(1U, std::min<uint32_t>(requested, max_slots));
+    }
+    const uint32_t target_baseline =
+        (args.scan_mode == "mixed" && max_slots >= 4U) ? 4U : 2U;
+    const uint32_t baseline = std::min<uint32_t>(target_baseline, max_slots);
+    const uint64_t min_probe_count = args.scan_mode == "mixed" ? 8'000'000ULL : 32'000'000ULL;
+    if (max_slots <= baseline || total_count < min_probe_count || capped_batch_size == 0ULL) {
+        return baseline;
+    }
+
+    const uint64_t probe_batch_size = std::min<uint64_t>(
+        capped_batch_size,
+        args.scan_mode == "mixed" ? 16'000'000ULL : 8'000'000ULL);
+    std::vector<uint32_t> candidates{1U, 2U, 3U, 4U, 6U, 8U};
+    uint32_t best_depth = baseline;
+    double baseline_rate = 0.0;
+    double best_rate = 0.0;
+
+    for (uint32_t candidate : candidates) {
+        if (candidate > max_slots) {
+            continue;
+        }
+        double rate = 0.0;
+        try {
+            rate = benchmark_async_gpu_depth(
+                gpu_backend,
+                gpu_prefilter_plan,
+                start_seed,
+                probe_batch_size,
+                candidate
+            );
+        } catch (const std::bad_alloc &) {
+            rate = 0.0;
+        } catch (const std::runtime_error &exc) {
+            const std::string msg = lower_ascii(exc.what());
+            if (!is_gpu_probe_resource_failure(msg)) {
+                throw;
+            }
+            rate = 0.0;
+        }
+        if (verbose) {
+            std::cout << "GPU async depth probe " << fmt_u64(candidate)
+                      << ": " << fmt_double(rate, 0) << " seeds/sec\n";
+        }
+        if (candidate == baseline) {
+            baseline_rate = rate;
+        }
+        if (rate > best_rate) {
+            best_rate = rate;
+            best_depth = candidate;
+        }
+    }
+
+    if (baseline_rate <= 0.0) {
+        return baseline;
+    }
+    if (best_depth != baseline && best_rate >= baseline_rate * 1.03) {
+        return best_depth;
+    }
+    return baseline;
+}
+
+static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
+    const CliArgs &args,
+    const GpuFilterApi &gpu_backend,
+    const GpuPrefilterPlan &gpu_prefilter_plan,
+    uint64_t start_seed,
+    uint64_t total_count,
+    bool verbose
+) {
+    MixedAsyncTuningChoice choice{};
+    if (args.batch_size != "max" || args.scan_mode != "mixed" || gpu_prefilter_plan.constraints.empty()) {
+        return choice;
+    }
+
+    const uint64_t total_mem_bytes = gpu_backend.total_mem_bytes();
+    const uint64_t base = recommended_batch_size(1, total_count, false, total_mem_bytes);
+    const uint64_t cap = std::min<uint64_t>(
+        total_count,
+        std::max<uint64_t>(base, estimate_max_probe_batch_cap(false, total_mem_bytes)));
+    if (cap == 0ULL) {
+        return choice;
+    }
+
+    const uint32_t available_slots = std::max<uint32_t>(1U, gpu_backend.async_max_slots());
+    const uint64_t gate_product = gpu_prefilter_gate_product(gpu_prefilter_plan);
+    const bool has_surrogate_gate = gate_product > 1ULL;
+    if (has_surrogate_gate && args.gpu_inflight_batches != "auto") {
+        const uint64_t target_gated_batch =
+            gate_product >= 4096ULL ? 8'000'000ULL : 32'000'000ULL;
+        const uint64_t gated_batch_size = std::max<uint64_t>(
+            1ULL,
+            std::min<uint64_t>(cap, target_gated_batch));
+        const uint32_t requested_depth =
+            static_cast<uint32_t>(std::max<uint64_t>(1ULL, parse_u64(args.gpu_inflight_batches)));
+        const uint32_t gated_depth = std::max<uint32_t>(
+            1U,
+            std::min<uint32_t>(
+                requested_depth,
+                max_async_slots_for_batch_memory(gpu_backend, gated_batch_size, available_slots)));
+        choice.valid = true;
+        choice.batch_size = gated_batch_size;
+        choice.depth = gated_depth;
+        choice.rate_sps = 0.0;
+        if (verbose) {
+            std::cout << "Mixed async max tuner: strict surrogate gate active; selected batch="
+                      << fmt_u64(choice.batch_size)
+                      << ", depth=" << fmt_u64(choice.depth)
+                      << " without extended probes.\n";
+        }
+        return choice;
+    }
+    std::vector<uint64_t> candidates;
+    auto push_mixed_candidate = [&](uint64_t value) {
+        if (value == 0ULL || cap == 0ULL) {
+            return;
+        }
+        candidates.push_back(std::max<uint64_t>(1ULL, std::min<uint64_t>(value, cap)));
+    };
+    push_mixed_candidate(base);
+    const uint64_t mixed_probe_points[] = {
+        8'000'000ULL,
+        16'000'000ULL,
+        32'000'000ULL,
+        64'000'000ULL,
+        96'000'000ULL,
+        128'000'000ULL,
+        192'000'000ULL,
+        256'000'000ULL,
+        384'000'000ULL,
+        512'000'000ULL,
+        768'000'000ULL,
+        1'000'000'000ULL,
+    };
+    for (uint64_t point : mixed_probe_points) {
+        push_mixed_candidate(point);
+    }
+    push_mixed_candidate(cap);
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    if (cap >= 8'000'000ULL) {
+        candidates.erase(
+            std::remove_if(
+                candidates.begin(),
+                candidates.end(),
+                [](uint64_t candidate) { return candidate < 8'000'000ULL; }),
+            candidates.end());
+    }
+    std::vector<MixedAsyncProbeRecord> records;
+    records.reserve(candidates.size() * 2U);
+
+    auto push_unique_depth = [](std::vector<uint32_t> &depths, uint32_t depth) {
+        if (depth == 0U) {
+            return;
+        }
+        if (std::find(depths.begin(), depths.end(), depth) == depths.end()) {
+            depths.push_back(depth);
+        }
+    };
+
+    auto all_depth_candidates = [&](uint64_t batch_size) {
+        std::vector<uint32_t> depths;
+        const uint32_t max_slots = max_async_slots_for_batch_memory(gpu_backend, batch_size, available_slots);
+        if (args.gpu_inflight_batches != "auto") {
+            const uint32_t requested = static_cast<uint32_t>(parse_u64(args.gpu_inflight_batches));
+            push_unique_depth(depths, std::max<uint32_t>(1U, std::min<uint32_t>(requested, max_slots)));
+            return depths;
+        }
+        const uint32_t raw_depths[] = {1U, 2U, 3U, 4U, 6U, 8U};
+        for (uint32_t depth : raw_depths) {
+            if (depth <= max_slots) {
+                push_unique_depth(depths, depth);
+            }
+        }
+        return depths;
+    };
+
+    auto has_record = [&](uint64_t batch_size, uint32_t depth) {
+        return std::any_of(records.begin(), records.end(), [&](const MixedAsyncProbeRecord &record) {
+            return record.batch_size == batch_size && record.depth == depth;
+        });
+    };
+
+    auto print_probe = [&](uint64_t batch_size, uint32_t depth, const BatchProbeResult *result, bool failed) {
+        if (!verbose) {
+            return;
+        }
+        std::cout << "- batch=" << fmt_u64(batch_size)
+                  << ", depth=" << fmt_u64(depth)
+                  << ": ";
+        if (failed || result == nullptr) {
+            std::cout << "OOM/failed\n";
+            return;
+        }
+        std::cout << fmt_double(result->rate_sps, 0) << " seeds/sec";
+        if (result->has_gpu_sample) {
+            std::cout << ", gpu=" << fmt_double(result->gpu_util_pct, 1)
+                      << "%, vram=" << fmt_double(result->gpu_memory_used_pct, 1) << "%";
+        } else {
+            std::cout << ", gpu=nvidia-smi unavailable";
+        }
+        std::cout << "\n";
+    };
+
+    auto measure = [&](uint64_t batch_size, uint32_t depth) -> bool {
+        if (depth == 0U || has_record(batch_size, depth)) {
+            return false;
+        }
+        const uint32_t quick_probe_batches = args.gpu_inflight_batches == "auto"
+            ? std::min<uint32_t>(5U, std::max<uint32_t>(3U, depth + 1U))
+            : 1U;
+        const std::optional<BatchProbeResult> result = benchmark_mixed_async_candidate(
+            gpu_backend,
+            gpu_prefilter_plan,
+            start_seed,
+            batch_size,
+            depth,
+            false,
+            quick_probe_batches,
+            false
+        );
+        if (!result.has_value()) {
+            print_probe(batch_size, depth, nullptr, true);
+            return false;
+        }
+        MixedAsyncProbeRecord record{};
+        record.batch_size = batch_size;
+        record.depth = depth;
+        record.result = *result;
+        records.push_back(record);
+        print_probe(batch_size, depth, &record.result, false);
+        return true;
+    };
+
+    if (verbose) {
+        std::cout << "Mixed async max tuner: probing " << fmt_size(candidates.size())
+                  << " batch candidate(s) up to " << fmt_u64(cap)
+                  << " with up to " << fmt_u64(available_slots)
+                  << " async slot(s); selecting by measured throughput...\n";
+    }
+
+    int fail_count = 0;
+    const int fail_limit = 3;
+    uint64_t largest_stable_batch = 0ULL;
+    const uint32_t min_mixed_probe_depth = std::min<uint32_t>(4U, available_slots);
+    for (uint64_t batch_size : candidates) {
+        const std::vector<uint32_t> depths = all_depth_candidates(batch_size);
+        if (depths.empty()) {
+            continue;
+        }
+        if (args.gpu_inflight_batches != "auto" && min_mixed_probe_depth > 1U &&
+            *std::max_element(depths.begin(), depths.end()) < min_mixed_probe_depth) {
+            continue;
+        }
+        std::vector<uint32_t> initial_depths;
+        push_unique_depth(initial_depths, depths.front());
+
+        bool any_ok = false;
+        for (uint32_t depth : initial_depths) {
+            any_ok = measure(batch_size, depth) || any_ok;
+        }
+        if (any_ok) {
+            largest_stable_batch = batch_size;
+            fail_count = 0;
+        } else {
+            ++fail_count;
+            if (fail_count >= fail_limit) {
+                if (verbose) {
+                    std::cout << "Mixed async max tuner: fail limit reached; stopping batch probes.\n";
+                }
+                break;
+            }
+        }
+    }
+
+    if (records.empty()) {
+        return choice;
+    }
+
+    std::vector<uint64_t> depth_tune_batches;
+    auto push_unique_batch = [&](uint64_t batch_size) {
+        if (batch_size == 0ULL) {
+            return;
+        }
+        if (std::find(depth_tune_batches.begin(), depth_tune_batches.end(), batch_size) == depth_tune_batches.end()) {
+            depth_tune_batches.push_back(batch_size);
+        }
+    };
+
+    std::vector<MixedAsyncProbeRecord> sorted_records = records;
+    std::sort(sorted_records.begin(), sorted_records.end(), [](const auto &a, const auto &b) {
+        return a.result.rate_sps > b.result.rate_sps;
+    });
+    for (const MixedAsyncProbeRecord &record : sorted_records) {
+        push_unique_batch(record.batch_size);
+        if (depth_tune_batches.size() >= 3U) {
+            break;
+        }
+    }
+    push_unique_batch(largest_stable_batch);
+
+    if (args.gpu_inflight_batches == "auto") {
+        for (uint64_t batch_size : depth_tune_batches) {
+            const std::vector<uint32_t> depths = all_depth_candidates(batch_size);
+            for (uint32_t depth : depths) {
+                if (!measure(batch_size, depth) && depth > 1U) {
+                    break;
+                }
+            }
+        }
+    }
+
+    std::sort(records.begin(), records.end(), [](const auto &a, const auto &b) {
+        return a.result.rate_sps > b.result.rate_sps;
+    });
+    double best_verified_rate = -1.0;
+    uint32_t verified_count = 0U;
+    uint32_t verified_attempts = 0U;
+    const uint32_t max_verified_records = args.gpu_inflight_batches == "auto" ? 6U : 1U;
+    const uint32_t max_verified_attempts = args.gpu_inflight_batches == "auto" ? 12U : 4U;
+    uint64_t mixed_validation_select_cap = 96'000'000ULL;
+    if (args.mixed_queue_capacity >= 8'000'000ULL) {
+        mixed_validation_select_cap = 384'000'000ULL;
+    } else if (args.mixed_queue_capacity >= 4'000'000ULL) {
+        mixed_validation_select_cap = 192'000'000ULL;
+    }
+    for (const MixedAsyncProbeRecord &record : records) {
+        if (verified_count >= max_verified_records || verified_attempts >= max_verified_attempts) {
+            break;
+        }
+        if (record.batch_size > mixed_validation_select_cap) {
+            continue;
+        }
+        ++verified_attempts;
+        const uint32_t verify_probe_batches = args.gpu_inflight_batches == "auto"
+            ? std::min<uint32_t>(7U, std::max<uint32_t>(3U, record.depth + 1U))
+            : 3U;
+        const std::optional<BatchProbeResult> verified = benchmark_mixed_async_candidate(
+            gpu_backend,
+            gpu_prefilter_plan,
+            start_seed,
+            record.batch_size,
+            record.depth,
+            false,
+            verify_probe_batches,
+            true
+        );
+        if (!verified.has_value()) {
+            if (verbose) {
+                std::cout << "Mixed async max tuner: verification failed for batch="
+                          << fmt_u64(record.batch_size)
+                          << ", depth=" << fmt_u64(record.depth) << "\n";
+            }
+            continue;
+        }
+        ++verified_count;
+        if (verified->rate_sps > best_verified_rate) {
+            best_verified_rate = verified->rate_sps;
+            choice.valid = true;
+            choice.batch_size = record.batch_size;
+            choice.depth = record.depth;
+            choice.rate_sps = verified->rate_sps;
+        }
+    }
+    if (!choice.valid) {
+        const auto best_it = std::max_element(records.begin(), records.end(), [](const auto &a, const auto &b) {
+            return a.result.rate_sps < b.result.rate_sps;
+        });
+        if (best_it == records.end()) {
+            return choice;
+        }
+        choice.valid = true;
+        choice.batch_size = best_it->batch_size;
+        choice.depth = best_it->depth;
+        choice.rate_sps = best_it->result.rate_sps;
+    }
+    if (verbose) {
+        std::cout << "Mixed async max tuner: selected batch=" << fmt_u64(choice.batch_size)
+                  << ", depth=" << fmt_u64(choice.depth)
+                  << " (" << fmt_double(choice.rate_sps, 0)
+                  << " seeds/sec; largest stable tested " << fmt_u64(largest_stable_batch) << ")\n";
+    }
+    return choice;
 }
 
 static uint32_t choose_effective_validation_workers(uint32_t max_workers, uint64_t hit_count) {
@@ -6681,35 +9163,62 @@ static uint32_t choose_effective_validation_workers(uint32_t max_workers, uint64
     return std::max<uint32_t>(1U, eff);
 }
 
-struct SurvivorCandidate {
-    uint64_t seed = 0ULL;
-    uint32_t placement_flags = 0U;
-    uint32_t metadata_offset = 0U;
-};
-
 class BoundedSurvivorBatchQueue {
 public:
-    explicit BoundedSurvivorBatchQueue(uint64_t capacity)
-        : capacity_(std::max<uint64_t>(1ULL, capacity)) {}
+    explicit BoundedSurvivorBatchQueue(uint64_t capacity, size_t max_batch_size)
+        : capacity_(std::max<uint64_t>(1ULL, capacity)),
+          max_batch_size_(std::max<size_t>(1U, max_batch_size)) {}
 
     bool try_push_batch(
-        std::vector<SurvivorCandidate> &&batch,
+        std::vector<uint64_t> &&batch,
         const std::atomic<bool> &cancelled,
         uint64_t &dropped_count,
         uint64_t &queue_full_events,
-        uint64_t &push_wait_ns
+        uint64_t &push_wait_ns,
+        bool allow_drop
     ) {
         if (batch.empty()) {
             return true;
         }
         const auto wait_start = std::chrono::high_resolution_clock::now();
+        size_t offset = 0U;
         std::unique_lock<std::mutex> lock(mu_);
-        const auto wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now() - wait_start);
-        push_wait_ns += static_cast<uint64_t>(std::max<int64_t>(0, wait_elapsed.count()));
         if (closed_ || cancelled.load()) {
             return false;
         }
+        if (!allow_drop) {
+            while (offset < batch.size()) {
+                not_full_.wait(lock, [&]() { return closed_ || cancelled.load() || size_ < capacity_; });
+                if (closed_ || cancelled.load()) {
+                    const auto wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::high_resolution_clock::now() - wait_start);
+                    push_wait_ns += static_cast<uint64_t>(std::max<int64_t>(0, wait_elapsed.count()));
+                    return false;
+                }
+                const uint64_t available = capacity_ - static_cast<uint64_t>(size_);
+                const size_t take = static_cast<size_t>(
+                    std::min<uint64_t>(
+                        available,
+                        static_cast<uint64_t>(balanced_chunk_size(batch.size() - offset))));
+                std::vector<uint64_t> chunk;
+                chunk.reserve(take);
+                chunk.insert(
+                    chunk.end(),
+                    std::make_move_iterator(batch.begin() + static_cast<std::ptrdiff_t>(offset)),
+                    std::make_move_iterator(batch.begin() + static_cast<std::ptrdiff_t>(offset + take)));
+                offset += take;
+                size_ += chunk.size();
+                batches_.push_back(std::move(chunk));
+                not_empty_.notify_all();
+            }
+            const auto wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - wait_start);
+            push_wait_ns += static_cast<uint64_t>(std::max<int64_t>(0, wait_elapsed.count()));
+            return true;
+        }
+        const auto wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now() - wait_start);
+        push_wait_ns += static_cast<uint64_t>(std::max<int64_t>(0, wait_elapsed.count()));
         const uint64_t current = static_cast<uint64_t>(size_);
         const uint64_t available = current >= capacity_ ? 0ULL : capacity_ - current;
         if (available == 0ULL) {
@@ -6722,13 +9231,23 @@ public:
             dropped_count += static_cast<uint64_t>(batch.size()) - available;
             batch.resize(static_cast<size_t>(available));
         }
-        size_ += batch.size();
-        batches_.push_back(std::move(batch));
-        not_empty_.notify_one();
+        while (offset < batch.size()) {
+            const size_t take = balanced_chunk_size(batch.size() - offset);
+            std::vector<uint64_t> chunk;
+            chunk.reserve(take);
+            chunk.insert(
+                chunk.end(),
+                std::make_move_iterator(batch.begin() + static_cast<std::ptrdiff_t>(offset)),
+                std::make_move_iterator(batch.begin() + static_cast<std::ptrdiff_t>(offset + take)));
+            offset += take;
+            size_ += chunk.size();
+            batches_.push_back(std::move(chunk));
+        }
+        not_empty_.notify_all();
         return true;
     }
 
-    bool pop_batch(std::vector<SurvivorCandidate> &out) {
+    bool pop_batch(std::vector<uint64_t> &out) {
         std::unique_lock<std::mutex> lock(mu_);
         not_empty_.wait(lock, [&]() { return closed_ || !batches_.empty(); });
         if (batches_.empty()) {
@@ -6737,6 +9256,7 @@ public:
         out = std::move(batches_.front());
         batches_.pop_front();
         size_ -= out.size();
+        not_full_.notify_all();
         return true;
     }
 
@@ -6746,6 +9266,7 @@ public:
             closed_ = true;
         }
         not_empty_.notify_all();
+        not_full_.notify_all();
     }
 
     uint64_t size() const {
@@ -6762,10 +9283,20 @@ public:
     }
 
 private:
+    size_t balanced_chunk_size(size_t remaining) const {
+        if (remaining <= max_batch_size_) {
+            return remaining;
+        }
+        const size_t chunks_left = (remaining + max_batch_size_ - 1U) / max_batch_size_;
+        return (remaining + chunks_left - 1U) / chunks_left;
+    }
+
     const uint64_t capacity_;
+    const size_t max_batch_size_;
     mutable std::mutex mu_;
     std::condition_variable not_empty_;
-    std::deque<std::vector<SurvivorCandidate>> batches_;
+    std::condition_variable not_full_;
+    std::deque<std::vector<uint64_t>> batches_;
     size_t size_ = 0;
     bool closed_ = false;
 };
@@ -6976,7 +9507,8 @@ static void print_query_template() {
         << "    \"dominance_threshold\": 0.85\n"
         << "  },\n"
         << "  \"output\": {\"detail\":\"matched_set\"},\n"
-        << "  \"performance\": {\"strict_workers\":0,\"candidate_cap_mode\":\"adaptive\",\"strict_surrogate\":\"balanced\",\"execution_mode\":\"auto\",\"compiled_stage_a_mode\":\"auto\"}\n"
+        << "  \"safety\": {\"completeness\":\"exact\"},\n"
+        << "  \"performance\": {\"strict_workers\":0,\"candidate_cap_mode\":\"none\",\"strict_surrogate\":\"off\",\"execution_mode\":\"auto\",\"compiled_stage_a_mode\":\"auto\"}\n"
         << "}\n";
 }
 
@@ -6994,6 +9526,7 @@ struct PlanDiagnosticsSummary {
     double predicted_score = 0.0;
     double measured_single_driver_pass_rate = -1.0;
     double measured_selected_pass_rate = -1.0;
+    std::string completeness_policy = "exact";
     std::string compiled_stage_a_mode = "auto";
     std::string route_decision = "gpu";
     std::string route_reason = "auto";
@@ -7139,9 +9672,10 @@ static bool gpu_stage_a_is_final_placement_filter(
     const CompiledQueryPlanContext &query_plan,
     const StageARoutePlan &route,
     bool sculpt_enabled,
-    bool loot_enabled
+    bool loot_enabled,
+    bool structure_settings_enabled
 ) {
-    if (!route.gpu_enabled || sculpt_enabled || loot_enabled || !query_plan.biome_filters.empty()) {
+    if (!route.gpu_enabled || sculpt_enabled || loot_enabled || structure_settings_enabled || !query_plan.biome_filters.empty()) {
         return false;
     }
     if (runtime.constraints.empty() || route.chosen_drivers.size() != runtime.constraints.size() ||
@@ -7202,6 +9736,10 @@ static StageADriverMeasurement measure_stage_a_driver_combo(
         selected_ids.insert(driver);
     }
     const GpuPrefilterPlan plan = build_gpu_prefilter_plan(runtime, &selected_ids);
+    if (!gpu_prefilter_plan_fits_const_region_buffer(plan)) {
+        measurement.measured = false;
+        return measurement;
+    }
     std::vector<uint64_t> survivors;
     gpu_backend.filter_multi_into(start_seed, sample_count, plan.regions, plan.constraints, survivors);
     measurement.survivor_count = static_cast<uint64_t>(survivors.size());
@@ -7220,7 +9758,7 @@ static std::vector<std::string> choose_static_stage_a_drivers(
     }
     size_t driver_count = 1U;
     if (mode == CompiledStageAMode::multi) {
-        driver_count = std::min<size_t>(2U, driver_candidates.size());
+        driver_count = driver_candidates.size();
     }
     return std::vector<std::string>(driver_candidates.begin(), driver_candidates.begin() + driver_count);
 }
@@ -7273,6 +9811,14 @@ static StageARoutePlan choose_stage_a_route_plan(
         if (route.gpu_enabled) {
             std::unordered_set<std::string> selected_ids(route.chosen_drivers.begin(), route.chosen_drivers.end());
             route.active_gpu_plan = build_gpu_prefilter_plan(runtime, &selected_ids);
+            if (!gpu_prefilter_plan_fits_const_region_buffer(route.active_gpu_plan)) {
+                route.route_decision = "gpu_off";
+                route.route_reason = "gpu_region_count_exceeds_limit";
+                route.gpu_enabled = false;
+                route.active_gpu_plan = GpuPrefilterPlan{};
+                route.multi_gpu_plan = GpuPrefilterPlan{};
+                return route;
+            }
             if (mode == CompiledStageAMode::multi) {
                 route.multi_gpu_plan = route.active_gpu_plan;
             }
@@ -7280,7 +9826,7 @@ static StageARoutePlan choose_stage_a_route_plan(
         return route;
     }
 
-    const uint64_t sample_count = std::min<uint64_t>(total_count, 4096ULL);
+    const uint64_t sample_count = std::min<uint64_t>(total_count, 65'536ULL);
     const bool measured_selection = sample_count >= 512ULL;
 
     if (!measured_selection) {
@@ -7291,6 +9837,13 @@ static StageARoutePlan choose_stage_a_route_plan(
         if (route.gpu_enabled) {
             std::unordered_set<std::string> selected_ids(route.chosen_drivers.begin(), route.chosen_drivers.end());
             route.active_gpu_plan = build_gpu_prefilter_plan(runtime, &selected_ids);
+            if (!gpu_prefilter_plan_fits_const_region_buffer(route.active_gpu_plan)) {
+                route.route_decision = "gpu_off";
+                route.route_reason = "gpu_region_count_exceeds_limit";
+                route.gpu_enabled = false;
+                route.active_gpu_plan = GpuPrefilterPlan{};
+                return route;
+            }
         }
         return route;
     }
@@ -7312,6 +9865,11 @@ static StageARoutePlan choose_stage_a_route_plan(
     }
 
     const StageADriverMeasurement best_single = single_measurements.front();
+    if (!best_single.measured) {
+        route.route_decision = "gpu_off";
+        route.route_reason = "gpu_region_count_exceeds_limit";
+        return route;
+    }
     route.best_single_drivers = best_single.drivers;
     route.measured_single_driver_pass_rate = best_single.pass_rate;
 
@@ -7319,8 +9877,8 @@ static StageARoutePlan choose_stage_a_route_plan(
     StageADriverMeasurement best_multi{};
     bool have_best_multi = false;
 
-    const bool allow_pair_search = mode == CompiledStageAMode::multi ||
-                                   (mode == CompiledStageAMode::auto_mode && best_single.pass_rate > 0.01);
+    const bool allow_pair_search =
+        mode == CompiledStageAMode::multi || mode == CompiledStageAMode::auto_mode;
     if (allow_pair_search && driver_candidates.size() > 1U) {
         const size_t pool_size = std::min<size_t>(4U, single_measurements.size());
         for (size_t i = 0; i < pool_size; ++i) {
@@ -7344,46 +9902,49 @@ static StageARoutePlan choose_stage_a_route_plan(
 
     const bool allow_triple_search =
         driver_candidates.size() > 2U &&
-        (mode == CompiledStageAMode::multi ||
-         (mode == CompiledStageAMode::auto_mode && have_best_multi && best_multi.pass_rate > 0.005));
+        (mode == CompiledStageAMode::multi || mode == CompiledStageAMode::auto_mode);
     if (allow_triple_search) {
-        const size_t triple_pool = std::min<size_t>(3U, single_measurements.size());
-        if (triple_pool == 3U) {
-            StageADriverMeasurement combo = measure_stage_a_driver_combo(
-                gpu_backend[0],
-                start_seed,
-                sample_count,
-                runtime,
-                {single_measurements[0].drivers.front(),
-                 single_measurements[1].drivers.front(),
-                 single_measurements[2].drivers.front()});
-            if (!have_best_multi || stage_a_measurement_better(combo, best_multi)) {
-                best_multi = combo;
-                have_best_multi = true;
+        const size_t triple_pool = std::min<size_t>(4U, single_measurements.size());
+        if (triple_pool >= 3U) {
+            for (size_t i = 0; i < triple_pool; ++i) {
+                for (size_t j = i + 1U; j < triple_pool; ++j) {
+                    for (size_t k = j + 1U; k < triple_pool; ++k) {
+                        StageADriverMeasurement combo = measure_stage_a_driver_combo(
+                            gpu_backend[0],
+                            start_seed,
+                            sample_count,
+                            runtime,
+                            {single_measurements[i].drivers.front(),
+                             single_measurements[j].drivers.front(),
+                             single_measurements[k].drivers.front()});
+                        if (!have_best_multi || stage_a_measurement_better(combo, best_multi)) {
+                            best_multi = combo;
+                            have_best_multi = true;
+                        }
+                        if (stage_a_measurement_better(combo, best_selected)) {
+                            best_selected = combo;
+                        }
+                    }
+                }
             }
-            if (stage_a_measurement_better(combo, best_selected)) {
-                best_selected = combo;
-            }
+        }
+    }
+
+    if ((mode == CompiledStageAMode::multi || mode == CompiledStageAMode::auto_mode) &&
+        driver_candidates.size() > 3U) {
+        StageADriverMeasurement combo =
+            measure_stage_a_driver_combo(gpu_backend[0], start_seed, sample_count, runtime, driver_candidates);
+        if (!have_best_multi || stage_a_measurement_better(combo, best_multi)) {
+            best_multi = combo;
+            have_best_multi = true;
+        }
+        if (stage_a_measurement_better(combo, best_selected)) {
+            best_selected = combo;
         }
     }
 
     route.best_multi_drivers = have_best_multi ? best_multi.drivers : std::vector<std::string>{};
     route.measured_multi_driver_pass_rate = have_best_multi ? best_multi.pass_rate : -1.0;
-    const auto selected_has_strict_constraint = [&](const std::vector<std::string> &drivers) {
-        return std::any_of(drivers.begin(), drivers.end(), [&](const std::string &cid) {
-            const auto it = runtime.constraints.find(cid);
-            return it != runtime.constraints.end() && it->second.spec.mode == "strict";
-        });
-    };
-    if (mode == CompiledStageAMode::auto_mode && selected_has_strict_constraint(best_selected.drivers) &&
-        best_selected.pass_rate > 0.0025) {
-        route.chosen_drivers.clear();
-        route.measured_selected_pass_rate = best_selected.pass_rate;
-        route.route_decision = "cpu_stage_a5_heavy";
-        route.route_reason = "auto_strict_gpu_survivor_rate";
-        route.gpu_enabled = false;
-        return route;
-    }
     route.chosen_drivers = best_selected.drivers;
     route.measured_selected_pass_rate = best_selected.pass_rate;
     route.route_decision = route.chosen_drivers.size() > 1U ? "multi_driver" : "single_driver";
@@ -7392,10 +9953,23 @@ static StageARoutePlan choose_stage_a_route_plan(
     if (route.gpu_enabled) {
         std::unordered_set<std::string> selected_ids(route.chosen_drivers.begin(), route.chosen_drivers.end());
         route.active_gpu_plan = build_gpu_prefilter_plan(runtime, &selected_ids);
+        if (!gpu_prefilter_plan_fits_const_region_buffer(route.active_gpu_plan)) {
+            route.route_decision = "gpu_off";
+            route.route_reason = "gpu_region_count_exceeds_limit";
+            route.gpu_enabled = false;
+            route.active_gpu_plan = GpuPrefilterPlan{};
+            route.multi_gpu_plan = GpuPrefilterPlan{};
+            return route;
+        }
     }
     if (!route.best_multi_drivers.empty()) {
         std::unordered_set<std::string> multi_ids(route.best_multi_drivers.begin(), route.best_multi_drivers.end());
         route.multi_gpu_plan = build_gpu_prefilter_plan(runtime, &multi_ids);
+        if (!gpu_prefilter_plan_fits_const_region_buffer(route.multi_gpu_plan)) {
+            route.multi_gpu_plan = GpuPrefilterPlan{};
+            route.best_multi_drivers.clear();
+            route.measured_multi_driver_pass_rate = -1.0;
+        }
     }
     return route;
 }
@@ -7407,6 +9981,7 @@ static PlanDiagnosticsSummary build_plan_diagnostics_summary(
     CompiledStageAMode compiled_stage_a_mode
 ) {
     PlanDiagnosticsSummary summary{};
+    summary.completeness_policy = runtime.spec.safety.completeness;
     summary.compiled_stage_a_mode = compiled_stage_a_mode_name(compiled_stage_a_mode);
     summary.gpu_stage_a_enabled = compiled_stage_a_mode_uses_gpu(compiled_stage_a_mode);
     summary.route_decision = summary.gpu_stage_a_enabled ? "gpu" : "cpu-only";
@@ -7590,6 +10165,7 @@ static std::string describe_plan_diagnostics_json(
 ) {
     std::ostringstream oss;
     oss << "{";
+    oss << "\"completeness\":\"" << json_escape(summary.completeness_policy) << "\",";
     oss << "\"compiled_stage_a_mode\":\"" << json_escape(summary.compiled_stage_a_mode) << "\",";
     oss << "\"route_decision\":\"" << json_escape(summary.route_decision) << "\"";
     oss << ",\"route_reason\":\"" << json_escape(summary.route_reason) << "\"";
@@ -7728,6 +10304,180 @@ static std::string describe_plan_diagnostics_json(
     return oss.str();
 }
 
+static bool query_uses_dependent_candidate_metadata(const QuerySpec &spec) {
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (constraint.anchor.rfind("constraint:", 0) == 0) {
+            return true;
+        }
+    }
+    for (const BiomeFilterSpec &filter : spec.biome_filters) {
+        if (filter.point.rfind("constraint:", 0) == 0) {
+            return true;
+        }
+    }
+    return !spec.loot_filters.empty();
+}
+
+static bool query_has_full64_required_predicates(const QuerySpec &spec) {
+    if (!spec.biome_filters.empty() || spec.sculpt.enabled || !spec.loot_filters.empty()) {
+        return true;
+    }
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (constraint.mode == "strict" || constraint.anchor == "spawn") {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool query_has_spawn_anchor(const QuerySpec &spec) {
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (constraint.anchor == "spawn") {
+            return true;
+        }
+    }
+    for (const BiomeFilterSpec &filter : spec.biome_filters) {
+        if (filter.point == "spawn") {
+            return true;
+        }
+    }
+    return spec.sculpt.enabled && spec.sculpt.center == "spawn";
+}
+
+static bool query_has_quad_constraint(const QuerySpec &spec) {
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (constraint.min_required > 1U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool query_has_structure_settings(const QuerySpec &spec) {
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (!constraint.structure_settings.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool query_has_strict_constraint(const QuerySpec &spec) {
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (constraint.mode == "strict") {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool query_has_strict_java_validated_constraint(const QuerySpec &spec) {
+    for (const ConstraintSpec &constraint : spec.constraints) {
+        if (constraint.mode == "strict" && constraint.structure != "stronghold") {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void enforce_exact_completeness_policy(const QuerySpec &spec, const CliArgs &args) {
+    if (!is_exact_policy(spec)) {
+        return;
+    }
+
+    std::string surrogate = lower_ascii(trim(spec.perf.strict_surrogate));
+    if (surrogate == "light-speed") {
+        surrogate = "lightspeed";
+    }
+    if (surrogate.empty()) {
+        surrogate = "off";
+    }
+    if (surrogate != "off") {
+        throw std::runtime_error(
+            "Exact scans require performance.strict_surrogate=off because surrogate gates and coarse biome samples "
+            "can skip valid seeds. Use safety.completeness=approximate for those speed shortcuts."
+        );
+    }
+
+    if (args.scan_mode == "placement") {
+        throw std::runtime_error(
+            "Exact scans cannot use --scan-mode placement. Placement mode reports raw structure-set attempts and does "
+            "not prove vanilla post-placement generation."
+        );
+    }
+
+    if (!spec.biome_filters.empty()) {
+        throw std::runtime_error(
+            "Exact biome filters are disabled because native biome filters currently use an approximate fixed-Y "
+            "sampling shape. Use safety.completeness=approximate until the vanilla quart sampler is enabled."
+        );
+    }
+
+    if (query_has_spawn_anchor(spec)) {
+        throw std::runtime_error(
+            "Exact spawn anchors are disabled because native spawn resolution uses the cubiomes climate spawn, not the "
+            "final Minecraft server spawn adjustment. Use safety.completeness=approximate for spawn-anchored scans."
+        );
+    }
+
+    if (!spec.loot_filters.empty()) {
+        throw std::runtime_error(
+            "Exact loot filters are disabled for 26.1.2 because the current replay does not yet derive loot from the "
+            "vanilla selected structure start and actual placed chests. Use safety.completeness=approximate."
+        );
+    }
+
+    if (query_has_structure_settings(spec)) {
+        throw std::runtime_error(
+            "Exact structure_settings are disabled because village building checks can fall back to approximate "
+            "jigsaw simulation. Use safety.completeness=approximate."
+        );
+    }
+
+    if (args.java_cubiomes_validation == "off" && query_has_strict_java_validated_constraint(spec)) {
+        throw std::runtime_error(
+            "Exact strict structure scans require Java vanilla structure validation. Use --java-cubiomes-validation "
+            "auto or strict, or set safety.completeness=approximate."
+        );
+    }
+
+    if (query_uses_dependent_candidate_metadata(spec) && spec.perf.candidate_cap_mode != "none") {
+        throw std::runtime_error(
+            "Exact scans with dependent anchors, dependent biome filters, or loot filters require "
+            "performance.candidate_cap_mode=none so anchor candidates are not truncated."
+        );
+    }
+
+    if (query_has_quad_constraint(spec) && spec.perf.candidate_cap_mode != "none") {
+        throw std::runtime_error(
+            "Exact multi-match/quad constraints require performance.candidate_cap_mode=none so compact groups are not "
+            "tested against a truncated candidate list."
+        );
+    }
+
+    if (args.java_cubiomes_validation != "off" && query_has_strict_constraint(spec) &&
+        spec.perf.candidate_cap_mode != "none") {
+        throw std::runtime_error(
+            "Exact Java structure validation requires performance.candidate_cap_mode=none so later vanilla-valid "
+            "structure starts are not skipped by candidate caps."
+        );
+    }
+
+    if (args.scan_mode == "mixed" && args.mixed_survivor_cap != 0U) {
+        throw std::runtime_error(
+            "Exact mixed scans require --mixed-survivor-cap 0. Survivor caps are approximate because they can drop "
+            "placement-valid seeds before strict validation."
+        );
+    }
+
+    if (args.output_mode != "raw" && args.upper16 != 0U && query_has_full64_required_predicates(spec)) {
+        throw std::runtime_error(
+            "Exact full64 output is not implemented for strict/biome/spawn/loot predicates yet. The scanner validates "
+            "the lower48 seed stream, so use raw output or upper16=0 until upper16 enumeration is added."
+        );
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -7766,16 +10516,13 @@ int main(int argc, char **argv) {
         if (!args.execution_mode.empty()) {
             query_spec.perf.execution_mode = args.execution_mode;
         }
+        if (!args.completeness_policy.empty()) {
+            query_spec.safety.completeness = args.completeness_policy;
+        }
+        enforce_exact_completeness_policy(query_spec, args);
         std::string requested_compiled_stage_a_mode = args.compiled_stage_a_mode;
         if (!args.compiled_stage_a_mode_set) {
             requested_compiled_stage_a_mode = query_spec.perf.compiled_stage_a_mode;
-        }
-        if (query_uses_exact_shipwreck_validation(query_spec, args.mc_version)) {
-            throw std::runtime_error(
-                "Exact 26.1.2 shipwreck validation is temporarily disabled because the current path can produce "
-                "false positives. Use buried_treasure/desert_pyramid for exact loot checks, or switch shipwreck "
-                "queries to a legacy supported loot version."
-            );
         }
         const ExecutionModePlan exec_mode_plan = resolve_execution_mode_plan(query_spec.perf.execution_mode);
         const CompiledStageAMode compiled_stage_a_mode = parse_compiled_stage_a_mode(requested_compiled_stage_a_mode);
@@ -7802,33 +10549,42 @@ int main(int argc, char **argv) {
         const std::string loot_version_token = trim(args.mc_version);
         const std::vector<PreparedLootFilter> prepared_loot_filters =
             prepare_loot_filters(runtime, constraint_index, loot_version_token);
+        const std::vector<PreparedStructureSettingsFilter> prepared_structure_settings_filters =
+            prepare_structure_settings_filters(runtime, constraint_index);
         const std::vector<PreparedJavaStructureValidationConstraint> prepared_java_structure_filters =
             prepare_java_structure_validation_constraints(runtime, constraint_index);
         const bool loot_enabled = !prepared_loot_filters.empty();
+        const bool structure_settings_enabled = !prepared_structure_settings_filters.empty();
         const bool java_cubiomes_validation_enabled =
             !prepared_java_structure_filters.empty() &&
             (args.java_cubiomes_validation == "strict" ||
              (args.java_cubiomes_validation == "auto" &&
+              is_exact_policy(query_spec) &&
               is_exact_java_cubiomes_validation_version(loot_version_token)));
         const bool sculpt_enabled = native_sculpt.enabled != 0U;
 
         GpuFilterApi gpu_backend;
-        const bool gpu_backend_loaded = gpu_backend.load(repo_root) && gpu_backend.is_available();
+        const bool gpu_backend_loaded = gpu_backend.load(repo_root, args.gpu_backend) && gpu_backend.is_available();
         if ((compiled_stage_a_mode == CompiledStageAMode::single ||
              compiled_stage_a_mode == CompiledStageAMode::multi) &&
             !gpu_backend_loaded) {
+            const std::string &requested_backend =
+                args.gpu_backend == "auto" ? std::string("cuda") : args.gpu_backend;
+            const char *missing_fname = gpu_filter_library_filename_for(requested_backend);
+            const char *missing_readme = gpu_backend_readme_path_for(requested_backend);
+            const char *missing_env = requested_backend == "opencl" ? "GPU_FILTER_OPENCL_DLL" : "GPU_FILTER_DLL";
+            std::string hint;
+            if (args.gpu_backend == "auto") {
+                hint = " (auto-selection tried CUDA then OpenCL and neither was found; pick one explicitly with --gpu-backend)";
+            } else {
+                hint = " (requested via --gpu-backend " + args.gpu_backend + ")";
+            }
             throw std::runtime_error(
-                std::string("Native GPU backend not available. Build ") + gpu_filter_library_filename() +
-                " (see " + gpu_backend_readme_path() + ") or set GPU_FILTER_DLL to the built library path."
+                std::string("Native GPU backend not available. Build ") + missing_fname +
+                " (see " + missing_readme + ") or set " + missing_env + " to the built library path." + hint
             );
         }
         CompiledStageAMode route_stage_a_mode = compiled_stage_a_mode;
-        if (args.scan_mode == "strict") {
-            route_stage_a_mode = CompiledStageAMode::gpu_off;
-        } else if ((args.scan_mode == "placement" || args.scan_mode == "mixed") &&
-                   compiled_stage_a_mode == CompiledStageAMode::auto_mode) {
-            route_stage_a_mode = CompiledStageAMode::single;
-        }
         StageARoutePlan stage_a_route = choose_stage_a_route_plan(
             runtime,
             query_plan,
@@ -7850,10 +10606,12 @@ int main(int argc, char **argv) {
         bool use_gpu_stage_a = stage_a_route.gpu_enabled;
         if ((args.scan_mode == "placement" || args.scan_mode == "mixed") &&
             (!use_gpu_stage_a || gpu_prefilter_plan.constraints.empty())) {
+            const std::string &requested_backend =
+                args.gpu_backend == "auto" ? std::string("cuda") : args.gpu_backend;
             throw std::runtime_error(
                 "--scan-mode " + args.scan_mode +
                 " requires an active GPU placement prefilter. Use a placement-supported structure query and build " +
-                gpu_filter_library_filename() + "."
+                gpu_filter_library_filename_for(requested_backend) + "."
             );
         }
         const bool gpu_stage_a_final_filter = gpu_stage_a_is_final_placement_filter(
@@ -7861,7 +10619,8 @@ int main(int argc, char **argv) {
             query_plan,
             stage_a_route,
             sculpt_enabled,
-            loot_enabled
+            loot_enabled,
+            structure_settings_enabled
         );
 
         const bool needs_cubiomes = std::any_of(
@@ -7871,9 +10630,11 @@ int main(int argc, char **argv) {
                                             return c.mode_strict != 0U || c.is_stronghold != 0U ||
                                                    c.anchor_type == SCAN_ANCHOR_SPAWN;
                                         }) ||
-                                    !query_plan.biome_filters.empty() || sculpt_enabled;
+                                    !query_plan.biome_filters.empty() || sculpt_enabled || loot_enabled ||
+                                    structure_settings_enabled ||
+                                    java_cubiomes_validation_enabled;
 
-        if (needs_cubiomes && args.scan_mode != "placement") {
+        if (needs_cubiomes) {
             const fs::path cubi_dll = resolve_cubiomes_lib_path(repo_root);
             if (cubi_dll.empty()) {
                 throw std::runtime_error(
@@ -7889,7 +10650,7 @@ int main(int argc, char **argv) {
         }
 
         LootValidationServerClient loot_client;
-        if (loot_enabled || java_cubiomes_validation_enabled) {
+        if (loot_enabled || structure_settings_enabled || java_cubiomes_validation_enabled) {
             std::string loot_error;
             if (!loot_client.start(repo_root, loot_error)) {
                 throw std::runtime_error("Failed to start LootValidationServer: " + loot_error);
@@ -7906,6 +10667,29 @@ int main(int argc, char **argv) {
             strict_workers = static_cast<int>(std::min<unsigned>(32U, hc));
         }
         strict_workers = std::max(1, strict_workers);
+        if (!args.strict_workers_set && (loot_enabled || structure_settings_enabled)) {
+            const int auto_loot_worker_cap = exec_mode_plan.requested == "max-throughput" ? 16 : 4;
+            if (strict_workers > auto_loot_worker_cap) {
+                // Exact loot replay is Java-heavy; keep auto conservative unless throughput mode asks for parallelism.
+                strict_workers = auto_loot_worker_cap;
+            }
+        }
+        const int requested_strict_workers = strict_workers;
+        const uint64_t strict_gate_product = gpu_prefilter_gate_product(gpu_prefilter_plan);
+        const bool strict_gate_active = strict_gate_product > 1ULL;
+        if (args.scan_mode == "mixed" &&
+            strict_gate_active &&
+            (loot_enabled || structure_settings_enabled || java_cubiomes_validation_enabled)) {
+            int sparse_worker_cap = strict_workers;
+            if (strict_gate_product >= 16384ULL) {
+                sparse_worker_cap = 1;
+            } else if (strict_gate_product >= 4096ULL) {
+                sparse_worker_cap = 2;
+            } else if (strict_gate_product >= 1024ULL) {
+                sparse_worker_cap = 4;
+            }
+            strict_workers = std::max(1, std::min(strict_workers, sparse_worker_cap));
+        }
 
         std::vector<uint64_t> batch_probe_buffer;
         std::vector<uint64_t> batch_probe_valid;
@@ -7987,31 +10771,6 @@ int main(int argc, char **argv) {
             }
         };
 
-        const uint64_t batch_size = choose_batch_size(
-            args,
-            args.scan_mode == "mixed" ? false : needs_cubiomes,
-            use_gpu_stage_a ? gpu_backend.total_mem_bytes() : 0ULL,
-            args.count,
-            [&](uint64_t bs) {
-                if (args.scan_mode == "mixed" && use_gpu_stage_a) {
-                    gpu_backend.filter_multi_into(
-                        start_seed,
-                        bs,
-                        gpu_prefilter_plan.regions,
-                        gpu_prefilter_plan.constraints,
-                        batch_probe_buffer
-                    );
-                    return;
-                }
-                run_pipeline_probe(bs, use_gpu_stage_a, use_gpu_stage_a ? &gpu_prefilter_plan : nullptr);
-            },
-            terminal_mode.load()
-        );
-        uint64_t capped_batch_size = std::min<uint64_t>(batch_size, args.count);
-        if (capped_batch_size == 0) {
-            capped_batch_size = 1;
-        }
-
         const bool gpu_async_forced_off = args.gpu_pipeline == "sync";
         bool use_async_gpu_pipeline = false;
         if (use_gpu_stage_a && !gpu_prefilter_plan.constraints.empty() && !gpu_async_forced_off) {
@@ -8025,12 +10784,118 @@ int main(int argc, char **argv) {
         ) {
             std::ostringstream oss;
             oss << "--gpu-pipeline async requested, but ";
-            oss << gpu_filter_library_filename() << " does not expose the double-buffered async API.";
+            const std::string &active = gpu_backend.active_backend().empty()
+                ? std::string("cuda") : gpu_backend.active_backend();
+            oss << gpu_filter_library_filename_for(active) << " does not expose the double-buffered async API";
+            if (active == "opencl") {
+                oss << " (the OpenCL backend is sync-only; use --gpu-backend cuda or --gpu-pipeline sync)";
+            }
+            oss << ".";
             throw std::runtime_error(oss.str());
+        }
+        const bool use_mixed_async_max_tuner =
+            args.batch_size == "max" &&
+            args.scan_mode == "mixed" &&
+            use_gpu_stage_a &&
+            use_async_gpu_pipeline;
+        MixedAsyncTuningChoice mixed_async_tuning_choice{};
+        uint64_t batch_size = 0ULL;
+        if (use_mixed_async_max_tuner) {
+            mixed_async_tuning_choice = choose_mixed_async_max_batch_and_depth(
+                args,
+                gpu_backend,
+                gpu_prefilter_plan,
+                start_seed,
+                args.count,
+                terminal_mode.load()
+            );
+            if (mixed_async_tuning_choice.valid) {
+                batch_size = mixed_async_tuning_choice.batch_size;
+            }
+        }
+        if (batch_size == 0ULL) {
+            const uint64_t fallback_min_async_slots =
+                (args.scan_mode == "mixed" && use_async_gpu_pipeline && args.gpu_inflight_batches != "auto")
+                    ? std::max<uint64_t>(1ULL, std::min<uint64_t>(parse_u64(args.gpu_inflight_batches), 8ULL))
+                    : 1ULL;
+            batch_size = choose_batch_size(
+                args,
+                args.scan_mode == "mixed" ? false : needs_cubiomes,
+                use_gpu_stage_a ? gpu_backend.total_mem_bytes() : 0ULL,
+                args.count,
+                [&](uint64_t bs) {
+                    if (args.scan_mode == "mixed" && use_gpu_stage_a) {
+                        if (use_async_gpu_pipeline) {
+                            gpu_backend.submit_batch(
+                                0U,
+                                start_seed,
+                                bs,
+                                gpu_prefilter_plan.regions,
+                                gpu_prefilter_plan.constraints
+                            );
+                            double kernel_seconds = 0.0;
+                            double transfer_seconds = 0.0;
+                            gpu_backend.collect_batch(0U, batch_probe_buffer, kernel_seconds, transfer_seconds);
+                        } else {
+                            gpu_backend.filter_multi_into(
+                                start_seed,
+                                bs,
+                                gpu_prefilter_plan.regions,
+                                gpu_prefilter_plan.constraints,
+                                batch_probe_buffer
+                            );
+                        }
+                        return;
+                    }
+                    run_pipeline_probe(bs, use_gpu_stage_a, use_gpu_stage_a ? &gpu_prefilter_plan : nullptr);
+                },
+                terminal_mode.load(),
+                static_cast<uint32_t>(fallback_min_async_slots)
+            );
+        }
+        uint64_t capped_batch_size = std::min<uint64_t>(batch_size, args.count);
+        if (capped_batch_size == 0) {
+            capped_batch_size = 1;
+        }
+
+        const uint32_t gpu_async_slots_available =
+            use_async_gpu_pipeline ? std::max<uint32_t>(1U, gpu_backend.async_max_slots()) : 0U;
+        const uint32_t gpu_inflight_batches = mixed_async_tuning_choice.valid
+            ? mixed_async_tuning_choice.depth
+            : choose_gpu_inflight_batches(
+                  args,
+                  gpu_backend,
+                  gpu_prefilter_plan,
+                  start_seed,
+                  args.count,
+                  capped_batch_size,
+                  use_async_gpu_pipeline,
+                  terminal_mode.load());
+        if (args.plan_diagnostics || args.debug_enabled || terminal_mode.load()) {
+            std::cout << "RUNTIME_DIAGNOSTICS {"
+                      << "\"scanner_path\":\"" << json_escape(fs::absolute(fs::path(argv[0])).string()) << "\""
+                      << ",\"repo_root\":\"" << json_escape(repo_root.string()) << "\""
+                      << ",\"gpu_backend\":\""
+                      << json_escape(
+                             gpu_backend_loaded
+                                 ? (gpu_backend.active_backend().empty() ? std::string("cuda") : gpu_backend.active_backend())
+                                 : std::string("none"))
+                      << "\""
+                      << ",\"gpu_filter_path\":\""
+                      << json_escape(gpu_backend_loaded ? gpu_backend.loaded_path().string() : std::string())
+                      << "\""
+                      << ",\"gpu_async_slots_available\":" << gpu_async_slots_available
+                      << ",\"gpu_inflight_batches\":" << gpu_inflight_batches
+                      << ",\"placement_batch_size\":" << capped_batch_size
+                      << ",\"route_decision\":\"" << json_escape(stage_a_route.route_decision) << "\""
+                      << ",\"route_reason\":\"" << json_escape(stage_a_route.route_reason) << "\""
+                      << "}\n";
         }
 
         if (terminal_mode.load()) {
             std::cout << "Device: native-cpp\n";
+            std::cout << "Native scanner: " << fs::absolute(fs::path(argv[0])).string() << "\n";
+            std::cout << "Repo root: " << repo_root.string() << "\n";
             const uint64_t tail_count = args.count % JAVA_DOMAIN;
             const uint64_t range_end = (start_seed + tail_count) & JAVA_MASK;
             const uint64_t seeds_until_wrap = JAVA_DOMAIN - start_seed;
@@ -8056,11 +10921,23 @@ int main(int argc, char **argv) {
             std::cout << "Compiled Stage A mode: requested=" << requested_compiled_stage_a_mode
                       << ", active=" << compiled_stage_a_mode_name(compiled_stage_a_mode)
                       << ", gpu=" << (use_gpu_stage_a ? "yes" : "no") << "\n";
+            std::cout << "Completeness: " << query_spec.safety.completeness << "\n";
             std::cout << "Scan mode: " << args.scan_mode << "\n";
             std::cout << "GPU pipeline: requested=" << args.gpu_pipeline
                       << ", active="
                       << (use_gpu_stage_a ? (use_async_gpu_pipeline ? "async-double-buffered" : "sync") : "off")
                       << "\n";
+            std::cout << "GPU backend: requested=" << args.gpu_backend
+                      << ", active="
+                      << (gpu_backend_loaded
+                              ? (gpu_backend.active_backend().empty() ? std::string("cuda") : gpu_backend.active_backend())
+                              : std::string("none"))
+                      << "\n";
+            if (gpu_backend_loaded) {
+                std::cout << "GPU backend library: " << gpu_backend.loaded_path().string() << "\n";
+            }
+            std::cout << "GPU async slots: available=" << fmt_u64(gpu_async_slots_available)
+                      << ", in_flight=" << fmt_u64(gpu_inflight_batches) << "\n";
             std::cout << "Query mode: version=1, logic=and\n";
         }
         std::string strict_surrogate_mode = query_spec.perf.strict_surrogate;
@@ -8117,7 +10994,8 @@ int main(int argc, char **argv) {
         }
 
         const bool allow_auto_route = compiled_stage_a_mode == CompiledStageAMode::auto_mode;
-        const bool allow_runtime_auto_route = allow_auto_route && !use_async_gpu_pipeline;
+        const bool allow_runtime_auto_route =
+            allow_auto_route && !use_async_gpu_pipeline && !is_exact_policy(query_spec);
         uint32_t gpu_hurt_streak = 0U;
         uint64_t total_gpu_hits = 0;
         uint64_t total_stage_a_survivors = 0;
@@ -8164,12 +11042,22 @@ int main(int argc, char **argv) {
         std::vector<uint64_t> java_worldgen_out;
         std::vector<uint64_t> sculpt_out;
         std::vector<uint64_t> loot_out;
+        std::vector<uint64_t> structure_settings_out;
         std::vector<NativeQueryMatchOut> java_worldgen_match_buffer;
         std::unordered_set<std::string> java_worldgen_skip_cache;
+        std::vector<NativeQueryMatchOut> structure_settings_match_buffer;
+        std::vector<StructureSettingsRequest> structure_settings_requests;
+        std::vector<uint32_t> structure_settings_request_indices;
+        std::vector<bool> structure_settings_results;
+        std::vector<uint64_t> structure_settings_current;
+        std::vector<uint64_t> structure_settings_next;
         std::vector<NativeQueryMatchOut> loot_match_buffer;
         std::unordered_map<std::string, std::unordered_map<std::string, int>> loot_roll_cache;
         if (java_cubiomes_validation_enabled) {
             java_worldgen_match_buffer.resize(initial_query_match_cap(query_plan.constraints));
+        }
+        if (structure_settings_enabled) {
+            structure_settings_match_buffer.resize(initial_query_match_cap(query_plan.constraints));
         }
         if (loot_enabled) {
             loot_match_buffer.resize(initial_query_match_cap(query_plan.constraints));
@@ -8203,6 +11091,9 @@ int main(int argc, char **argv) {
         double telemetry_gpu_utilization_estimate = 0.0;
         double telemetry_queue_push_wait_time_ms = 0.0;
         double telemetry_placement_gpu_busy_percent = 0.0;
+        double telemetry_gpu_batch_kernel_ms = 0.0;
+        double telemetry_gpu_host_gap_ms = 0.0;
+        double telemetry_gpu_pipeline_fill_percent = 0.0;
         uint64_t telemetry_queue_size = 0ULL;
         uint64_t telemetry_queue_capacity = 0ULL;
         uint64_t telemetry_dropped_survivors = 0ULL;
@@ -8257,7 +11148,19 @@ int main(int argc, char **argv) {
                 << ",\"gpu_pipeline\":\""
                 << json_escape(use_gpu_stage_a ? (use_async_gpu_pipeline ? "async" : "sync") : "off")
                 << "\""
+                << ",\"gpu_backend\":\""
+                << json_escape(
+                       gpu_backend_loaded
+                           ? (gpu_backend.active_backend().empty() ? std::string("cuda") : gpu_backend.active_backend())
+                           : std::string("none"))
+                << "\""
+                << ",\"gpu_filter_path\":\""
+                << json_escape(gpu_backend_loaded ? gpu_backend.loaded_path().string() : std::string())
+                << "\""
+                << ",\"route_decision\":\"" << json_escape(stage_a_route.route_decision) << "\""
+                << ",\"route_reason\":\"" << json_escape(stage_a_route.route_reason) << "\""
                 << ",\"scan_mode\":\"" << json_escape(args.scan_mode) << "\""
+                << ",\"completeness\":\"" << json_escape(query_spec.safety.completeness) << "\""
                 << ",\"raw_placement_seeds_per_sec\":" << std::fixed << std::setprecision(2) << telemetry_placement_rate_sps
                 << ",\"placement_rate_sps\":" << std::fixed << std::setprecision(2) << telemetry_placement_rate_sps
                 << ",\"strict_rate_sps\":" << std::fixed << std::setprecision(2) << telemetry_strict_rate_sps
@@ -8276,6 +11179,12 @@ int main(int argc, char **argv) {
                 << ",\"placement_gpu_busy_percent\":" << std::fixed << std::setprecision(3) << telemetry_placement_gpu_busy_percent
                 << ",\"gpu_busy_percent\":" << std::fixed << std::setprecision(3) << telemetry_placement_gpu_busy_percent
                 << ",\"gpu_utilization_estimate\":" << std::fixed << std::setprecision(3) << telemetry_gpu_utilization_estimate
+                << ",\"gpu_inflight_batches\":" << gpu_inflight_batches
+                << ",\"placement_batch_size\":" << capped_batch_size
+                << ",\"gpu_async_slots_available\":" << gpu_async_slots_available
+                << ",\"gpu_batch_kernel_ms\":" << std::fixed << std::setprecision(3) << telemetry_gpu_batch_kernel_ms
+                << ",\"gpu_host_gap_ms\":" << std::fixed << std::setprecision(3) << telemetry_gpu_host_gap_ms
+                << ",\"gpu_pipeline_fill_percent\":" << std::fixed << std::setprecision(3) << telemetry_gpu_pipeline_fill_percent
                 << ",\"terminal_mode\":" << (terminal_mode.load() ? "true" : "false")
                 << ",\"done\":" << (done ? "true" : "false")
                 << "}";
@@ -8291,7 +11200,8 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("--scan-mode mixed does not support --shadow-compare.");
             }
 
-            BoundedSurvivorBatchQueue survivor_queue(args.mixed_queue_capacity);
+            const size_t mixed_queue_batch_size = strict_workers > 1 ? 256U : 32768U;
+            BoundedSurvivorBatchQueue survivor_queue(args.mixed_queue_capacity, mixed_queue_batch_size);
             std::atomic<bool> cancel_mixed{false};
             std::atomic<bool> producer_done{false};
             std::atomic<uint32_t> active_workers{static_cast<uint32_t>(strict_workers)};
@@ -8310,6 +11220,10 @@ int main(int argc, char **argv) {
             std::atomic<uint64_t> mixed_queue_full_events{0ULL};
             std::atomic<uint64_t> mixed_queue_push_wait_ns{0ULL};
             std::atomic<uint64_t> mixed_placement_gpu_ns{0ULL};
+            std::atomic<uint64_t> mixed_gpu_kernel_ns{0ULL};
+            std::atomic<uint64_t> mixed_gpu_host_gap_ns{0ULL};
+            std::atomic<uint64_t> mixed_gpu_batch_count{0ULL};
+            std::atomic<uint32_t> mixed_pending_gpu_batches{0U};
             std::atomic<uint64_t> mixed_strict_ns{0ULL};
             std::atomic<uint64_t> mixed_java_ns{0ULL};
             std::atomic<uint64_t> mixed_sculpt_ns{0ULL};
@@ -8318,12 +11232,20 @@ int main(int argc, char **argv) {
             std::atomic<uint32_t> mixed_verified_log_count{0U};
 
             std::mutex mixed_debug_log_mu;
+            std::mutex mixed_shared_java_validation_mu;
             auto mixed_debug_log_line = [&](auto write_line) {
                 std::ostringstream oss;
                 write_line(oss);
                 std::lock_guard<std::mutex> lock(mixed_debug_log_mu);
                 std::cerr << oss.str() << "\n";
             };
+
+            if (requested_strict_workers != strict_workers) {
+                mixed_debug_log_line([&](std::ostream &os) {
+                    os << "[mixed] sparse strict gate active; validation workers capped "
+                       << fmt_i64(requested_strict_workers) << " -> " << fmt_i64(strict_workers);
+                });
+            }
 
             mixed_debug_log_line([&](std::ostream &os) {
                 os << "[mixed] placement pipeline started";
@@ -8334,7 +11256,11 @@ int main(int argc, char **argv) {
                    << " stage_a_mode=" << compiled_stage_a_mode_name(route_stage_a_mode)
                    << " gpu_stage_active=" << (use_gpu_stage_a ? "yes" : "no")
                    << " gpu_pipeline=" << (use_gpu_stage_a ? (use_async_gpu_pipeline ? "async" : "sync") : "off")
+                   << " gpu_async_slots=" << fmt_u64(gpu_async_slots_available)
+                   << " gpu_inflight_batches=" << fmt_u64(gpu_inflight_batches)
+                   << " placement_batch=" << fmt_u64(capped_batch_size)
                    << " queue_capacity=" << fmt_u64(args.mixed_queue_capacity)
+                   << " queue_batch=" << fmt_size(mixed_queue_batch_size)
                    << " strict_workers=" << fmt_i64(strict_workers);
             });
             if (use_gpu_stage_a) {
@@ -8392,8 +11318,6 @@ int main(int argc, char **argv) {
                 }
             };
 
-            std::mutex java_validation_mu;
-            std::mutex loot_validation_mu;
             mixed_debug_log_line([&](std::ostream &os) {
                 os << "[mixed] queue producer startup";
             });
@@ -8427,7 +11351,7 @@ int main(int argc, char **argv) {
                         if (!use_async_gpu_pipeline || async_remaining == 0ULL || cancel_mixed.load()) {
                             return false;
                         }
-                        if (pending_gpu_batches.size() >= 2U) {
+                        if (pending_gpu_batches.size() >= gpu_inflight_batches) {
                             return false;
                         }
                         const uint64_t submit_count = std::min<uint64_t>(async_remaining, capped_batch_size);
@@ -8453,14 +11377,18 @@ int main(int argc, char **argv) {
                         pending.start_seed = async_next_batch_start;
                         pending.count = submit_count;
                         pending_gpu_batches.push_back(pending);
+                        mixed_pending_gpu_batches.store(static_cast<uint32_t>(pending_gpu_batches.size()));
                         async_next_batch_start = (async_next_batch_start + submit_count) & JAVA_MASK;
                         async_remaining -= submit_count;
-                        next_async_slot ^= 1U;
+                        next_async_slot = gpu_inflight_batches == 0U
+                            ? 0U
+                            : ((next_async_slot + 1U) % gpu_inflight_batches);
                         return true;
                     };
                     if (use_async_gpu_pipeline) {
-                        submit_next_async_gpu_batch();
-                        submit_next_async_gpu_batch();
+                        while (pending_gpu_batches.size() < gpu_inflight_batches &&
+                               submit_next_async_gpu_batch()) {
+                        }
                     }
                     while (local_remaining > 0ULL && !cancel_mixed.load()) {
                         while (stdin_control.paused() && !cancel_mixed.load()) {
@@ -8474,6 +11402,7 @@ int main(int argc, char **argv) {
                             }
                             const PendingGpuBatch pending_gpu_batch = pending_gpu_batches.front();
                             pending_gpu_batches.pop_front();
+                            mixed_pending_gpu_batches.store(static_cast<uint32_t>(pending_gpu_batches.size()));
                             local_start = pending_gpu_batch.start_seed;
                             submit_count = pending_gpu_batch.count;
                             double batch_gpu_kernel_seconds = 0.0;
@@ -8487,6 +11416,9 @@ int main(int argc, char **argv) {
                             const double batch_gpu_seconds =
                                 std::max(0.0, batch_gpu_kernel_seconds) + std::max(0.0, batch_gpu_transfer_seconds);
                             mixed_placement_gpu_ns.fetch_add(static_cast<uint64_t>(batch_gpu_seconds * 1e9));
+                            mixed_gpu_kernel_ns.fetch_add(static_cast<uint64_t>(
+                                std::max(0.0, batch_gpu_kernel_seconds) * 1e9));
+                            mixed_gpu_batch_count.fetch_add(1ULL);
                             submit_next_async_gpu_batch();
                         } else {
                             const auto gpu_t0 = std::chrono::high_resolution_clock::now();
@@ -8498,7 +11430,12 @@ int main(int argc, char **argv) {
                                 survivors
                             );
                             add_elapsed_ns(mixed_placement_gpu_ns, gpu_t0);
+                            mixed_gpu_kernel_ns.fetch_add(static_cast<uint64_t>(
+                                std::max(0.0, std::chrono::duration<double>(
+                                    std::chrono::high_resolution_clock::now() - gpu_t0).count()) * 1e9));
+                            mixed_gpu_batch_count.fetch_add(1ULL);
                         }
+                        const auto host_gap_t0 = std::chrono::high_resolution_clock::now();
                         if (placement_batch_log_count < 8U) {
                             mixed_debug_log_line([&](std::ostream &os) {
                                 os << "[mixed] placement batch complete start=" << fmt_u64(local_start)
@@ -8509,13 +11446,14 @@ int main(int argc, char **argv) {
                         }
                         mixed_processed.fetch_add(submit_count);
                         mixed_placement_survivors.fetch_add(static_cast<uint64_t>(survivors.size()));
-                        if (args.mixed_survivor_cap > 0U && survivors.size() > args.mixed_survivor_cap) {
+                        if (!is_exact_policy(query_spec) &&
+                            args.mixed_survivor_cap > 0U && survivors.size() > args.mixed_survivor_cap) {
                             const uint64_t drop =
                                 static_cast<uint64_t>(survivors.size() - static_cast<size_t>(args.mixed_survivor_cap));
                             mixed_dropped_survivors.fetch_add(drop);
                             survivors.resize(args.mixed_survivor_cap);
                         }
-                        if (args.mixed_adaptive_throttling && !survivors.empty()) {
+                        if (!is_exact_policy(query_spec) && args.mixed_adaptive_throttling && !survivors.empty()) {
                             const double saturation = survivor_queue.saturation();
                             if (saturation >= 0.90) {
                                 ++mixed_throttle_events;
@@ -8557,21 +11495,20 @@ int main(int argc, char **argv) {
                                 }
                             }
 
-                            std::vector<SurvivorCandidate> batch;
-                            batch.reserve(survivors.size());
-                            for (uint64_t seed : survivors) {
-                                batch.push_back(SurvivorCandidate{seed & JAVA_MASK, 1U, 0U});
+                            for (uint64_t &seed : survivors) {
+                                seed &= JAVA_MASK;
                             }
-                            const size_t pushed_count = batch.size();
+                            const size_t pushed_count = survivors.size();
                             uint64_t queue_dropped = 0ULL;
                             uint64_t queue_full_events = 0ULL;
                             uint64_t queue_push_wait_ns = 0ULL;
                             if (!survivor_queue.try_push_batch(
-                                    std::move(batch),
+                                    std::move(survivors),
                                     cancel_mixed,
                                     queue_dropped,
                                     queue_full_events,
-                                    queue_push_wait_ns)) {
+                                    queue_push_wait_ns,
+                                    !is_exact_policy(query_spec))) {
                                 break;
                             }
                             if (queue_dropped > 0ULL) {
@@ -8594,38 +11531,70 @@ int main(int argc, char **argv) {
                             }
                         }
 
+                        add_elapsed_ns(mixed_gpu_host_gap_ns, host_gap_t0);
+
                         local_start = (local_start + submit_count) & JAVA_MASK;
                         local_remaining -= submit_count;
                     }
                     producer_done.store(true);
+                    mixed_pending_gpu_batches.store(0U);
                     survivor_queue.close();
                 } catch (...) {
                     producer_done.store(true);
+                    mixed_pending_gpu_batches.store(0U);
                     set_mixed_error(std::current_exception());
                 }
             });
 
+            const bool mixed_strict_input_is_post_stage_a =
+                use_gpu_stage_a &&
+                !gpu_prefilter_plan.constraints.empty() &&
+                gpu_prefilter_plan.constraints.size() == query_plan.constraints.size();
             std::vector<std::thread> workers;
             workers.reserve(static_cast<size_t>(strict_workers));
             for (int worker_index = 0; worker_index < strict_workers; ++worker_index) {
                 workers.emplace_back([&, worker_index]() {
                     (void)worker_index;
                     try {
-                        std::vector<SurvivorCandidate> batch;
-                        std::vector<uint64_t> seed_batch;
+                        std::vector<uint64_t> batch;
                         std::vector<uint64_t> valid;
                         std::vector<uint64_t> post_a;
                         std::vector<uint64_t> post_b;
                         std::vector<NativeQueryMatchOut> local_java_match_buffer;
                         std::unordered_set<std::string> local_java_skip_cache;
+                        std::vector<NativeQueryMatchOut> local_structure_settings_match_buffer;
+                        std::vector<StructureSettingsRequest> local_structure_settings_requests;
+                        std::vector<uint32_t> local_structure_settings_request_indices;
+                        std::vector<bool> local_structure_settings_results;
+                        std::vector<uint64_t> local_structure_settings_current;
+                        std::vector<uint64_t> local_structure_settings_next;
                         std::vector<NativeQueryMatchOut> local_loot_match_buffer;
                         std::unordered_map<std::string, std::unordered_map<std::string, int>> local_loot_roll_cache;
+                        std::vector<LootCheckRequest> local_loot_check_requests;
+                        std::vector<uint32_t> local_loot_check_seed_indices;
+                        std::vector<bool> local_loot_check_results;
+                        std::vector<uint64_t> local_loot_current;
+                        std::vector<uint64_t> local_loot_next;
                         if (java_cubiomes_validation_enabled) {
                             local_java_match_buffer.resize(initial_query_match_cap(query_plan.constraints));
+                        }
+                        if (structure_settings_enabled) {
+                            local_structure_settings_match_buffer.resize(initial_query_match_cap(query_plan.constraints));
                         }
                         if (loot_enabled) {
                             local_loot_match_buffer.resize(initial_query_match_cap(query_plan.constraints));
                         }
+                        std::unique_ptr<LootValidationServerClient> local_loot_client;
+                        auto worker_loot_client = [&]() -> LootValidationServerClient & {
+                            if (!local_loot_client) {
+                                local_loot_client.reset(new LootValidationServerClient());
+                                std::string loot_error;
+                                if (!local_loot_client->start(repo_root, loot_error)) {
+                                    throw std::runtime_error("Failed to start worker LootValidationServer: " + loot_error);
+                                }
+                            }
+                            return *local_loot_client;
+                        };
 
                         while (!cancel_mixed.load() && survivor_queue.pop_batch(batch)) {
                             if (batch.empty()) {
@@ -8639,32 +11608,36 @@ int main(int argc, char **argv) {
                                 });
                             }
                             mixed_strict_input.fetch_add(static_cast<uint64_t>(batch.size()));
-                            if (seed_batch.size() < batch.size()) {
-                                seed_batch.resize(batch.size());
-                            }
-                            for (size_t i = 0; i < batch.size(); ++i) {
-                                seed_batch[i] = batch[i].seed;
-                            }
-                            if (valid.size() < seed_batch.size()) {
-                                valid.resize(seed_batch.size());
+                            if (valid.size() < batch.size()) {
+                                valid.resize(batch.size());
                             }
                             uint32_t valid_count = 0U;
                             uint32_t mismatch_count = 0U;
                             uint32_t biome_reject_count = 0U;
                             uint32_t cap_pruned = 0U;
                             const auto strict_t0 = std::chrono::high_resolution_clock::now();
-                            const int rc = query_plan.validate_batch(
-                                seed_batch.data(),
-                                static_cast<uint32_t>(std::min<size_t>(
-                                    seed_batch.size(),
-                                    static_cast<size_t>(std::numeric_limits<uint32_t>::max()))),
-                                1U,
-                                valid.data(),
-                                &valid_count,
-                                &mismatch_count,
-                                &biome_reject_count,
-                                &cap_pruned
-                            );
+                            const uint32_t strict_input_count = static_cast<uint32_t>(std::min<size_t>(
+                                batch.size(),
+                                static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+                            const int rc = mixed_strict_input_is_post_stage_a
+                                ? query_plan.validate_batch_post_stage_a(
+                                      batch.data(),
+                                      strict_input_count,
+                                      1U,
+                                      valid.data(),
+                                      &valid_count,
+                                      &mismatch_count,
+                                      &biome_reject_count,
+                                      &cap_pruned)
+                                : query_plan.validate_batch(
+                                      batch.data(),
+                                      strict_input_count,
+                                      1U,
+                                      valid.data(),
+                                      &valid_count,
+                                      &mismatch_count,
+                                      &biome_reject_count,
+                                      &cap_pruned);
                             add_elapsed_ns(mixed_strict_ns, strict_t0);
                             if (rc != 0) {
                                 std::ostringstream oss;
@@ -8682,15 +11655,14 @@ int main(int argc, char **argv) {
                                 uint32_t java_valid_count = 0U;
                                 uint32_t java_reject_count = 0U;
                                 const auto java_t0 = std::chrono::high_resolution_clock::now();
-                                {
-                                    std::lock_guard<std::mutex> lock(java_validation_mu);
+                                auto validate_java_outputs = [&](LootValidationServerClient &client) {
                                     for (uint32_t i = 0; i < valid_count; ++i) {
                                         if (validate_java_structure_matches_for_seed(
                                                 valid[i],
                                                 prepared_java_structure_filters,
                                                 loot_version_token,
                                                 query_plan,
-                                                loot_client,
+                                                client,
                                                 local_java_match_buffer,
                                                 local_java_skip_cache)) {
                                             post_a[java_valid_count++] = valid[i];
@@ -8698,6 +11670,12 @@ int main(int argc, char **argv) {
                                             ++java_reject_count;
                                         }
                                     }
+                                };
+                                if (!loot_enabled && !structure_settings_enabled) {
+                                    std::lock_guard<std::mutex> java_lock(mixed_shared_java_validation_mu);
+                                    validate_java_outputs(loot_client);
+                                } else {
+                                    validate_java_outputs(worker_loot_client());
                                 }
                                 add_elapsed_ns(mixed_java_ns, java_t0);
                                 mixed_java_rejected.fetch_add(java_reject_count);
@@ -8705,6 +11683,34 @@ int main(int argc, char **argv) {
                                     std::copy_n(post_a.data(), java_valid_count, valid.data());
                                 }
                                 valid_count = java_valid_count;
+                            }
+
+                            if (structure_settings_enabled && valid_count > 0U) {
+                                if (post_a.size() < valid_count) {
+                                    post_a.resize(valid_count);
+                                }
+                                const auto settings_t0 = std::chrono::high_resolution_clock::now();
+                                LootValidationServerClient &client = worker_loot_client();
+                                const uint32_t settings_valid_count = validate_structure_settings_for_seed_batch(
+                                    valid.data(),
+                                    valid_count,
+                                    prepared_structure_settings_filters,
+                                    loot_version_token,
+                                    query_plan,
+                                    client,
+                                    local_structure_settings_match_buffer,
+                                    local_structure_settings_requests,
+                                    local_structure_settings_request_indices,
+                                    local_structure_settings_results,
+                                    local_structure_settings_current,
+                                    local_structure_settings_next,
+                                    post_a.data());
+                                add_elapsed_ns(mixed_java_ns, settings_t0);
+                                mixed_java_rejected.fetch_add(valid_count - settings_valid_count);
+                                if (settings_valid_count > 0U) {
+                                    std::copy_n(post_a.data(), settings_valid_count, valid.data());
+                                }
+                                valid_count = settings_valid_count;
                             }
 
                             if (sculpt_enabled && valid_count > 0U) {
@@ -8744,25 +11750,24 @@ int main(int argc, char **argv) {
                                     post_b.resize(valid_count);
                                 }
                                 uint32_t loot_valid_count = 0U;
-                                uint32_t loot_reject_count = 0U;
                                 const auto loot_t0 = std::chrono::high_resolution_clock::now();
-                                {
-                                    std::lock_guard<std::mutex> lock(loot_validation_mu);
-                                    for (uint32_t i = 0; i < valid_count; ++i) {
-                                        if (validate_loot_filters_for_seed(
-                                                valid[i],
-                                                prepared_loot_filters,
-                                                loot_version_token,
-                                                query_plan,
-                                                loot_client,
-                                                local_loot_match_buffer,
-                                                local_loot_roll_cache)) {
-                                            post_b[loot_valid_count++] = valid[i];
-                                        } else {
-                                            ++loot_reject_count;
-                                        }
-                                    }
-                                }
+                                LootValidationServerClient &client = worker_loot_client();
+                                loot_valid_count = validate_loot_filters_for_seed_batch(
+                                    valid.data(),
+                                    valid_count,
+                                    prepared_loot_filters,
+                                    loot_version_token,
+                                    query_plan,
+                                    client,
+                                    local_loot_match_buffer,
+                                    local_loot_check_requests,
+                                    local_loot_check_seed_indices,
+                                    local_loot_check_results,
+                                    local_loot_current,
+                                    local_loot_next,
+                                    post_b.data());
+                                const uint32_t loot_reject_count = valid_count - loot_valid_count;
+                                (void)local_loot_roll_cache;
                                 add_elapsed_ns(mixed_loot_ns, loot_t0);
                                 mixed_loot_rejected.fetch_add(loot_reject_count);
                                 if (loot_valid_count > 0U) {
@@ -8797,6 +11802,9 @@ int main(int argc, char **argv) {
             uint64_t last_verified_sample = 0ULL;
             uint64_t last_queue_push_wait_ns_sample = 0ULL;
             uint64_t last_placement_gpu_ns_sample = 0ULL;
+            uint64_t last_gpu_kernel_ns_sample = 0ULL;
+            uint64_t last_gpu_host_gap_ns_sample = 0ULL;
+            uint64_t last_gpu_batch_count_sample = 0ULL;
             auto last_mixed_sample = std::chrono::high_resolution_clock::now();
 
             while (true) {
@@ -8816,6 +11824,13 @@ int main(int argc, char **argv) {
                 const uint64_t verified_now = mixed_verified.load();
                 const uint64_t queue_push_wait_ns_now = mixed_queue_push_wait_ns.load();
                 const uint64_t placement_gpu_ns_now = mixed_placement_gpu_ns.load();
+                const uint64_t gpu_kernel_ns_now = mixed_gpu_kernel_ns.load();
+                const uint64_t gpu_host_gap_ns_now = mixed_gpu_host_gap_ns.load();
+                const uint64_t gpu_batch_count_now = mixed_gpu_batch_count.load();
+                const uint64_t gpu_batch_delta =
+                    gpu_batch_count_now > last_gpu_batch_count_sample
+                        ? gpu_batch_count_now - last_gpu_batch_count_sample
+                        : 0ULL;
                 telemetry_placement_rate_sps =
                     static_cast<double>(processed_now - last_processed_sample) / sample_dt;
                 telemetry_placement_survivors_per_sec =
@@ -8831,6 +11846,22 @@ int main(int argc, char **argv) {
                     (static_cast<double>(placement_gpu_ns_now - last_placement_gpu_ns_sample) /
                      (sample_dt * 1e9)) *
                         100.0);
+                telemetry_gpu_batch_kernel_ms = gpu_batch_delta > 0ULL
+                    ? (static_cast<double>(gpu_kernel_ns_now - last_gpu_kernel_ns_sample) /
+                       static_cast<double>(gpu_batch_delta)) /
+                          1e6
+                    : 0.0;
+                telemetry_gpu_host_gap_ms = gpu_batch_delta > 0ULL
+                    ? (static_cast<double>(gpu_host_gap_ns_now - last_gpu_host_gap_ns_sample) /
+                       static_cast<double>(gpu_batch_delta)) /
+                          1e6
+                    : 0.0;
+                telemetry_gpu_pipeline_fill_percent =
+                    gpu_inflight_batches == 0U
+                        ? 0.0
+                        : (static_cast<double>(mixed_pending_gpu_batches.load()) /
+                           static_cast<double>(gpu_inflight_batches)) *
+                              100.0;
 
                 telemetry_queue_size = survivor_queue.size();
                 telemetry_queue_capacity = survivor_queue.capacity();
@@ -8870,6 +11901,9 @@ int main(int argc, char **argv) {
                     last_verified_sample = verified_now;
                     last_queue_push_wait_ns_sample = queue_push_wait_ns_now;
                     last_placement_gpu_ns_sample = placement_gpu_ns_now;
+                    last_gpu_kernel_ns_sample = gpu_kernel_ns_now;
+                    last_gpu_host_gap_ns_sample = gpu_host_gap_ns_now;
+                    last_gpu_batch_count_sample = gpu_batch_count_now;
                     last_mixed_sample = now;
                 }
                 if (done && emitted_progress) {
@@ -8919,12 +11953,11 @@ int main(int argc, char **argv) {
             total_loot_seconds = static_cast<double>(mixed_loot_ns.load()) / 1e9;
         } else {
         struct PendingGpuBatch {
-            bool active = false;
             uint32_t slot_id = 0U;
             uint64_t start_seed = 0ULL;
             uint64_t count = 0ULL;
         };
-        PendingGpuBatch pending_gpu_batch{};
+        std::deque<PendingGpuBatch> pending_gpu_batches;
         uint32_t next_async_slot = 0U;
         uint64_t async_next_batch_start = batch_start;
         uint64_t async_remaining = remaining;
@@ -8932,8 +11965,8 @@ int main(int argc, char **argv) {
             if (!use_async_gpu_pipeline || !use_gpu_stage_a || async_remaining == 0ULL) {
                 return false;
             }
-            if (pending_gpu_batch.active) {
-                throw std::runtime_error("Async GPU pipeline attempted to submit while a slot is still pending.");
+            if (pending_gpu_batches.size() >= gpu_inflight_batches) {
+                return false;
             }
             const uint64_t submit_count = std::min<uint64_t>(async_remaining, capped_batch_size);
             const uint32_t slot_id = next_async_slot;
@@ -8944,17 +11977,18 @@ int main(int argc, char **argv) {
                 gpu_prefilter_plan.regions,
                 gpu_prefilter_plan.constraints
             );
-            pending_gpu_batch.active = true;
-            pending_gpu_batch.slot_id = slot_id;
-            pending_gpu_batch.start_seed = async_next_batch_start;
-            pending_gpu_batch.count = submit_count;
+            pending_gpu_batches.push_back(PendingGpuBatch{slot_id, async_next_batch_start, submit_count});
             async_next_batch_start += submit_count;
             async_remaining -= submit_count;
-            next_async_slot ^= 1U;
+            next_async_slot = gpu_inflight_batches == 0U
+                ? 0U
+                : ((next_async_slot + 1U) % gpu_inflight_batches);
             return true;
         };
         if (use_async_gpu_pipeline) {
-            submit_next_async_gpu_batch();
+            while (pending_gpu_batches.size() < gpu_inflight_batches &&
+                   submit_next_async_gpu_batch()) {
+            }
         }
 
         while (remaining > 0) {
@@ -8974,9 +12008,11 @@ int main(int argc, char **argv) {
             double batch_gpu_transfer_compaction_seconds = 0.0;
             if (use_gpu_stage_a) {
                 if (use_async_gpu_pipeline) {
-                    if (!pending_gpu_batch.active && !submit_next_async_gpu_batch()) {
+                    if (pending_gpu_batches.empty() && !submit_next_async_gpu_batch()) {
                         throw std::runtime_error("Async GPU pipeline had no pending batch to collect.");
                     }
+                    const PendingGpuBatch pending_gpu_batch = pending_gpu_batches.front();
+                    pending_gpu_batches.pop_front();
                     if (pending_gpu_batch.start_seed != batch_start || pending_gpu_batch.count != this_batch) {
                         std::ostringstream oss;
                         oss << "Async GPU pipeline batch order mismatch: expected start=" << fmt_seed(batch_start)
@@ -8991,9 +12027,10 @@ int main(int argc, char **argv) {
                         batch_gpu_kernel_seconds,
                         batch_gpu_transfer_compaction_seconds
                     );
-                    pending_gpu_batch.active = false;
                     batch_gpu_seconds = batch_gpu_kernel_seconds + batch_gpu_transfer_compaction_seconds;
-                    submit_next_async_gpu_batch();
+                    while (pending_gpu_batches.size() < gpu_inflight_batches &&
+                           submit_next_async_gpu_batch()) {
+                    }
                 } else {
                     const auto gpu_t0 = std::chrono::high_resolution_clock::now();
                     gpu_backend.filter_multi_into(
@@ -9249,6 +12286,34 @@ int main(int argc, char **argv) {
                 }
                 valid_count = java_valid_count;
                 java_worldgen_rejected += java_reject_count;
+            }
+
+            if (structure_settings_enabled && valid_count > 0U) {
+                if (structure_settings_out.size() < valid_count) {
+                    structure_settings_out.resize(valid_count);
+                }
+                const auto settings_t0 = std::chrono::high_resolution_clock::now();
+                const uint32_t settings_valid_count = validate_structure_settings_for_seed_batch(
+                    valid_out.data(),
+                    valid_count,
+                    prepared_structure_settings_filters,
+                    loot_version_token,
+                    query_plan,
+                    loot_client,
+                    structure_settings_match_buffer,
+                    structure_settings_requests,
+                    structure_settings_request_indices,
+                    structure_settings_results,
+                    structure_settings_current,
+                    structure_settings_next,
+                    structure_settings_out.data());
+                total_java_worldgen_seconds +=
+                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - settings_t0).count();
+                if (settings_valid_count > 0U) {
+                    std::copy_n(structure_settings_out.data(), settings_valid_count, valid_out.data());
+                }
+                java_worldgen_rejected += valid_count - settings_valid_count;
+                valid_count = settings_valid_count;
             }
 
             if (sculpt_enabled && valid_count > 0U) {
