@@ -1088,6 +1088,27 @@ void buildUi(HWND hwnd) {
     g_defaultBtn = createButton(hwnd, L"Default",   ID_DEFAULT_BTN,
                                 X_PANEL + W_PANEL - 110, Y_PATH_PANEL + 56, 95, 32);
 
+    // GPU backend selector. Keep this in the Toolchain header instead of the
+    // bottom action row; the action row does not have enough width for three
+    // secondary buttons plus a labeled combo box.
+    g_backendLabel = CreateWindowExW(0, L"STATIC", L"GPU backend:",
+        WS_CHILD | WS_VISIBLE | SS_RIGHT,
+        X_PANEL + W_PANEL - 270, Y_TOOLS_PANEL + 15, 92, 18,
+        hwnd, nullptr, nullptr, nullptr);
+    SendMessageW(g_backendLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontSmall), TRUE);
+    g_backendCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+        X_PANEL + W_PANEL - 168, Y_TOOLS_PANEL + 10, 148, 200,
+        hwnd, reinterpret_cast<HMENU>((INT_PTR)ID_BACKEND_COMBO), nullptr, nullptr);
+    SendMessageW(g_backendCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
+    SetWindowTheme(g_backendCombo, L"DarkMode_CFD", nullptr);
+    SendMessageW(g_backendCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), 24);
+    SendMessageW(g_backendCombo, CB_SETITEMHEIGHT, 0, 24);
+    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Both"));
+    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CUDA only"));
+    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"OpenCL only"));
+    SendMessageW(g_backendCombo, CB_SETCURSEL, BACKEND_BOTH, 0);
+
     // ---- Toolchain rows (text + status + install button) ----
     int rowY = Y_TOOLS_PANEL + 56;
     for (int i = 0; i < kToolCount; ++i) {
@@ -1126,27 +1147,6 @@ void buildUi(HWND hwnd) {
         X_PANEL + 212, Y_ACTION_BAR, 110, H_ACTION, false, false, C_BG);
     g_openBtn    = createButton(hwnd, L"Open Folder", ID_OPEN_BTN,
         X_PANEL + 330, Y_ACTION_BAR, 130, H_ACTION, false, false, C_BG);
-
-    // GPU backend selector. Sits between Open Folder and Close. Default to
-    // Both so existing users get the same behaviour with no extra clicks.
-    const int comboY = Y_ACTION_BAR + (H_ACTION - 24) / 2;
-    g_backendLabel = CreateWindowExW(0, L"STATIC", L"GPU backend:",
-        WS_CHILD | WS_VISIBLE | SS_RIGHT,
-        X_PANEL + 470, comboY + 4, 88, 18,
-        hwnd, nullptr, nullptr, nullptr);
-    SendMessageW(g_backendLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontSmall), TRUE);
-    g_backendCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-        X_PANEL + 562, comboY, 100, 200,
-        hwnd, reinterpret_cast<HMENU>((INT_PTR)ID_BACKEND_COMBO), nullptr, nullptr);
-    SendMessageW(g_backendCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
-    SetWindowTheme(g_backendCombo, L"DarkMode_CFD", nullptr);
-    SendMessageW(g_backendCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), 24);
-    SendMessageW(g_backendCombo, CB_SETITEMHEIGHT, 0, 24);
-    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Both"));
-    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CUDA only"));
-    SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"OpenCL only"));
-    SendMessageW(g_backendCombo, CB_SETCURSEL, BACKEND_BOTH, 0);
 
     g_closeBtn   = createButton(hwnd, L"Close", ID_CLOSE_BTN,
         X_PANEL + W_PANEL - 110, Y_ACTION_BAR, 110, H_ACTION, false, false, C_BG);
