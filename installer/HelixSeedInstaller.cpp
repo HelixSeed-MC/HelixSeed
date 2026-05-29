@@ -346,6 +346,43 @@ void drawCustomButton(LPDRAWITEMSTRUCT dis) {
     drawCenteredText(dis->hDC, dis->rcItem, buf, text, g_fontBody);
 }
 
+void drawCustomCombo(LPDRAWITEMSTRUCT dis) {
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    const bool selected = (dis->itemState & ODS_SELECTED) != 0;
+    const bool editPart = (dis->itemState & ODS_COMBOBOXEDIT) != 0;
+    const bool focused  = (dis->itemState & ODS_FOCUS) != 0;
+
+    COLORREF fill = C_INPUT_BG;
+    if (!editPart && selected) fill = C_PANEL_HIGH;
+    COLORREF text = disabled ? C_SUBTLE : C_TEXT;
+    COLORREF border = focused && editPart ? RGB(78, 78, 84) : C_LINE;
+
+    fillSolid(dis->hDC, dis->rcItem, fill);
+
+    wchar_t buf[128] = {};
+    if (dis->itemID != static_cast<UINT>(-1)) {
+        SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(buf));
+    } else {
+        GetWindowTextW(dis->hwndItem, buf, 128);
+    }
+
+    RECT textRect = dis->rcItem;
+    textRect.left += 8;
+    textRect.right -= editPart ? 22 : 8;
+    drawLeftText(dis->hDC, textRect, buf, text, g_fontBody);
+
+    if (editPart) {
+        HPEN pen = CreatePen(PS_SOLID, 1, border);
+        HGDIOBJ op = SelectObject(dis->hDC, pen);
+        HGDIOBJ ob = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+        Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+                  dis->rcItem.right, dis->rcItem.bottom);
+        SelectObject(dis->hDC, op);
+        SelectObject(dis->hDC, ob);
+        DeleteObject(pen);
+    }
+}
+
 LRESULT CALLBACK ButtonSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
                                     UINT_PTR /*id*/, DWORD_PTR /*ref*/) {
     ButtonState* st = findButtonState(h);
@@ -1099,10 +1136,13 @@ void buildUi(HWND hwnd) {
         hwnd, nullptr, nullptr, nullptr);
     SendMessageW(g_backendLabel, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontSmall), TRUE);
     g_backendCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
         X_PANEL + 562, comboY, 100, 200,
         hwnd, reinterpret_cast<HMENU>((INT_PTR)ID_BACKEND_COMBO), nullptr, nullptr);
     SendMessageW(g_backendCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
+    SetWindowTheme(g_backendCombo, L"DarkMode_CFD", nullptr);
+    SendMessageW(g_backendCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), 24);
+    SendMessageW(g_backendCombo, CB_SETITEMHEIGHT, 0, 24);
     SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Both"));
     SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CUDA only"));
     SendMessageW(g_backendCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"OpenCL only"));
@@ -1239,6 +1279,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 drawCustomButton(dis);
                 return TRUE;
             }
+            if (dis->CtlType == ODT_COMBOBOX && dis->CtlID == ID_BACKEND_COMBO) {
+                drawCustomCombo(dis);
+                return TRUE;
+            }
+            break;
+        }
+
+        case WM_MEASUREITEM: {
+            LPMEASUREITEMSTRUCT mis = reinterpret_cast<LPMEASUREITEMSTRUCT>(lp);
+            if (mis->CtlType == ODT_COMBOBOX && mis->CtlID == ID_BACKEND_COMBO) {
+                mis->itemHeight = 24;
+                return TRUE;
+            }
             break;
         }
 
@@ -1270,12 +1323,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetBkColor(hdc, C_INPUT_BG);
                 return reinterpret_cast<LRESULT>(g_brushInput);
             }
+            if (ctl == g_backendCombo) {
+                SetTextColor(hdc, C_TEXT);
+                SetBkColor(hdc, C_INPUT_BG);
+                return reinterpret_cast<LRESULT>(g_brushInput);
+            }
             // Default (panel-coloured)
             SetTextColor(hdc, C_TEXT);
             return reinterpret_cast<LRESULT>(g_brushPanel);
         }
 
         case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wp);
+            SetTextColor(hdc, C_TEXT);
+            SetBkColor(hdc, C_INPUT_BG);
+            SetBkMode(hdc, OPAQUE);
+            return reinterpret_cast<LRESULT>(g_brushInput);
+        }
+
+        case WM_CTLCOLORLISTBOX: {
             HDC hdc = reinterpret_cast<HDC>(wp);
             SetTextColor(hdc, C_TEXT);
             SetBkColor(hdc, C_INPUT_BG);
