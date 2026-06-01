@@ -32,6 +32,7 @@ extern "C" int gpu_filter_multi_checked_impl(
     uint32_t *hit_count);
 extern "C" int gpu_filter_double_buffer_available_impl(void);
 extern "C" uint32_t gpu_filter_async_max_slots_impl(void);
+extern "C" int gpu_filter_async_reset_impl(void);
 extern "C" int gpu_filter_multi_submit_impl(
     uint32_t slot_id,
     uint64_t start_seed,
@@ -40,6 +41,15 @@ extern "C" int gpu_filter_multi_submit_impl(
     uint32_t region_count,
     ConstraintDesc *constraints,
     uint32_t constraint_count);
+extern "C" int gpu_filter_multi_submit_limited_impl(
+    uint32_t slot_id,
+    uint64_t start_seed,
+    uint64_t count,
+    RegionTerm *regions,
+    uint32_t region_count,
+    ConstraintDesc *constraints,
+    uint32_t constraint_count,
+    uint64_t output_capacity);
 extern "C" int gpu_filter_multi_collect_impl(
     uint32_t slot_id,
     uint64_t *out_buffer,
@@ -126,6 +136,10 @@ extern "C" GPU_FILTER_API uint32_t gpu_filter_async_max_slots(void) {
     return gpu_filter_async_max_slots_impl();
 }
 
+extern "C" GPU_FILTER_API int gpu_filter_async_reset(void) {
+    return gpu_filter_async_reset_impl();
+}
+
 extern "C" GPU_FILTER_API int gpu_filter_multi_submit(
     uint32_t slot_id,
     uint64_t start_seed,
@@ -142,6 +156,26 @@ extern "C" GPU_FILTER_API int gpu_filter_multi_submit(
         region_count,
         constraints,
         constraint_count);
+}
+
+extern "C" GPU_FILTER_API int gpu_filter_multi_submit_limited(
+    uint32_t slot_id,
+    uint64_t start_seed,
+    uint64_t count,
+    RegionTerm *regions,
+    uint32_t region_count,
+    ConstraintDesc *constraints,
+    uint32_t constraint_count,
+    uint64_t output_capacity) {
+    return gpu_filter_multi_submit_limited_impl(
+        slot_id,
+        start_seed,
+        count,
+        regions,
+        region_count,
+        constraints,
+        constraint_count,
+        output_capacity);
 }
 
 extern "C" GPU_FILTER_API int gpu_filter_multi_collect(

@@ -4456,6 +4456,13 @@ static SeedStatus evaluate_query_seed_stage_c_biomes_compiled(
         records->resize(plan.prepared_filters.size());
     }
     std::vector<uint8_t> filter_satisfied(plan.prepared_filters.size(), 0U);
+    if (records == nullptr && plan.has_early_fixed_biome_filters) {
+        for (uint32_t i = 0; i < plan.prepared_filters.size(); ++i) {
+            if (biome_filter_is_cheap_exact_early_anchor(plan.prepared_filters[i])) {
+                filter_satisfied[i] = 1U;
+            }
+        }
+    }
     void *g_world = nullptr;
     auto ensure_world = [&](int32_t dimension) -> void * {
         g_world = ensure_generator(api, st, mc_version, seed, dimension);
@@ -4463,6 +4470,19 @@ static SeedStatus evaluate_query_seed_stage_c_biomes_compiled(
     };
 
     for (const CompiledBiomeGroup &group : plan.stage_c_biome_groups) {
+        bool group_already_satisfied = true;
+        for (const CompiledBiomeGroupFilter &filter_ref : group.filters) {
+            if (filter_ref.filter_index < filter_satisfied.size() &&
+                filter_satisfied[filter_ref.filter_index] != 0U) {
+                continue;
+            }
+            group_already_satisfied = false;
+            break;
+        }
+        if (group_already_satisfied) {
+            continue;
+        }
+
         auto process_anchor = [&](int32_t ax, int32_t az) {
             return evaluate_compiled_biome_group_at_anchor(
                 api,
@@ -4815,6 +4835,7 @@ static int validate_query_batch_with_plan(
     constexpr uint32_t kSelectivityWarmupSeeds = 4096U;
     constexpr uint64_t kSelectivityMinEvalSamples = 32ULL;
     constexpr uint32_t kDynamicChunkSize = 512U;
+    constexpr bool kCollectDetailedStageTiming = false;
     const uint32_t constraint_count = static_cast<uint32_t>(plan.constraints.size());
     CompiledBatchStatsAccumulator batch_stats(constraint_count);
     batch_stats.input_seed_count = seed_count;
@@ -4828,7 +4849,10 @@ static int validate_query_batch_with_plan(
         if (!plan.has_early_fixed_biome_filters) {
             return SeedStatus::valid;
         }
-        const auto stage_c_t0 = std::chrono::high_resolution_clock::now();
+        std::chrono::high_resolution_clock::time_point stage_c_t0{};
+        if (kCollectDetailedStageTiming) {
+            stage_c_t0 = std::chrono::high_resolution_clock::now();
+        }
         const SeedStatus status = evaluate_query_seed_early_fixed_biomes_compiled(
             api_copy,
             cubi_state,
@@ -4837,8 +4861,10 @@ static int validate_query_batch_with_plan(
             cubi_mc_version,
             plan
         );
-        stats.cpu_stage_c_seconds +=
-            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0).count();
+        if (kCollectDetailedStageTiming) {
+            stats.cpu_stage_c_seconds +=
+                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0).count();
+        }
         return status;
     };
     const uint32_t warmup_seed_count =
@@ -4861,7 +4887,10 @@ static int validate_query_batch_with_plan(
         for (uint32_t i = 0; i < warmup_seed_count; ++i) {
             if (!skip_stage_a) {
                 uint32_t stage_a_cap_pruned = 0U;
-                const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
+                std::chrono::high_resolution_clock::time_point stage_a_t0{};
+                if (kCollectDetailedStageTiming) {
+                    stage_a_t0 = std::chrono::high_resolution_clock::now();
+                }
                 const SeedStatus stage_a_status = evaluate_query_seed_stage_a_compiled(
                     warmup_scratch,
                     seeds[i],
@@ -4869,8 +4898,10 @@ static int validate_query_batch_with_plan(
                     stage_a_cap_pruned,
                     batch_stats.per_constraint_stage_a5_rejects.data()
                 );
-                batch_stats.cpu_stage_a5_seconds +=
-                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
+                if (kCollectDetailedStageTiming) {
+                    batch_stats.cpu_stage_a5_seconds +=
+                        std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
+                }
                 warmup_result.cap_pruned += stage_a_cap_pruned;
                 if (stage_a_status != SeedStatus::valid) {
                     ++batch_stats.stage_a5_reject_count;
@@ -4889,7 +4920,10 @@ static int validate_query_batch_with_plan(
             }
 
             uint32_t stage_b_cap_pruned = 0U;
-            const auto stage_b_t0 = std::chrono::high_resolution_clock::now();
+            std::chrono::high_resolution_clock::time_point stage_b_t0{};
+            if (kCollectDetailedStageTiming) {
+                stage_b_t0 = std::chrono::high_resolution_clock::now();
+            }
             SeedStatus status = evaluate_query_seed_stage_b_constraints_compiled<true>(
                 api_copy,
                 warmup_cubi_state,
@@ -4904,8 +4938,10 @@ static int validate_query_batch_with_plan(
                 static_cast<uint32_t>(warmup_stats.size()),
                 batch_stats.per_constraint_stage_b_exact_rejects.data()
             );
-            batch_stats.cpu_stage_b_seconds +=
-                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_b_t0).count();
+            if (kCollectDetailedStageTiming) {
+                batch_stats.cpu_stage_b_seconds +=
+                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_b_t0).count();
+            }
             warmup_result.cap_pruned += stage_b_cap_pruned;
             if (status != SeedStatus::valid) {
                 ++batch_stats.stage_b_exact_reject_count;
@@ -4913,7 +4949,10 @@ static int validate_query_batch_with_plan(
                 ++batch_stats.stage_b_structure_survivor_count;
             }
             if (status == SeedStatus::valid) {
-                const auto stage_c_t0 = std::chrono::high_resolution_clock::now();
+                std::chrono::high_resolution_clock::time_point stage_c_t0{};
+                if (kCollectDetailedStageTiming) {
+                    stage_c_t0 = std::chrono::high_resolution_clock::now();
+                }
                 status = evaluate_query_seed_stage_c_biomes_compiled(
                     api_copy,
                     warmup_cubi_state,
@@ -4923,8 +4962,10 @@ static int validate_query_batch_with_plan(
                     plan,
                     nullptr
                 );
-                batch_stats.cpu_stage_c_seconds +=
-                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0).count();
+                if (kCollectDetailedStageTiming) {
+                    batch_stats.cpu_stage_c_seconds +=
+                        std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0).count();
+                }
             }
             if (status == SeedStatus::valid) {
                 ++batch_stats.stage_c_biome_survivor_count;
@@ -4983,7 +5024,10 @@ static int validate_query_batch_with_plan(
                     const uint32_t seed_idx = warmup_seed_count + i;
                     if (!skip_stage_a) {
                         uint32_t stage_a_cap_pruned = 0U;
-                        const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
+                        std::chrono::high_resolution_clock::time_point stage_a_t0{};
+                        if (kCollectDetailedStageTiming) {
+                            stage_a_t0 = std::chrono::high_resolution_clock::now();
+                        }
                         const SeedStatus stage_a_status =
                             evaluate_query_seed_stage_a_compiled(
                                 scratch,
@@ -4991,8 +5035,10 @@ static int validate_query_batch_with_plan(
                                 plan,
                                 stage_a_cap_pruned,
                                 local_stats.per_constraint_stage_a5_rejects.data());
-                        local_stats.cpu_stage_a5_seconds +=
-                            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
+                        if (kCollectDetailedStageTiming) {
+                            local_stats.cpu_stage_a5_seconds +=
+                                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0).count();
+                        }
                         out.cap_pruned += stage_a_cap_pruned;
                         if (stage_a_status != SeedStatus::valid) {
                             ++local_stats.stage_a5_reject_count;
@@ -5009,7 +5055,10 @@ static int validate_query_batch_with_plan(
                         continue;
                     }
                     uint32_t stage_b_cap_pruned = 0U;
-                    const auto stage_b_t0 = std::chrono::high_resolution_clock::now();
+                    std::chrono::high_resolution_clock::time_point stage_b_t0{};
+                    if (kCollectDetailedStageTiming) {
+                        stage_b_t0 = std::chrono::high_resolution_clock::now();
+                    }
                     SeedStatus status = evaluate_query_seed_stage_b_constraints_compiled<false>(
                         api_copy,
                         cubi_state,
@@ -5024,8 +5073,10 @@ static int validate_query_batch_with_plan(
                         0U,
                         local_stats.per_constraint_stage_b_exact_rejects.data()
                     );
-                    local_stats.cpu_stage_b_seconds +=
-                        std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_b_t0).count();
+                    if (kCollectDetailedStageTiming) {
+                        local_stats.cpu_stage_b_seconds +=
+                            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_b_t0).count();
+                    }
                     out.cap_pruned += stage_b_cap_pruned;
                     if (status != SeedStatus::valid) {
                         ++local_stats.stage_b_exact_reject_count;
@@ -5033,7 +5084,10 @@ static int validate_query_batch_with_plan(
                         ++local_stats.stage_b_structure_survivor_count;
                     }
                     if (status == SeedStatus::valid) {
-                        const auto stage_c_t0 = std::chrono::high_resolution_clock::now();
+                        std::chrono::high_resolution_clock::time_point stage_c_t0{};
+                        if (kCollectDetailedStageTiming) {
+                            stage_c_t0 = std::chrono::high_resolution_clock::now();
+                        }
                         status = evaluate_query_seed_stage_c_biomes_compiled(
                             api_copy,
                             cubi_state,
@@ -5043,9 +5097,11 @@ static int validate_query_batch_with_plan(
                             plan,
                             nullptr
                         );
-                        local_stats.cpu_stage_c_seconds +=
-                            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0)
-                                .count();
+                        if (kCollectDetailedStageTiming) {
+                            local_stats.cpu_stage_c_seconds +=
+                                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_c_t0)
+                                    .count();
+                        }
                     }
                     if (status == SeedStatus::valid) {
                         ++local_stats.stage_c_biome_survivor_count;
@@ -5089,7 +5145,10 @@ static int validate_query_batch_with_plan(
                             const uint32_t seed_idx = warmup_seed_count + i;
                             if (!skip_stage_a) {
                                 uint32_t stage_a_cap_pruned = 0U;
-                                const auto stage_a_t0 = std::chrono::high_resolution_clock::now();
+                                std::chrono::high_resolution_clock::time_point stage_a_t0{};
+                                if (kCollectDetailedStageTiming) {
+                                    stage_a_t0 = std::chrono::high_resolution_clock::now();
+                                }
                                 const SeedStatus stage_a_status =
                                     evaluate_query_seed_stage_a_compiled(
                                         scratch,
@@ -5097,9 +5156,11 @@ static int validate_query_batch_with_plan(
                                         plan,
                                         stage_a_cap_pruned,
                                         local_stats.per_constraint_stage_a5_rejects.data());
-                                local_stats.cpu_stage_a5_seconds +=
-                                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0)
-                                        .count();
+                                if (kCollectDetailedStageTiming) {
+                                    local_stats.cpu_stage_a5_seconds +=
+                                        std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_a_t0)
+                                            .count();
+                                }
                                 out.cap_pruned += stage_a_cap_pruned;
                                 if (stage_a_status != SeedStatus::valid) {
                                     ++local_stats.stage_a5_reject_count;
@@ -5116,7 +5177,10 @@ static int validate_query_batch_with_plan(
                                 continue;
                             }
                             uint32_t stage_b_cap_pruned = 0U;
-                            const auto stage_b_t0 = std::chrono::high_resolution_clock::now();
+                            std::chrono::high_resolution_clock::time_point stage_b_t0{};
+                            if (kCollectDetailedStageTiming) {
+                                stage_b_t0 = std::chrono::high_resolution_clock::now();
+                            }
                             SeedStatus status = evaluate_query_seed_stage_b_constraints_compiled<false>(
                                 api_copy,
                                 cubi_state,
@@ -5131,9 +5195,11 @@ static int validate_query_batch_with_plan(
                                 0U,
                                 local_stats.per_constraint_stage_b_exact_rejects.data()
                             );
-                            local_stats.cpu_stage_b_seconds +=
-                                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_b_t0)
-                                    .count();
+                            if (kCollectDetailedStageTiming) {
+                                local_stats.cpu_stage_b_seconds +=
+                                    std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - stage_b_t0)
+                                        .count();
+                            }
                             out.cap_pruned += stage_b_cap_pruned;
                             if (status != SeedStatus::valid) {
                                 ++local_stats.stage_b_exact_reject_count;
@@ -5141,7 +5207,10 @@ static int validate_query_batch_with_plan(
                                 ++local_stats.stage_b_structure_survivor_count;
                             }
                             if (status == SeedStatus::valid) {
-                                const auto stage_c_t0 = std::chrono::high_resolution_clock::now();
+                                std::chrono::high_resolution_clock::time_point stage_c_t0{};
+                                if (kCollectDetailedStageTiming) {
+                                    stage_c_t0 = std::chrono::high_resolution_clock::now();
+                                }
                                 status = evaluate_query_seed_stage_c_biomes_compiled(
                                     api_copy,
                                     cubi_state,
@@ -5151,10 +5220,12 @@ static int validate_query_batch_with_plan(
                                     plan,
                                     nullptr
                                 );
-                                local_stats.cpu_stage_c_seconds +=
-                                    std::chrono::duration<double>(
-                                        std::chrono::high_resolution_clock::now() - stage_c_t0)
-                                        .count();
+                                if (kCollectDetailedStageTiming) {
+                                    local_stats.cpu_stage_c_seconds +=
+                                        std::chrono::duration<double>(
+                                            std::chrono::high_resolution_clock::now() - stage_c_t0)
+                                            .count();
+                                }
                             }
                             if (status == SeedStatus::valid) {
                                 ++local_stats.stage_c_biome_survivor_count;

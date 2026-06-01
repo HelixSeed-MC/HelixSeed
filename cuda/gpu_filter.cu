@@ -731,7 +731,8 @@ __global__ void filter_one_min1_kernel_x4(
     uint32_t region_start,
     uint32_t region_count,
     uint64_t *out,
-    uint32_t *hit_count) {
+    uint32_t *hit_count,
+    uint64_t out_capacity) {
     constexpr int N = SEEDS_PER_THREAD;
     const uint64_t tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint64_t base_idx = tid * static_cast<uint64_t>(N);
@@ -766,7 +767,7 @@ __global__ void filter_one_min1_kernel_x4(
     for (int i = 0; i < N; ++i) {
         any_hit[i] = any_hit[i] && active[i];
     }
-    emit_hits_n<N>(any_hit, seed48, out, hit_count, count);
+    emit_hits_n<N>(any_hit, seed48, out, hit_count, out_capacity);
 }
 
 __global__ void filter_single_kernel_x4(
@@ -846,6 +847,7 @@ __global__ void filter_multi_exact_kernel_x4(
     uint64_t count,
     uint64_t *out,
     uint32_t *hit_count,
+    uint64_t out_capacity,
     uint32_t constraint_count,
     const ConstraintDesc * __restrict__ constraints_global) {
     constexpr int N = SEEDS_PER_THREAD;
@@ -988,7 +990,7 @@ __global__ void filter_multi_exact_kernel_x4(
         if (!any_alive) return;
     }
 
-    emit_hits_n<N>(alive, seed48, out, hit_count, count);
+    emit_hits_n<N>(alive, seed48, out, hit_count, out_capacity);
 }
 
 __global__ void filter_single_kernel(
@@ -1295,6 +1297,39 @@ bool ensure_async_slot_resources(AsyncSlotResources &slot, uint64_t needed_out_c
     return true;
 }
 
+void release_async_slot_resources(AsyncSlotResources &slot) {
+    if (slot.stream_ready && slot.stream != nullptr) {
+        cudaStreamSynchronize(slot.stream);
+    }
+    if (slot.d_out != nullptr) {
+        cudaFree(slot.d_out);
+    }
+    if (slot.d_hit != nullptr) {
+        cudaFree(slot.d_hit);
+    }
+    if (slot.pinned_out != nullptr) {
+        cudaFreeHost(slot.pinned_out);
+    }
+    if (slot.pinned_hit != nullptr) {
+        cudaFreeHost(slot.pinned_hit);
+    }
+    if (slot.events_ready) {
+        if (slot.kernel_start != nullptr) {
+            cudaEventDestroy(slot.kernel_start);
+        }
+        if (slot.kernel_end != nullptr) {
+            cudaEventDestroy(slot.kernel_end);
+        }
+        if (slot.transfer_end != nullptr) {
+            cudaEventDestroy(slot.transfer_end);
+        }
+    }
+    if (slot.stream_ready && slot.stream != nullptr) {
+        cudaStreamDestroy(slot.stream);
+    }
+    slot = AsyncSlotResources{};
+}
+
 bool ensure_async_constraint_capacity(AsyncDeviceState &state, uint32_t constraint_count) {
     if (constraint_count == 0U) {
         return true;
@@ -1330,6 +1365,7 @@ struct PerDeviceJob {
     int device_index = -1;
     uint64_t device_start = 0ULL;
     uint64_t device_count_seeds = 0ULL;
+    uint64_t output_capacity = 0ULL;
     AsyncSlotResources *slot_res = nullptr;
 };
 
@@ -1340,6 +1376,7 @@ struct AsyncSlotState {
     bool nothing_to_filter = false;
     uint64_t passthrough_start = 0ULL;
     uint64_t passthrough_count = 0ULL;
+    uint64_t output_capacity = 0ULL;
     bool use_single_min1_kernel = false;
     uint32_t exact_constraint_count = 0U;
     std::vector<ConstraintDesc> exact_constraints;
@@ -1661,13 +1698,15 @@ extern "C" int gpu_filter_multi_checked_impl(
                         c.region_start,
                         c.region_count,
                         workspace.d_out,
-                        workspace.d_hit);
+                        workspace.d_hit,
+                        device_count_seeds);
                 } else {
                     filter_multi_exact_kernel_x4<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(
                         device_start_seed + processed,
                         batch,
                         workspace.d_out,
                         workspace.d_hit,
+                        device_count_seeds,
                         exact_constraint_count,
                         workspace.d_constraints);
                 }
@@ -1757,14 +1796,63 @@ extern "C" uint32_t gpu_filter_async_max_slots_impl(void) {
     return MAX_ASYNC_SLOTS;
 }
 
-extern "C" int gpu_filter_multi_submit_impl(
+extern "C" int gpu_filter_async_reset_impl(void) {
+    int rc = GPU_FILTER_STATUS_OK;
+    const int device_count = gpu_device_count_impl();
+    {
+        std::lock_guard<std::mutex> lock(g_async_state_mu);
+        const size_t states = std::min<size_t>(
+            g_async_device_states.size(),
+            device_count > 0 ? static_cast<size_t>(device_count) : g_async_device_states.size());
+        for (size_t di = 0; di < states; ++di) {
+            if (cudaSetDevice(static_cast<int>(di)) != cudaSuccess) {
+                rc = GPU_FILTER_STATUS_DEVICE_SETUP;
+                continue;
+            }
+            AsyncDeviceState &state = g_async_device_states[di];
+            for (uint32_t slot_id = 0; slot_id < MAX_ASYNC_SLOTS; ++slot_id) {
+                AsyncSlotResources &res = state.slots[slot_id];
+                if (res.stream_ready && cudaStreamSynchronize(res.stream) != cudaSuccess) {
+                    rc = GPU_FILTER_STATUS_LAUNCH;
+                }
+                release_async_slot_resources(res);
+            }
+            if (state.d_constraints != nullptr) {
+                cudaFree(state.d_constraints);
+                state.d_constraints = nullptr;
+            }
+            state.regions_hash = 0ULL;
+            state.regions_count = 0U;
+            state.constraints_hash = 0ULL;
+            state.constraints_count = 0U;
+            state.constraint_capacity = 0U;
+        }
+    }
+    for (uint32_t slot_id = 0; slot_id < MAX_ASYNC_SLOTS; ++slot_id) {
+        AsyncSlotState &slot = g_async_slots[slot_id];
+        slot.jobs.clear();
+        slot.exact_constraints.clear();
+        slot.status = GPU_FILTER_STATUS_OK;
+        slot.submitted_count = 0ULL;
+        slot.nothing_to_filter = false;
+        slot.passthrough_start = 0ULL;
+        slot.passthrough_count = 0ULL;
+        slot.use_single_min1_kernel = false;
+        slot.exact_constraint_count = 0U;
+        slot.in_flight.store(false);
+    }
+    return rc;
+}
+
+extern "C" int gpu_filter_multi_submit_limited_impl(
     uint32_t slot_id,
     uint64_t start_seed,
     uint64_t count,
     RegionTerm *regions,
     uint32_t region_count,
     ConstraintDesc *constraints,
-    uint32_t constraint_count) {
+    uint32_t constraint_count,
+    uint64_t output_capacity) {
     if (slot_id >= MAX_ASYNC_SLOTS) {
         return GPU_FILTER_STATUS_INVALID_ARG;
     }
@@ -1776,6 +1864,7 @@ extern "C" int gpu_filter_multi_submit_impl(
 
     slot.status = GPU_FILTER_STATUS_OK;
     slot.submitted_count = count;
+    slot.output_capacity = std::min<uint64_t>(output_capacity, count);
     slot.nothing_to_filter = false;
     slot.passthrough_start = start_seed;
     slot.passthrough_count = 0ULL;
@@ -1864,7 +1953,8 @@ extern "C" int gpu_filter_multi_submit_impl(
             state.regions_count = region_count;
         }
 
-        if (!ensure_async_slot_resources(res, dc)) {
+        const uint64_t job_output_capacity = std::min<uint64_t>(dc, slot.output_capacity);
+        if (!ensure_async_slot_resources(res, job_output_capacity)) {
             slot.status = GPU_FILTER_STATUS_ALLOC;
             slot.in_flight.store(false);
             return GPU_FILTER_STATUS_ALLOC;
@@ -1924,13 +2014,15 @@ extern "C" int gpu_filter_multi_submit_impl(
                     c.region_start,
                     c.region_count,
                     res.d_out,
-                    res.d_hit);
+                    res.d_hit,
+                    job_output_capacity);
             } else {
                 filter_multi_exact_kernel_x4<<<blocks, THREADS_PER_BLOCK, 0, res.stream>>>(
                     ds + processed,
                     batch,
                     res.d_out,
                     res.d_hit,
+                    job_output_capacity,
                     slot.exact_constraint_count,
                     state.d_constraints);
             }
@@ -1962,11 +2054,31 @@ extern "C" int gpu_filter_multi_submit_impl(
         job.device_index = di;
         job.device_start = ds;
         job.device_count_seeds = dc;
+        job.output_capacity = job_output_capacity;
         job.slot_res = &res;
         slot.jobs.push_back(job);
     }
 
     return GPU_FILTER_STATUS_OK;
+}
+
+extern "C" int gpu_filter_multi_submit_impl(
+    uint32_t slot_id,
+    uint64_t start_seed,
+    uint64_t count,
+    RegionTerm *regions,
+    uint32_t region_count,
+    ConstraintDesc *constraints,
+    uint32_t constraint_count) {
+    return gpu_filter_multi_submit_limited_impl(
+        slot_id,
+        start_seed,
+        count,
+        regions,
+        region_count,
+        constraints,
+        constraint_count,
+        count);
 }
 
 extern "C" int gpu_filter_multi_collect_impl(
@@ -2007,7 +2119,7 @@ extern "C" int gpu_filter_multi_collect_impl(
                 out_buffer[i] = (slot.passthrough_start + i) & JAVA_MASK;
             }
         }
-        *out_hit_count = static_cast<uint32_t>(emit);
+        *out_hit_count = static_cast<uint32_t>(count);
         slot.jobs.clear();
         slot.in_flight.store(false);
         return GPU_FILTER_STATUS_OK;
@@ -2015,6 +2127,7 @@ extern "C" int gpu_filter_multi_collect_impl(
 
     double max_kernel_sec = 0.0;
     double max_transfer_sec = 0.0;
+    uint32_t total_hits = 0U;
     uint32_t merged = 0U;
     int rc = GPU_FILTER_STATUS_OK;
 
@@ -2034,12 +2147,15 @@ extern "C" int gpu_filter_multi_collect_impl(
         if (static_cast<uint64_t>(n) > job.device_count_seeds) {
             n = static_cast<uint32_t>(job.device_count_seeds);
         }
+        total_hits += n;
 
-        if (n > 0U) {
+        const uint64_t remaining_capacity = merged < out_capacity ? out_capacity - merged : 0ULL;
+        const uint64_t can_copy_from_device = std::min<uint64_t>(static_cast<uint64_t>(n), remaining_capacity);
+        if (can_copy_from_device > 0ULL) {
             if (cudaMemcpyAsync(
                     res.pinned_out,
                     res.d_out,
-                    static_cast<size_t>(n) * sizeof(uint64_t),
+                    static_cast<size_t>(can_copy_from_device) * sizeof(uint64_t),
                     cudaMemcpyDeviceToHost,
                     res.stream) != cudaSuccess) {
                 rc = GPU_FILTER_STATUS_COPY;
@@ -2068,18 +2184,16 @@ extern "C" int gpu_filter_multi_collect_impl(
             max_transfer_sec = t_sec;
         }
 
-        if (n > 0U && out_buffer != nullptr && merged < out_capacity) {
-            const uint64_t can_copy =
-                std::min<uint64_t>(static_cast<uint64_t>(n), out_capacity - merged);
+        if (can_copy_from_device > 0ULL && out_buffer != nullptr) {
             std::memcpy(
                 out_buffer + merged,
                 res.pinned_out,
-                static_cast<size_t>(can_copy) * sizeof(uint64_t));
-            merged += static_cast<uint32_t>(can_copy);
+                static_cast<size_t>(can_copy_from_device) * sizeof(uint64_t));
+            merged += static_cast<uint32_t>(can_copy_from_device);
         }
     }
 
-    *out_hit_count = merged;
+    *out_hit_count = total_hits;
     if (out_kernel_seconds != nullptr) {
         *out_kernel_seconds = max_kernel_sec;
     }

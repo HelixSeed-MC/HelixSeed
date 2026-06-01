@@ -116,6 +116,7 @@ GPU_FILTER_API int gpu_filter_multi_checked(
 // gpu_filter_multi_checked on failure.
 GPU_FILTER_API int gpu_filter_double_buffer_available(void);
 GPU_FILTER_API uint32_t gpu_filter_async_max_slots(void);
+GPU_FILTER_API int gpu_filter_async_reset(void);
 
 GPU_FILTER_API int gpu_filter_multi_submit(
     uint32_t slot_id,
@@ -125,6 +126,16 @@ GPU_FILTER_API int gpu_filter_multi_submit(
     uint32_t region_count,
     ConstraintDesc *constraints,
     uint32_t constraint_count);
+
+GPU_FILTER_API int gpu_filter_multi_submit_limited(
+    uint32_t slot_id,
+    uint64_t start_seed,
+    uint64_t count,
+    RegionTerm *regions,
+    uint32_t region_count,
+    ConstraintDesc *constraints,
+    uint32_t constraint_count,
+    uint64_t output_capacity);
 
 GPU_FILTER_API int gpu_filter_multi_collect(
     uint32_t slot_id,

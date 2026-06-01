@@ -43,10 +43,18 @@ public final class ExactWorldgenLootResolver {
     private static final int RUINED_PORTAL_FEATURE_INDEX_12111 = 10;
     private static final int RUINED_PORTAL_DESERT_FEATURE_INDEX_12111 = 11;
     private static final int RUINED_PORTAL_JUNGLE_FEATURE_INDEX_12111 = 12;
-    private static final int RUINED_PORTAL_MOUNTAIN_FEATURE_INDEX_12111 = 13;
-    private static final int RUINED_PORTAL_NETHER_FEATURE_INDEX_12111 = 14;
+    private static final int RUINED_PORTAL_SWAMP_FEATURE_INDEX_12111 = 13;
+    private static final int RUINED_PORTAL_MOUNTAIN_FEATURE_INDEX_12111 = 14;
     private static final int RUINED_PORTAL_OCEAN_FEATURE_INDEX_12111 = 15;
-    private static final int RUINED_PORTAL_SWAMP_FEATURE_INDEX_12111 = 16;
+    private static final int RUINED_PORTAL_NETHER_FEATURE_INDEX_12111 = 16;
+    private static final List<String> OVERWORLD_RUINED_PORTAL_VARIANTS = List.of(
+        "ruined_portal",
+        "ruined_portal_desert",
+        "ruined_portal_jungle",
+        "ruined_portal_swamp",
+        "ruined_portal_mountain",
+        "ruined_portal_ocean"
+    );
     private static final RuinedPortalTemplate[] RUINED_PORTAL_TEMPLATES = new RuinedPortalTemplate[]{
         new RuinedPortalTemplate(6, 6, 2, 0),
         new RuinedPortalTemplate(9, 9, 8, 6),
@@ -120,6 +128,7 @@ public final class ExactWorldgenLootResolver {
     public static boolean supportsStructure(String structureId) {
         String normalized = normalizeSourceId(structureId);
         return "buried_treasure".equals(normalized)
+            || "ruined_portal_overworld".equals(normalized)
             || isExactRuinedPortalSource(normalized)
             || isExactVillageLootSource(normalized);
     }
@@ -217,6 +226,16 @@ public final class ExactWorldgenLootResolver {
         structureId = normalizeSourceId(structureId);
         if (isExactVillageLootSource(structureId)) {
             return gatherExactVillageAggregateCountAlternatives(structureId, worldSeed, blockX, blockZ);
+        }
+        if ("ruined_portal_overworld".equals(structureId)) {
+            List<Map<String, Integer>> out = new ArrayList<>();
+            for (String variant : OVERWORLD_RUINED_PORTAL_VARIANTS) {
+                Map<String, Integer> counts = gatherAggregateCounts(variant, worldSeed, blockX, blockZ);
+                if (!counts.isEmpty()) {
+                    out.add(counts);
+                }
+            }
+            return List.copyOf(out);
         }
 
         Map<String, Integer> counts = gatherAggregateCounts(structureId, worldSeed, blockX, blockZ);

@@ -214,6 +214,13 @@ struct QueryRuntime {
     std::unordered_map<std::string, QueryConstraintRuntime> constraints;
 };
 
+struct ConstraintPrefilterEnvelope {
+    int radius = 0;
+    int32_t center_x = 0;
+    int32_t center_z = 0;
+    bool center_known = true;
+};
+
 struct GpuRegionTerm {
     int32_t base_block_x = 0;
     int32_t base_block_z = 0;
@@ -279,6 +286,15 @@ using FnGpuFilterMultiSubmit = int (*)(
     uint32_t,
     GpuConstraintDesc *,
     uint32_t);
+using FnGpuFilterMultiSubmitLimited = int (*)(
+    uint32_t,
+    uint64_t,
+    uint64_t,
+    GpuRegionTerm *,
+    uint32_t,
+    GpuConstraintDesc *,
+    uint32_t,
+    uint64_t);
 using FnGpuFilterMultiCollect = int (*)(
     uint32_t,
     uint64_t *,
@@ -286,6 +302,7 @@ using FnGpuFilterMultiCollect = int (*)(
     uint32_t *,
     double *,
     double *);
+using FnGpuAsyncReset = int (*)();
 
 struct ScannerCompiledQueryPlan;
 using FnScannerCoreCompileQueryPlan = ScannerCompiledQueryPlan *(*)(
@@ -591,6 +608,18 @@ public:
         return std::min<uint32_t>(slots, 8U);
     }
 
+    void reset_async_slots() const {
+        if (!ready_ || gpu_filter_async_reset_ == nullptr) {
+            return;
+        }
+        const int status = gpu_filter_async_reset_();
+        if (status != 0) {
+            throw std::runtime_error("GPU async reset failed with status " + std::to_string(status) + ".");
+        }
+        std::fill(async_slot_capacity_.begin(), async_slot_capacity_.end(), 0ULL);
+        std::fill(async_slot_submitted_.begin(), async_slot_submitted_.end(), 0ULL);
+    }
+
     // Submit a Stage A batch on the given slot (0 or 1). Does NOT block.
     // After submit returns, the caller may continue with CPU work; collect
     // the matching slot when ready to consume survivors.
@@ -598,6 +627,17 @@ public:
         uint32_t slot_id,
         uint64_t start_seed,
         uint64_t count,
+        const std::vector<GpuRegionTerm> &regions,
+        const std::vector<GpuConstraintDesc> &constraints
+    ) const {
+        submit_batch_limited(slot_id, start_seed, count, count, regions, constraints);
+    }
+
+    void submit_batch_limited(
+        uint32_t slot_id,
+        uint64_t start_seed,
+        uint64_t count,
+        uint64_t output_capacity,
         const std::vector<GpuRegionTerm> &regions,
         const std::vector<GpuConstraintDesc> &constraints
     ) const {
@@ -613,8 +653,6 @@ public:
                 "submit_batch: batch exceeds the 32-bit hit-count ABI limit; reduce the batch size.");
         }
         ensure_async_slot_capacity(slot_id);
-        async_slot_capacity_[slot_id] = count;
-        async_slot_submitted_[slot_id] = count;
 
         GpuRegionTerm dummy_region{};
         GpuConstraintDesc dummy_constraint{};
@@ -623,19 +661,37 @@ public:
         GpuConstraintDesc *constraint_ptr =
             constraints.empty() ? &dummy_constraint : const_cast<GpuConstraintDesc *>(constraints.data());
 
-        const int status = gpu_filter_multi_submit_(
-            slot_id,
-            start_seed,
-            count,
-            region_ptr,
-            static_cast<uint32_t>(regions.size()),
-            constraint_ptr,
-            static_cast<uint32_t>(constraints.size())
-        );
+        const uint64_t capped_output_capacity = std::min<uint64_t>(output_capacity, count);
+        const int status = gpu_filter_multi_submit_limited_ != nullptr
+            ? gpu_filter_multi_submit_limited_(
+                  slot_id,
+                  start_seed,
+                  count,
+                  region_ptr,
+                  static_cast<uint32_t>(regions.size()),
+                  constraint_ptr,
+                  static_cast<uint32_t>(constraints.size()),
+                  capped_output_capacity)
+            : gpu_filter_multi_submit_(
+                  slot_id,
+                  start_seed,
+                  count,
+                  region_ptr,
+                  static_cast<uint32_t>(regions.size()),
+                  constraint_ptr,
+                  static_cast<uint32_t>(constraints.size()));
         if (status != 0) {
+            async_slot_capacity_[slot_id] = 0ULL;
+            async_slot_submitted_[slot_id] = 0ULL;
+            try {
+                reset_async_slots();
+            } catch (...) {
+            }
             throw std::runtime_error(
                 "GPU filter submit failed with status " + std::to_string(status) + ".");
         }
+        async_slot_capacity_[slot_id] = count;
+        async_slot_submitted_[slot_id] = count;
     }
 
     // Collect the survivors for the given slot into out. Blocks on the slot's
@@ -672,6 +728,12 @@ public:
             &transfer_seconds
         );
         if (status != 0) {
+            async_slot_submitted_[slot_id] = 0ULL;
+            async_slot_capacity_[slot_id] = 0ULL;
+            try {
+                reset_async_slots();
+            } catch (...) {
+            }
             throw std::runtime_error(
                 "GPU filter collect failed with status " + std::to_string(status) + ".");
         }
@@ -680,6 +742,59 @@ public:
         }
         out.assign(buffer, buffer + hit_count);
         async_slot_submitted_[slot_id] = 0;
+    }
+
+    uint32_t collect_batch_limited(
+        uint32_t slot_id,
+        uint64_t emit_capacity,
+        std::vector<uint64_t> &out,
+        double &kernel_seconds,
+        double &transfer_seconds
+    ) const {
+        kernel_seconds = 0.0;
+        transfer_seconds = 0.0;
+        if (!async_available()) {
+            throw std::runtime_error("collect_batch_limited: async API not available.");
+        }
+        const uint32_t max_slots = async_max_slots();
+        if (slot_id >= max_slots) {
+            throw std::runtime_error("collect_batch_limited: invalid slot id.");
+        }
+        ensure_async_slot_capacity(slot_id);
+        const uint64_t capacity = async_slot_capacity_[slot_id];
+        const uint64_t capped_emit_capacity = std::min<uint64_t>(emit_capacity, capacity);
+        const uint64_t scratch_capacity = std::max<uint64_t>(1ULL, capped_emit_capacity);
+        if (async_slot_scratch_capacity_[slot_id] < scratch_capacity) {
+            async_slot_scratch_[slot_id].reset(new uint64_t[static_cast<size_t>(scratch_capacity)]);
+            async_slot_scratch_capacity_[slot_id] = scratch_capacity;
+        }
+        uint64_t *buffer = async_slot_scratch_[slot_id].get();
+        uint32_t hit_count = 0;
+        const int status = gpu_filter_multi_collect_(
+            slot_id,
+            buffer,
+            capped_emit_capacity,
+            &hit_count,
+            &kernel_seconds,
+            &transfer_seconds
+        );
+        if (status != 0) {
+            async_slot_submitted_[slot_id] = 0ULL;
+            async_slot_capacity_[slot_id] = 0ULL;
+            try {
+                reset_async_slots();
+            } catch (...) {
+            }
+            throw std::runtime_error(
+                "GPU filter collect failed with status " + std::to_string(status) + ".");
+        }
+        if (static_cast<uint64_t>(hit_count) > capacity) {
+            throw std::runtime_error("GPU filter collect returned more hits than the submitted batch capacity.");
+        }
+        const uint64_t emitted = std::min<uint64_t>(static_cast<uint64_t>(hit_count), capped_emit_capacity);
+        out.assign(buffer, buffer + emitted);
+        async_slot_submitted_[slot_id] = 0;
+        return hit_count;
     }
 
 private:
@@ -758,8 +873,12 @@ private:
             lookup_symbol(module_, "gpu_filter_async_max_slots"));
         gpu_filter_multi_submit_ = reinterpret_cast<FnGpuFilterMultiSubmit>(
             lookup_symbol(module_, "gpu_filter_multi_submit"));
+        gpu_filter_multi_submit_limited_ = reinterpret_cast<FnGpuFilterMultiSubmitLimited>(
+            lookup_symbol(module_, "gpu_filter_multi_submit_limited"));
         gpu_filter_multi_collect_ = reinterpret_cast<FnGpuFilterMultiCollect>(
             lookup_symbol(module_, "gpu_filter_multi_collect"));
+        gpu_filter_async_reset_ = reinterpret_cast<FnGpuAsyncReset>(
+            lookup_symbol(module_, "gpu_filter_async_reset"));
         const bool required_symbols =
             gpu_is_available_ != nullptr &&
             gpu_total_mem_ != nullptr &&
@@ -775,7 +894,9 @@ private:
             gpu_filter_double_buffer_available_ = nullptr;
             gpu_filter_async_max_slots_ = nullptr;
             gpu_filter_multi_submit_ = nullptr;
+            gpu_filter_multi_submit_limited_ = nullptr;
             gpu_filter_multi_collect_ = nullptr;
+            gpu_filter_async_reset_ = nullptr;
             return false;
         }
         return true;
@@ -791,7 +912,9 @@ private:
     FnGpuFilterDoubleBufferAvailable gpu_filter_double_buffer_available_ = nullptr;
     FnGpuFilterAsyncMaxSlots gpu_filter_async_max_slots_ = nullptr;
     FnGpuFilterMultiSubmit gpu_filter_multi_submit_ = nullptr;
+    FnGpuFilterMultiSubmitLimited gpu_filter_multi_submit_limited_ = nullptr;
     FnGpuFilterMultiCollect gpu_filter_multi_collect_ = nullptr;
+    FnGpuAsyncReset gpu_filter_async_reset_ = nullptr;
     mutable std::unique_ptr<uint64_t[]> gpu_output_scratch_;
     mutable uint64_t gpu_output_capacity_ = 0ULL;
     mutable std::vector<std::unique_ptr<uint64_t[]>> async_slot_scratch_;
@@ -1369,6 +1492,18 @@ static bool is_ruined_portal_loot_structure_id(const std::string &structure_id) 
            s == "ruined_portal_swamp";
 }
 
+static const std::vector<std::string> &exact_overworld_ruined_portal_roll_structures() {
+    static const std::vector<std::string> variants{
+        "ruined_portal",
+        "ruined_portal_desert",
+        "ruined_portal_jungle",
+        "ruined_portal_swamp",
+        "ruined_portal_mountain",
+        "ruined_portal_ocean",
+    };
+    return variants;
+}
+
 static bool is_exact_village_candidate_loot_structure_id(const std::string &structure_id) {
     const std::string s = normalize_loot_structure_id(structure_id);
     return s == "village_weaponsmith";
@@ -1502,6 +1637,7 @@ struct PreparedLootFilter {
     std::string constraint_id;
     std::string query_structure;
     std::string effective_structure;
+    bool source_was_auto = false;
     std::vector<PreparedLootRequirement> required;
     std::string encoded_required;
 };
@@ -3115,6 +3251,7 @@ struct CliArgs {
     bool strict_workers_set = false;
     std::string output_mode = "raw";
     uint16_t upper16 = 0;
+    bool upper16_set = false;
     bool print_closest = false;
     bool list_structures = false;
     bool dump_query_template = false;
@@ -5496,7 +5633,7 @@ static std::vector<std::string> topological_constraint_order(const std::vector<C
     return order;
 }
 
-static std::unordered_map<std::string, int> compute_constraint_prefilter_radii(
+static std::unordered_map<std::string, ConstraintPrefilterEnvelope> compute_constraint_prefilter_envelopes(
     const QuerySpec &spec,
     const std::vector<std::string> &order
 ) {
@@ -5504,23 +5641,38 @@ static std::unordered_map<std::string, int> compute_constraint_prefilter_radii(
     for (const ConstraintSpec &c : spec.constraints) {
         by_id.emplace(c.cid, c);
     }
-    std::unordered_map<std::string, int> out;
+    std::unordered_map<std::string, ConstraintPrefilterEnvelope> out;
     for (const std::string &cid : order) {
         const ConstraintSpec &c = by_id.at(cid);
+        ConstraintPrefilterEnvelope envelope{};
         if (c.anchor == "origin") {
-            out[cid] = c.radius;
+            envelope.radius = c.radius;
+            envelope.center_x = 0;
+            envelope.center_z = 0;
+            envelope.center_known = true;
         } else if (c.anchor == "spawn") {
-            out[cid] = spec.perf.spawn_anchor_slack + c.radius;
+            envelope.radius = spec.perf.spawn_anchor_slack + c.radius;
+            envelope.center_x = 0;
+            envelope.center_z = 0;
+            envelope.center_known = true;
         } else {
             int32_t fixed_x = 0;
             int32_t fixed_z = 0;
             if (parse_fixed_anchor_coords(c.anchor, fixed_x, fixed_z)) {
-                out[cid] = c.radius;
-                continue;
+                envelope.radius = c.radius;
+                envelope.center_x = fixed_x;
+                envelope.center_z = fixed_z;
+                envelope.center_known = true;
+            } else {
+                const std::string dep = c.anchor.substr(std::strlen("constraint:"));
+                const ConstraintPrefilterEnvelope &parent = out.at(dep);
+                envelope.radius = parent.radius + c.radius;
+                envelope.center_x = parent.center_x;
+                envelope.center_z = parent.center_z;
+                envelope.center_known = parent.center_known;
             }
-            const std::string dep = c.anchor.substr(std::strlen("constraint:"));
-            out[cid] = out.at(dep) + c.radius;
         }
+        out[cid] = envelope;
     }
     return out;
 }
@@ -5529,12 +5681,13 @@ static QueryRuntime build_query_runtime(const QuerySpec &spec) {
     QueryRuntime runtime{};
     runtime.spec = spec;
     runtime.ordered_constraint_ids = topological_constraint_order(spec.constraints);
-    const auto prefilter_radii = compute_constraint_prefilter_radii(spec, runtime.ordered_constraint_ids);
+    const auto prefilter_envelopes = compute_constraint_prefilter_envelopes(spec, runtime.ordered_constraint_ids);
 
     for (const ConstraintSpec &c : spec.constraints) {
         QueryConstraintRuntime rc{};
         rc.spec = c;
-        rc.prefilter_radius = prefilter_radii.at(c.cid);
+        const ConstraintPrefilterEnvelope &prefilter = prefilter_envelopes.at(c.cid);
+        rc.prefilter_radius = prefilter.radius;
         rc.dimension = dimension_id_from_name(c.dimension);
         rc.candidate_radius_sq = static_cast<uint64_t>(c.radius) * static_cast<uint64_t>(c.radius);
         rc.root_radius_sq = static_cast<uint64_t>(rc.prefilter_radius) * static_cast<uint64_t>(rc.prefilter_radius);
@@ -5581,9 +5734,8 @@ static QueryRuntime build_query_runtime(const QuerySpec &spec) {
         if (rc.prefilter_supported && preset_ptr != nullptr) {
             rc.context.name = c.structure;
             rc.context.preset = *preset_ptr;
-            int32_t region_center_x = 0;
-            int32_t region_center_z = 0;
-            (void)parse_fixed_anchor_coords(c.anchor, region_center_x, region_center_z);
+            int32_t region_center_x = prefilter.center_known ? prefilter.center_x : 0;
+            int32_t region_center_z = prefilter.center_known ? prefilter.center_z : 0;
             rc.context.regions = build_candidate_regions(
                 rc.prefilter_radius,
                 preset_ptr->spacing,
@@ -6746,7 +6898,8 @@ static std::vector<PreparedLootFilter> prepare_loot_filters(
         }
         const QueryConstraintRuntime &constraint = runtime_it->second;
 
-        std::string effective_structure = lf.structure.empty() || lf.structure == "auto"
+        const bool source_was_auto = lf.structure.empty() || lf.structure == "auto";
+        std::string effective_structure = source_was_auto
             ? infer_auto_loot_structure_for_constraint(version_token, constraint)
             : lf.structure;
         effective_structure = normalize_loot_structure_id(std::move(effective_structure));
@@ -6768,6 +6921,7 @@ static std::vector<PreparedLootFilter> prepare_loot_filters(
         prepared.constraint_id = lf.constraint_id;
         prepared.query_structure = constraint.spec.structure;
         prepared.effective_structure = effective_structure;
+        prepared.source_was_auto = source_was_auto;
         prepared.required.reserve(lf.required.size());
         for (const LootRequirementSpec &req : lf.required) {
             prepared.required.push_back(PreparedLootRequirement{normalize_loot_item_id(req.item), req.count});
@@ -6777,7 +6931,8 @@ static std::vector<PreparedLootFilter> prepare_loot_filters(
             return existing.constraint_index == prepared.constraint_index &&
                    existing.constraint_id == prepared.constraint_id &&
                    existing.query_structure == prepared.query_structure &&
-                   existing.effective_structure == prepared.effective_structure;
+                   existing.effective_structure == prepared.effective_structure &&
+                   existing.source_was_auto == prepared.source_was_auto;
         });
         if (merge_it == out.end()) {
             out.push_back(std::move(prepared));
@@ -6851,6 +7006,9 @@ static std::vector<PreparedJavaStructureValidationConstraint> prepare_java_struc
         }
         const QueryConstraintRuntime &constraint = runtime_it->second;
         if (constraint.spec.mode != "strict") {
+            continue;
+        }
+        if (constraint.dimension != SCAN_DIM_OVERWORLD) {
             continue;
         }
         PreparedJavaStructureValidationConstraint prepared{};
@@ -7012,7 +7170,8 @@ static std::string resolve_effective_loot_roll_structure(
     std::unordered_map<uint64_t, bool> &exact_shipwreck_variant_cache
 ) {
     std::string roll_structure = filter.effective_structure;
-    if (is_exact_loot_version_token(version_token) && is_ruined_portal_loot_structure_id(filter.effective_structure)) {
+    if (filter.source_was_auto && is_exact_loot_version_token(version_token) &&
+        is_ruined_portal_loot_structure_id(filter.effective_structure)) {
         const std::string query_structure = normalize_loot_structure_id(filter.query_structure);
         if (is_ruined_portal_loot_structure_id(query_structure)) {
             roll_structure = query_structure;
@@ -7030,6 +7189,34 @@ static std::string resolve_effective_loot_roll_structure(
         roll_structure = exact_shipwreck_roll_structure_id(filter.effective_structure, is_beached);
     }
     return roll_structure;
+}
+
+static void append_effective_loot_roll_structures(
+    const PreparedLootFilter &filter,
+    const std::string &version_token,
+    uint64_t seed,
+    int32_t cubi_mc_version,
+    int32_t match_x,
+    int32_t match_z,
+    std::unordered_map<uint64_t, bool> &exact_shipwreck_variant_cache,
+    std::vector<std::string> &out
+) {
+    if (filter.source_was_auto &&
+        is_exact_loot_version_token(version_token) &&
+        normalize_loot_structure_id(filter.effective_structure) == "ruined_portal" &&
+        normalize_loot_structure_id(filter.query_structure) == "ruined_portal") {
+        out.push_back("ruined_portal_overworld");
+        return;
+    }
+    out.push_back(resolve_effective_loot_roll_structure(
+        filter,
+        version_token,
+        seed,
+        cubi_mc_version,
+        match_x,
+        match_z,
+        exact_shipwreck_variant_cache
+    ));
 }
 
 static std::vector<NativeQueryMatchOut> collect_query_match_details_for_seed(
@@ -7340,6 +7527,8 @@ static bool validate_loot_filters_for_seed(
     roll_cache.clear();
     std::unordered_map<uint64_t, bool> exact_shipwreck_variant_cache;
     exact_shipwreck_variant_cache.reserve(32U);
+    std::vector<std::string> roll_structures;
+    roll_structures.reserve(8U);
     for (const PreparedLootFilter &filter : loot_filters) {
         bool passed = false;
         std::unordered_set<uint64_t> seen_positions;
@@ -7354,35 +7543,41 @@ static bool validate_loot_filters_for_seed(
                 continue;
             }
 
-            const std::string roll_structure = resolve_effective_loot_roll_structure(
+            roll_structures.clear();
+            append_effective_loot_roll_structures(
                 filter,
                 version_token,
                 seed,
                 query_plan.cubi_mc_version,
                 match.x,
                 match.z,
-                exact_shipwreck_variant_cache
+                exact_shipwreck_variant_cache,
+                roll_structures
             );
 
-            bool roll_passed = false;
-            std::string roll_error;
-            if (!loot_client.check(
-                    roll_structure,
-                    version_token,
-                    seed,
-                    match.x,
-                    match.z,
-                    filter.encoded_required,
-                    roll_passed,
-                    roll_error)) {
-                throw std::runtime_error(
-                    "LootValidationServer failed for constraint '" + filter.constraint_id + "' at (" +
-                    std::to_string(match.x) + "," + std::to_string(match.z) + "): " + roll_error
-                );
+            for (const std::string &roll_structure : roll_structures) {
+                bool roll_passed = false;
+                std::string roll_error;
+                if (!loot_client.check(
+                        roll_structure,
+                        version_token,
+                        seed,
+                        match.x,
+                        match.z,
+                        filter.encoded_required,
+                        roll_passed,
+                        roll_error)) {
+                    throw std::runtime_error(
+                        "LootValidationServer failed for constraint '" + filter.constraint_id + "' at (" +
+                        std::to_string(match.x) + "," + std::to_string(match.z) + "): " + roll_error
+                    );
+                }
+                if (roll_passed) {
+                    passed = true;
+                    break;
+                }
             }
-
-            if (roll_passed) {
-                passed = true;
+            if (passed) {
                 break;
             }
         }
@@ -7424,6 +7619,8 @@ static uint32_t validate_loot_filters_for_seed_batch(
         check_requests.clear();
         check_seed_indices.clear();
         std::vector<char> seed_passed(current.size(), 0);
+        std::vector<std::string> roll_structures;
+        roll_structures.reserve(8U);
 
         for (size_t seed_index = 0; seed_index < current.size(); ++seed_index) {
             const uint64_t seed = current[seed_index];
@@ -7478,21 +7675,27 @@ static uint32_t validate_loot_filters_for_seed_batch(
                 if (!seen_positions.insert(packed).second) {
                     continue;
                 }
-                check_requests.push_back(LootCheckRequest{
-                    resolve_effective_loot_roll_structure(
-                        filter,
-                        version_token,
-                        seed,
-                        query_plan.cubi_mc_version,
-                        match.x,
-                        match.z,
-                        exact_shipwreck_variant_cache),
+                roll_structures.clear();
+                append_effective_loot_roll_structures(
+                    filter,
+                    version_token,
                     seed,
+                    query_plan.cubi_mc_version,
                     match.x,
                     match.z,
-                    filter.encoded_required,
-                });
-                check_seed_indices.push_back(static_cast<uint32_t>(seed_index));
+                    exact_shipwreck_variant_cache,
+                    roll_structures
+                );
+                for (const std::string &roll_structure : roll_structures) {
+                    check_requests.push_back(LootCheckRequest{
+                        roll_structure,
+                        seed,
+                        match.x,
+                        match.z,
+                        filter.encoded_required,
+                    });
+                    check_seed_indices.push_back(static_cast<uint32_t>(seed_index));
+                }
             }
         }
 
@@ -7689,6 +7892,21 @@ static uint64_t lift_seed_to_64(uint64_t seed, uint16_t upper16) {
     return (static_cast<uint64_t>(upper16) << 48U) | (seed & JAVA_MASK);
 }
 
+static const uint64_t *validation_seed_data(
+    const std::vector<uint64_t> &seeds,
+    uint16_t upper16,
+    std::vector<uint64_t> &scratch
+) {
+    if (upper16 == 0U) {
+        return seeds.data();
+    }
+    scratch.resize(seeds.size());
+    for (size_t i = 0; i < seeds.size(); ++i) {
+        scratch[i] = lift_seed_to_64(seeds[i], upper16);
+    }
+    return scratch.data();
+}
+
 static void emit_seed_found_line(uint64_t seed, const CliArgs &args, const char *stage = nullptr) {
     const uint64_t raw_seed = seed & JAVA_MASK;
     const uint64_t lifted = lift_seed_to_64(raw_seed, args.upper16);
@@ -7822,7 +8040,7 @@ static CliArgs parse_cli(int argc, char **argv) {
                 );
             }
         } else if (opt == "--max-print") {
-            args.max_print = std::max(1, parse_i32(require_value("--max-print")));
+            args.max_print = std::max(0, parse_i32(require_value("--max-print")));
         } else if (opt == "--mc-version") {
             args.mc_version = require_value("--mc-version");
         } else if (opt == "--strict-workers") {
@@ -7835,6 +8053,7 @@ static CliArgs parse_cli(int argc, char **argv) {
             }
         } else if (opt == "--upper16") {
             args.upper16 = static_cast<uint16_t>(parse_u64(require_value("--upper16")) & 0xFFFFULL);
+            args.upper16_set = true;
         } else if (opt == "--progress-interval") {
             args.progress_interval = std::stod(require_value("--progress-interval"));
             if (args.progress_interval < 0.0) {
@@ -8396,8 +8615,10 @@ static uint64_t auto_find_batch_size(
             std::cout << ")...\n";
         }
 
+        const bool sample_probe_gpu_utilization = !strict_or_biome;
         auto probe_candidate = [&](uint64_t probe_bs) -> bool {
-            const std::optional<BatchProbeResult> result = benchmark_batch_candidate(run_probe, probe_bs, true);
+            const std::optional<BatchProbeResult> result =
+                benchmark_batch_candidate(run_probe, probe_bs, sample_probe_gpu_utilization);
             if (!result.has_value()) {
                 ++fail_count;
                 if (verbose) {
@@ -8436,7 +8657,8 @@ static uint64_t auto_find_batch_size(
             uint64_t right = hi_fail - 1U;
             while (left <= right) {
                 const uint64_t mid = left + ((right - left) / 2U);
-                const std::optional<BatchProbeResult> result = benchmark_batch_candidate(run_probe, mid, true);
+                const std::optional<BatchProbeResult> result =
+                    benchmark_batch_candidate(run_probe, mid, sample_probe_gpu_utilization);
                 if (!result.has_value()) {
                     ++fail_count;
                     if (mid == 0) {
@@ -8647,11 +8869,13 @@ static double benchmark_async_gpu_depth(
         }
     } catch (const std::bad_alloc &) {
         drain_pending();
+        gpu_backend.reset_async_slots();
         return 0.0;
     } catch (const std::runtime_error &exc) {
         const std::string msg = lower_ascii(exc.what());
         if (is_gpu_probe_resource_failure(msg)) {
             drain_pending();
+            gpu_backend.reset_async_slots();
             return 0.0;
         }
         drain_pending();
@@ -8850,33 +9074,6 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
     }
 
     const uint32_t available_slots = std::max<uint32_t>(1U, gpu_backend.async_max_slots());
-    const uint64_t gate_product = gpu_prefilter_gate_product(gpu_prefilter_plan);
-    const bool has_surrogate_gate = gate_product > 1ULL;
-    if (has_surrogate_gate && args.gpu_inflight_batches != "auto") {
-        const uint64_t target_gated_batch =
-            gate_product >= 4096ULL ? 8'000'000ULL : 32'000'000ULL;
-        const uint64_t gated_batch_size = std::max<uint64_t>(
-            1ULL,
-            std::min<uint64_t>(cap, target_gated_batch));
-        const uint32_t requested_depth =
-            static_cast<uint32_t>(std::max<uint64_t>(1ULL, parse_u64(args.gpu_inflight_batches)));
-        const uint32_t gated_depth = std::max<uint32_t>(
-            1U,
-            std::min<uint32_t>(
-                requested_depth,
-                max_async_slots_for_batch_memory(gpu_backend, gated_batch_size, available_slots)));
-        choice.valid = true;
-        choice.batch_size = gated_batch_size;
-        choice.depth = gated_depth;
-        choice.rate_sps = 0.0;
-        if (verbose) {
-            std::cout << "Mixed async max tuner: strict surrogate gate active; selected batch="
-                      << fmt_u64(choice.batch_size)
-                      << ", depth=" << fmt_u64(choice.depth)
-                      << " without extended probes.\n";
-        }
-        return choice;
-    }
     std::vector<uint64_t> candidates;
     auto push_mixed_candidate = [&](uint64_t value) {
         if (value == 0ULL || cap == 0ULL) {
@@ -8886,6 +9083,9 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
     };
     push_mixed_candidate(base);
     const uint64_t mixed_probe_points[] = {
+        1'000'000ULL,
+        2'000'000ULL,
+        4'000'000ULL,
         8'000'000ULL,
         16'000'000ULL,
         32'000'000ULL,
@@ -8905,14 +9105,6 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
     push_mixed_candidate(cap);
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
-    if (cap >= 8'000'000ULL) {
-        candidates.erase(
-            std::remove_if(
-                candidates.begin(),
-                candidates.end(),
-                [](uint64_t candidate) { return candidate < 8'000'000ULL; }),
-            candidates.end());
-    }
     std::vector<MixedAsyncProbeRecord> records;
     records.reserve(candidates.size() * 2U);
 
@@ -8933,7 +9125,7 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
             push_unique_depth(depths, std::max<uint32_t>(1U, std::min<uint32_t>(requested, max_slots)));
             return depths;
         }
-        const uint32_t raw_depths[] = {1U, 2U, 3U, 4U, 6U, 8U};
+        const uint32_t raw_depths[] = {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U};
         for (uint32_t depth : raw_depths) {
             if (depth <= max_slots) {
                 push_unique_depth(depths, depth);
@@ -8973,9 +9165,7 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
         if (depth == 0U || has_record(batch_size, depth)) {
             return false;
         }
-        const uint32_t quick_probe_batches = args.gpu_inflight_batches == "auto"
-            ? std::min<uint32_t>(5U, std::max<uint32_t>(3U, depth + 1U))
-            : 1U;
+        const uint32_t quick_probe_batches = std::min<uint32_t>(12U, std::max<uint32_t>(4U, depth + 2U));
         const std::optional<BatchProbeResult> result = benchmark_mixed_async_candidate(
             gpu_backend,
             gpu_prefilter_plan,
@@ -8987,8 +9177,28 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
             false
         );
         if (!result.has_value()) {
-            print_probe(batch_size, depth, nullptr, true);
-            return false;
+            gpu_backend.reset_async_slots();
+            const std::optional<BatchProbeResult> retry = benchmark_mixed_async_candidate(
+                gpu_backend,
+                gpu_prefilter_plan,
+                start_seed,
+                batch_size,
+                depth,
+                false,
+                quick_probe_batches,
+                false
+            );
+            if (!retry.has_value()) {
+                print_probe(batch_size, depth, nullptr, true);
+                return false;
+            }
+            MixedAsyncProbeRecord record{};
+            record.batch_size = batch_size;
+            record.depth = depth;
+            record.result = *retry;
+            records.push_back(record);
+            print_probe(batch_size, depth, &record.result, false);
+            return true;
         }
         MixedAsyncProbeRecord record{};
         record.batch_size = batch_size;
@@ -9009,18 +9219,13 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
     int fail_count = 0;
     const int fail_limit = 3;
     uint64_t largest_stable_batch = 0ULL;
-    const uint32_t min_mixed_probe_depth = std::min<uint32_t>(4U, available_slots);
     for (uint64_t batch_size : candidates) {
         const std::vector<uint32_t> depths = all_depth_candidates(batch_size);
         if (depths.empty()) {
             continue;
         }
-        if (args.gpu_inflight_batches != "auto" && min_mixed_probe_depth > 1U &&
-            *std::max_element(depths.begin(), depths.end()) < min_mixed_probe_depth) {
-            continue;
-        }
         std::vector<uint32_t> initial_depths;
-        push_unique_depth(initial_depths, depths.front());
+        push_unique_depth(initial_depths, depths.back());
 
         bool any_ok = false;
         for (uint32_t depth : initial_depths) {
@@ -9083,25 +9288,52 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
     double best_verified_rate = -1.0;
     uint32_t verified_count = 0U;
     uint32_t verified_attempts = 0U;
-    const uint32_t max_verified_records = args.gpu_inflight_batches == "auto" ? 6U : 1U;
-    const uint32_t max_verified_attempts = args.gpu_inflight_batches == "auto" ? 12U : 4U;
-    uint64_t mixed_validation_select_cap = 96'000'000ULL;
-    if (args.mixed_queue_capacity >= 8'000'000ULL) {
-        mixed_validation_select_cap = 384'000'000ULL;
-    } else if (args.mixed_queue_capacity >= 4'000'000ULL) {
-        mixed_validation_select_cap = 192'000'000ULL;
-    }
+    const uint32_t max_verified_records = args.gpu_inflight_batches == "auto" ? 16U : 16U;
+    const uint32_t max_verified_attempts = args.gpu_inflight_batches == "auto" ? 16U : 16U;
+    auto verified_rate_is_plausible = [&](const MixedAsyncProbeRecord &record, double verified_rate) {
+        const double quick_rate = std::max(1.0, record.result.rate_sps);
+        const bool small_sparse_batch = record.batch_size <= 8'000'000ULL;
+        const double absolute_cap = small_sparse_batch ? 20.0e9 : 5.0e9;
+        const double ratio_cap = small_sparse_batch ? 32.0 : 8.0;
+        return verified_rate <= std::max(absolute_cap, quick_rate * ratio_cap);
+    };
+    auto accept_verified = [&](const MixedAsyncProbeRecord &record, const BatchProbeResult &verified) {
+        if (!verified_rate_is_plausible(record, verified.rate_sps)) {
+            if (verbose) {
+                std::cout << "Mixed async max tuner: rejected unstable verification for batch="
+                          << fmt_u64(record.batch_size)
+                          << ", depth=" << fmt_u64(record.depth)
+                          << " (quick=" << fmt_double(record.result.rate_sps, 0)
+                          << ", verified=" << fmt_double(verified.rate_sps, 0)
+                          << " seeds/sec)\n";
+            }
+            return;
+        }
+        ++verified_count;
+        if (verified.rate_sps > best_verified_rate) {
+            best_verified_rate = verified.rate_sps;
+            choice.valid = true;
+            choice.batch_size = record.batch_size;
+            choice.depth = record.depth;
+            choice.rate_sps = verified.rate_sps;
+        }
+    };
     for (const MixedAsyncProbeRecord &record : records) {
         if (verified_count >= max_verified_records || verified_attempts >= max_verified_attempts) {
             break;
         }
-        if (record.batch_size > mixed_validation_select_cap) {
-            continue;
-        }
         ++verified_attempts;
-        const uint32_t verify_probe_batches = args.gpu_inflight_batches == "auto"
-            ? std::min<uint32_t>(7U, std::max<uint32_t>(3U, record.depth + 1U))
-            : 3U;
+        const uint64_t target_verify_seeds = std::min<uint64_t>(total_count, 512'000'000ULL);
+        uint32_t target_verify_batches = static_cast<uint32_t>(std::max<uint64_t>(
+            1ULL,
+            (target_verify_seeds + record.batch_size - 1ULL) / record.batch_size));
+        const uint32_t verify_batch_cap = record.batch_size <= 2'000'000ULL
+            ? 512U
+            : (record.batch_size <= 8'000'000ULL ? 256U : 64U);
+        const uint32_t verify_probe_batches = std::min<uint32_t>(
+            verify_batch_cap,
+            std::max<uint32_t>(std::max<uint32_t>(8U, record.depth + 3U), target_verify_batches));
+        gpu_backend.reset_async_slots();
         const std::optional<BatchProbeResult> verified = benchmark_mixed_async_candidate(
             gpu_backend,
             gpu_prefilter_plan,
@@ -9110,9 +9342,24 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
             record.depth,
             false,
             verify_probe_batches,
-            true
+            false
         );
         if (!verified.has_value()) {
+            gpu_backend.reset_async_slots();
+            const std::optional<BatchProbeResult> retry = benchmark_mixed_async_candidate(
+                gpu_backend,
+                gpu_prefilter_plan,
+                start_seed,
+                record.batch_size,
+                record.depth,
+                false,
+                verify_probe_batches,
+                false
+            );
+            if (retry.has_value()) {
+                accept_verified(record, *retry);
+                continue;
+            }
             if (verbose) {
                 std::cout << "Mixed async max tuner: verification failed for batch="
                           << fmt_u64(record.batch_size)
@@ -9120,14 +9367,7 @@ static MixedAsyncTuningChoice choose_mixed_async_max_batch_and_depth(
             }
             continue;
         }
-        ++verified_count;
-        if (verified->rate_sps > best_verified_rate) {
-            best_verified_rate = verified->rate_sps;
-            choice.valid = true;
-            choice.batch_size = record.batch_size;
-            choice.depth = record.depth;
-            choice.rate_sps = verified->rate_sps;
-        }
+        accept_verified(record, *verified);
     }
     if (!choice.valid) {
         const auto best_it = std::max_element(records.begin(), records.end(), [](const auto &a, const auto &b) {
@@ -10470,12 +10710,6 @@ static void enforce_exact_completeness_policy(const QuerySpec &spec, const CliAr
         );
     }
 
-    if (args.output_mode != "raw" && args.upper16 != 0U && query_has_full64_required_predicates(spec)) {
-        throw std::runtime_error(
-            "Exact full64 output is not implemented for strict/biome/spawn/loot predicates yet. The scanner validates "
-            "the lower48 seed stream, so use raw output or upper16=0 until upper16 enumeration is added."
-        );
-    }
 }
 
 } // namespace
@@ -10485,7 +10719,7 @@ int main(int argc, char **argv) {
         std::cout.setf(std::ios::unitbuf);
         std::cerr.setf(std::ios::unitbuf);
 
-        const CliArgs args = parse_cli(argc, argv);
+        CliArgs args = parse_cli(argc, argv);
         g_debug_enabled = args.debug_enabled;
         if (args.list_structures) {
             print_supported_structures();
@@ -10494,6 +10728,17 @@ int main(int argc, char **argv) {
         if (args.dump_query_template) {
             print_query_template();
             return 0;
+        }
+        if (args.has_start && args.start > JAVA_MASK) {
+            const uint16_t start_upper16 = static_cast<uint16_t>((args.start >> 48U) & 0xFFFFULL);
+            if (args.upper16_set && args.upper16 != start_upper16) {
+                throw std::runtime_error(
+                    "--start includes upper16 bits that conflict with the explicit --upper16 value."
+                );
+            }
+            if (!args.upper16_set) {
+                args.upper16 = start_upper16;
+            }
         }
 
         const fs::path repo_root = detect_repo_root(argv[0]);
@@ -10534,6 +10779,15 @@ int main(int argc, char **argv) {
         const uint64_t start_seed = (args.has_start ? args.start : choose_default_start()) & JAVA_MASK;
         if (args.count == 0) {
             throw std::runtime_error("--count must be > 0.");
+        }
+        if (args.has_start && args.start > JAVA_MASK && query_has_full64_required_predicates(query_spec)) {
+            const uint64_t seeds_until_wrap = JAVA_DOMAIN - start_seed;
+            if (args.count > seeds_until_wrap) {
+                throw std::runtime_error(
+                    "Full64 scans that cross the lower48 wrap boundary are not supported yet; split the range "
+                    "at the 2^48 boundary so upper16 remains unambiguous."
+                );
+            }
         }
         CompiledQueryPlanContext query_plan;
         query_plan.build(
@@ -10585,6 +10839,13 @@ int main(int argc, char **argv) {
             );
         }
         CompiledStageAMode route_stage_a_mode = compiled_stage_a_mode;
+        const bool strict_auto_cpu_pipeline =
+            args.scan_mode == "strict" &&
+            compiled_stage_a_mode == CompiledStageAMode::auto_mode &&
+            !args.shadow_compare;
+        if (strict_auto_cpu_pipeline) {
+            route_stage_a_mode = CompiledStageAMode::gpu_off;
+        }
         StageARoutePlan stage_a_route = choose_stage_a_route_plan(
             runtime,
             query_plan,
@@ -10594,6 +10855,9 @@ int main(int argc, char **argv) {
             start_seed,
             args.count
         );
+        if (strict_auto_cpu_pipeline) {
+            stage_a_route.route_reason = "strict_auto_cpu_full_pipeline";
+        }
         PlanDiagnosticsSummary plan_summary =
             build_plan_diagnostics_summary(runtime, query_plan, constraint_index, route_stage_a_mode);
         plan_summary.chosen_drivers = stage_a_route.chosen_drivers;
@@ -10622,6 +10886,12 @@ int main(int argc, char **argv) {
             loot_enabled,
             structure_settings_enabled
         );
+        if (args.scan_mode == "placement" && !gpu_stage_a_final_filter) {
+            throw std::runtime_error(
+                "--scan-mode placement requires GPU Stage A to cover every placement constraint. "
+                "Use --compiled-stage-a-mode multi for multi-constraint placement scans, or use strict/mixed mode."
+            );
+        }
 
         const bool needs_cubiomes = std::any_of(
                                         query_plan.constraints.begin(),
@@ -10693,6 +10963,7 @@ int main(int argc, char **argv) {
 
         std::vector<uint64_t> batch_probe_buffer;
         std::vector<uint64_t> batch_probe_valid;
+        std::vector<uint64_t> batch_probe_validation_seeds;
         std::vector<uint64_t> batch_probe_sculpt;
         auto run_pipeline_probe = [&](uint64_t bs, bool probe_use_gpu, const GpuPrefilterPlan *probe_plan) {
             if (probe_use_gpu) {
@@ -10726,16 +10997,32 @@ int main(int argc, char **argv) {
                 static_cast<uint32_t>(strict_workers),
                 batch_probe_buffer.size()
             );
-            const int rc = query_plan.validate_batch(
-                batch_probe_buffer.data(),
-                static_cast<uint32_t>(batch_probe_buffer.size()),
-                probe_workers,
-                batch_probe_valid.data(),
-                &valid_count,
-                &mismatch_count,
-                &biome_reject_count,
-                &cap_pruned
-            );
+            const bool probe_input_is_post_stage_a =
+                probe_use_gpu &&
+                probe_plan != nullptr &&
+                !probe_plan->constraints.empty() &&
+                probe_plan->constraints.size() == query_plan.constraints.size();
+            const uint64_t *probe_seed_data =
+                validation_seed_data(batch_probe_buffer, args.upper16, batch_probe_validation_seeds);
+            const int rc = probe_input_is_post_stage_a
+                ? query_plan.validate_batch_post_stage_a(
+                      probe_seed_data,
+                      static_cast<uint32_t>(batch_probe_buffer.size()),
+                      probe_workers,
+                      batch_probe_valid.data(),
+                      &valid_count,
+                      &mismatch_count,
+                      &biome_reject_count,
+                      &cap_pruned)
+                : query_plan.validate_batch(
+                      probe_seed_data,
+                      static_cast<uint32_t>(batch_probe_buffer.size()),
+                      probe_workers,
+                      batch_probe_valid.data(),
+                      &valid_count,
+                      &mismatch_count,
+                      &biome_reject_count,
+                      &cap_pruned);
             if (rc != 0) {
                 std::ostringstream oss;
                 oss << "scanner_core_validate_query_batch failed with code " << fmt_i64(rc);
@@ -10809,6 +11096,7 @@ int main(int argc, char **argv) {
                 args.count,
                 terminal_mode.load()
             );
+            gpu_backend.reset_async_slots();
             if (mixed_async_tuning_choice.valid) {
                 batch_size = mixed_async_tuning_choice.batch_size;
             }
@@ -11039,6 +11327,7 @@ int main(int argc, char **argv) {
         uint64_t batch_idx = 0;
         std::vector<uint64_t> hit_seeds;
         std::vector<uint64_t> valid_out;
+        std::vector<uint64_t> validation_seeds;
         std::vector<uint64_t> java_worldgen_out;
         std::vector<uint64_t> sculpt_out;
         std::vector<uint64_t> loot_out;
@@ -11110,7 +11399,9 @@ int main(int argc, char **argv) {
             last_ui_emit = now;
             const double elapsed = std::max(1e-9, std::chrono::duration<double>(now - t0).count());
             const double inst_rate = static_cast<double>(processed) / elapsed;
-            if (!have_smoothed_rate) {
+            if (processed == 0ULL) {
+                smoothed_rate = 0.0;
+            } else if (!have_smoothed_rate) {
                 smoothed_rate = inst_rate;
                 have_smoothed_rate = true;
             } else {
@@ -11558,6 +11849,7 @@ int main(int argc, char **argv) {
                     try {
                         std::vector<uint64_t> batch;
                         std::vector<uint64_t> valid;
+                        std::vector<uint64_t> validation_seeds;
                         std::vector<uint64_t> post_a;
                         std::vector<uint64_t> post_b;
                         std::vector<NativeQueryMatchOut> local_java_match_buffer;
@@ -11595,6 +11887,12 @@ int main(int argc, char **argv) {
                             }
                             return *local_loot_client;
                         };
+                        auto worker_validation_client = [&]() -> LootValidationServerClient & {
+                            if (strict_workers == 1) {
+                                return loot_client;
+                            }
+                            return worker_loot_client();
+                        };
 
                         while (!cancel_mixed.load() && survivor_queue.pop_batch(batch)) {
                             if (batch.empty()) {
@@ -11619,9 +11917,11 @@ int main(int argc, char **argv) {
                             const uint32_t strict_input_count = static_cast<uint32_t>(std::min<size_t>(
                                 batch.size(),
                                 static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+                            const uint64_t *strict_seed_data =
+                                validation_seed_data(batch, args.upper16, validation_seeds);
                             const int rc = mixed_strict_input_is_post_stage_a
                                 ? query_plan.validate_batch_post_stage_a(
-                                      batch.data(),
+                                      strict_seed_data,
                                       strict_input_count,
                                       1U,
                                       valid.data(),
@@ -11630,7 +11930,7 @@ int main(int argc, char **argv) {
                                       &biome_reject_count,
                                       &cap_pruned)
                                 : query_plan.validate_batch(
-                                      batch.data(),
+                                      strict_seed_data,
                                       strict_input_count,
                                       1U,
                                       valid.data(),
@@ -11675,7 +11975,7 @@ int main(int argc, char **argv) {
                                     std::lock_guard<std::mutex> java_lock(mixed_shared_java_validation_mu);
                                     validate_java_outputs(loot_client);
                                 } else {
-                                    validate_java_outputs(worker_loot_client());
+                                    validate_java_outputs(worker_validation_client());
                                 }
                                 add_elapsed_ns(mixed_java_ns, java_t0);
                                 mixed_java_rejected.fetch_add(java_reject_count);
@@ -11690,7 +11990,7 @@ int main(int argc, char **argv) {
                                     post_a.resize(valid_count);
                                 }
                                 const auto settings_t0 = std::chrono::high_resolution_clock::now();
-                                LootValidationServerClient &client = worker_loot_client();
+                                LootValidationServerClient &client = worker_validation_client();
                                 const uint32_t settings_valid_count = validate_structure_settings_for_seed_batch(
                                     valid.data(),
                                     valid_count,
@@ -11751,7 +12051,7 @@ int main(int argc, char **argv) {
                                 }
                                 uint32_t loot_valid_count = 0U;
                                 const auto loot_t0 = std::chrono::high_resolution_clock::now();
-                                LootValidationServerClient &client = worker_loot_client();
+                                LootValidationServerClient &client = worker_validation_client();
                                 loot_valid_count = validate_loot_filters_for_seed_batch(
                                     valid.data(),
                                     valid_count,
@@ -11961,6 +12261,10 @@ int main(int argc, char **argv) {
         uint32_t next_async_slot = 0U;
         uint64_t async_next_batch_start = batch_start;
         uint64_t async_remaining = remaining;
+        const bool can_limit_async_placement_submit =
+            args.scan_mode == "placement" &&
+            gpu_stage_a_final_filter &&
+            args.save_txt.empty();
         auto submit_next_async_gpu_batch = [&]() -> bool {
             if (!use_async_gpu_pipeline || !use_gpu_stage_a || async_remaining == 0ULL) {
                 return false;
@@ -11970,10 +12274,14 @@ int main(int argc, char **argv) {
             }
             const uint64_t submit_count = std::min<uint64_t>(async_remaining, capped_batch_size);
             const uint32_t slot_id = next_async_slot;
-            gpu_backend.submit_batch(
+            const uint64_t output_capacity = can_limit_async_placement_submit
+                ? std::min<uint64_t>(submit_count, static_cast<uint64_t>(args.max_print))
+                : submit_count;
+            gpu_backend.submit_batch_limited(
                 slot_id,
                 async_next_batch_start,
                 submit_count,
+                output_capacity,
                 gpu_prefilter_plan.regions,
                 gpu_prefilter_plan.constraints
             );
@@ -12003,6 +12311,7 @@ int main(int argc, char **argv) {
             }
             RunBatchStats batch_stats{};
             batch_stats.input_seed_count = this_batch;
+            uint64_t gpu_hits_this_batch = 0ULL;
             double batch_gpu_seconds = 0.0;
             double batch_gpu_kernel_seconds = 0.0;
             double batch_gpu_transfer_compaction_seconds = 0.0;
@@ -12021,12 +12330,30 @@ int main(int argc, char **argv) {
                             << " count=" << fmt_u64(pending_gpu_batch.count);
                         throw std::runtime_error(oss.str());
                     }
-                    gpu_backend.collect_batch(
-                        pending_gpu_batch.slot_id,
-                        hit_seeds,
-                        batch_gpu_kernel_seconds,
-                        batch_gpu_transfer_compaction_seconds
-                    );
+                    const bool can_limit_placement_output =
+                        args.scan_mode == "placement" &&
+                        gpu_stage_a_final_filter &&
+                        args.save_txt.empty();
+                    if (can_limit_placement_output) {
+                        const uint64_t remaining_print =
+                            static_cast<uint64_t>(std::max<int>(
+                                0,
+                                args.max_print - static_cast<int>(printed_seeds.size())));
+                        gpu_hits_this_batch = gpu_backend.collect_batch_limited(
+                            pending_gpu_batch.slot_id,
+                            remaining_print,
+                            hit_seeds,
+                            batch_gpu_kernel_seconds,
+                            batch_gpu_transfer_compaction_seconds);
+                    } else {
+                        gpu_backend.collect_batch(
+                            pending_gpu_batch.slot_id,
+                            hit_seeds,
+                            batch_gpu_kernel_seconds,
+                            batch_gpu_transfer_compaction_seconds
+                        );
+                        gpu_hits_this_batch = static_cast<uint64_t>(hit_seeds.size());
+                    }
                     batch_gpu_seconds = batch_gpu_kernel_seconds + batch_gpu_transfer_compaction_seconds;
                     while (pending_gpu_batches.size() < gpu_inflight_batches &&
                            submit_next_async_gpu_batch()) {
@@ -12043,6 +12370,7 @@ int main(int argc, char **argv) {
                     batch_gpu_seconds =
                         std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - gpu_t0).count();
                     batch_gpu_kernel_seconds = batch_gpu_seconds;
+                    gpu_hits_this_batch = static_cast<uint64_t>(hit_seeds.size());
                 }
                 total_gpu_kernel_seconds += batch_gpu_kernel_seconds;
                 total_gpu_transfer_compaction_seconds += batch_gpu_transfer_compaction_seconds;
@@ -12052,15 +12380,16 @@ int main(int argc, char **argv) {
                 for (uint64_t i = 0; i < this_batch; ++i) {
                     hit_seeds[static_cast<size_t>(i)] = (batch_start + i) & JAVA_MASK;
                 }
+                gpu_hits_this_batch = static_cast<uint64_t>(hit_seeds.size());
             }
             batch_stats.gpu_kernel_seconds = batch_gpu_kernel_seconds;
             batch_stats.gpu_transfer_compaction_seconds = batch_gpu_transfer_compaction_seconds;
             batch_stats.gpu_seconds = batch_gpu_seconds;
             if (use_gpu_stage_a) {
-                total_gpu_hits += hit_seeds.size();
+                total_gpu_hits += gpu_hits_this_batch;
             }
-            batch_stats.stage_a_survivor_count = static_cast<uint64_t>(hit_seeds.size());
-            batch_stats.stage_a_reject_count = this_batch > hit_seeds.size() ? this_batch - hit_seeds.size() : 0U;
+            batch_stats.stage_a_survivor_count = gpu_hits_this_batch;
+            batch_stats.stage_a_reject_count = this_batch > gpu_hits_this_batch ? this_batch - gpu_hits_this_batch : 0U;
             total_stage_a_survivors += batch_stats.stage_a_survivor_count;
             stage_a_reject_total += batch_stats.stage_a_reject_count;
             uint32_t valid_count = 0;
@@ -12077,9 +12406,9 @@ int main(int argc, char **argv) {
                 if (valid_count > 0U) {
                     std::copy_n(hit_seeds.data(), valid_count, valid_out.data());
                 }
-                batch_stats.stage_a5_survivor_count = valid_count;
-                batch_stats.stage_b_structure_survivor_count = valid_count;
-                batch_stats.stage_c_biome_survivor_count = valid_count;
+                batch_stats.stage_a5_survivor_count = gpu_hits_this_batch;
+                batch_stats.stage_b_structure_survivor_count = gpu_hits_this_batch;
+                batch_stats.stage_c_biome_survivor_count = gpu_hits_this_batch;
             } else if (!hit_seeds.empty()) {
                 if (gpu_stage_a_final_filter && use_gpu_stage_a && !args.shadow_compare) {
                     valid_count = static_cast<uint32_t>(hit_seeds.size());
@@ -12107,9 +12436,11 @@ int main(int argc, char **argv) {
                     uint32_t legacy_mismatch_count = 0U;
                     uint32_t legacy_biome_reject_count = 0U;
                     uint32_t legacy_cap_pruned = 0U;
+                    const uint64_t *shadow_seed_data =
+                        validation_seed_data(hit_seeds, args.upper16, validation_seeds);
 
                     const int compiled_rc = query_plan.validate_batch_compiled(
-                        hit_seeds.data(),
+                        shadow_seed_data,
                         static_cast<uint32_t>(hit_seeds.size()),
                         effective_workers,
                         compiled_valid.data(),
@@ -12119,7 +12450,7 @@ int main(int argc, char **argv) {
                         &compiled_cap_pruned
                     );
                     const int legacy_rc = query_plan.validate_batch_legacy(
-                        hit_seeds.data(),
+                        shadow_seed_data,
                         static_cast<uint32_t>(hit_seeds.size()),
                         effective_workers,
                         legacy_valid.data(),
@@ -12138,7 +12469,6 @@ int main(int argc, char **argv) {
                     if (compiled_valid_count != legacy_valid_count ||
                         compiled_mismatch_count != legacy_mismatch_count ||
                         compiled_biome_reject_count != legacy_biome_reject_count ||
-                        compiled_cap_pruned != legacy_cap_pruned ||
                         !std::equal(compiled_valid.begin(), compiled_valid.begin() + compiled_valid_count, legacy_valid.begin())) {
                         std::ostringstream oss;
                         oss << "shadow-compare validation mismatch: batch_start=" << fmt_seed(batch_start)
@@ -12201,16 +12531,31 @@ int main(int argc, char **argv) {
                     }
                     } else {
                         const auto strict_t0_impl = std::chrono::high_resolution_clock::now();
-                        const int rc = query_plan.validate_batch(
-                            hit_seeds.data(),
-                            static_cast<uint32_t>(hit_seeds.size()),
-                            effective_workers,
-                            valid_out.data(),
-                            &valid_count,
-                            &mismatch_count,
-                            &biome_reject_count,
-                            &cap_pruned
-                        );
+                        const bool strict_input_is_post_stage_a =
+                            use_gpu_stage_a &&
+                            !gpu_prefilter_plan.constraints.empty() &&
+                            gpu_prefilter_plan.constraints.size() == query_plan.constraints.size();
+                        const uint64_t *strict_seed_data =
+                            validation_seed_data(hit_seeds, args.upper16, validation_seeds);
+                        const int rc = strict_input_is_post_stage_a
+                            ? query_plan.validate_batch_post_stage_a(
+                                  strict_seed_data,
+                                  static_cast<uint32_t>(hit_seeds.size()),
+                                  effective_workers,
+                                  valid_out.data(),
+                                  &valid_count,
+                                  &mismatch_count,
+                                  &biome_reject_count,
+                                  &cap_pruned)
+                            : query_plan.validate_batch(
+                                  strict_seed_data,
+                                  static_cast<uint32_t>(hit_seeds.size()),
+                                  effective_workers,
+                                  valid_out.data(),
+                                  &valid_count,
+                                  &mismatch_count,
+                                  &biome_reject_count,
+                                  &cap_pruned);
                         if (rc != 0) {
                             std::ostringstream oss;
                             oss << "scanner_core_validate_query_batch failed with code " << fmt_i64(rc);
@@ -12246,6 +12591,11 @@ int main(int argc, char **argv) {
                 batch_stats.cpu_stage_a5_seconds = batch_stats.core_stats.cpu_stage_a5_seconds;
                 batch_stats.cpu_stage_b_seconds = batch_stats.core_stats.cpu_stage_b_seconds;
                 batch_stats.cpu_stage_c_seconds = batch_stats.core_stats.cpu_stage_c_seconds;
+            } else if (args.scan_mode == "placement") {
+                batch_stats.stage_b_structure_survivor_count = gpu_hits_this_batch;
+                batch_stats.stage_c_biome_survivor_count = gpu_hits_this_batch;
+                batch_stats.stage_b_exact_reject_count = 0U;
+                batch_stats.stage_c_biome_reject_count = 0U;
             } else {
                 batch_stats.stage_b_structure_survivor_count =
                     static_cast<uint64_t>(valid_count) + static_cast<uint64_t>(biome_reject_count);
@@ -12382,13 +12732,15 @@ int main(int argc, char **argv) {
                 loot_rejected += loot_reject_count;
             }
 
-            batch_stats.final_valid_count = valid_count;
+            const uint64_t reported_valid_count =
+                args.scan_mode == "placement" ? gpu_hits_this_batch : static_cast<uint64_t>(valid_count);
+            batch_stats.final_valid_count = reported_valid_count;
             batch_stats.mismatches = mismatch_count;
             batch_stats.biome_rejected = biome_reject_count;
             batch_stats.sculpt_rejected = 0U;
             batch_stats.loot_rejected = 0U;
             batch_stats.cap_pruned_total = cap_pruned;
-            total_cpu_verified += valid_count;
+            total_cpu_verified += reported_valid_count;
             total_stage_a5_survivors += batch_stats.stage_a5_survivor_count;
             stage_a5_reject_total += batch_stats.stage_a5_reject_count;
             mismatches += mismatch_count;
@@ -12566,7 +12918,11 @@ int main(int argc, char **argv) {
 
         if (printed_seeds.empty()) {
             if (terminal_mode.load()) {
-                std::cout << "No valid seeds found in this range.\n";
+                if (args.max_print == 0 && total_cpu_verified > 0U) {
+                    std::cout << "Valid seeds found; printing disabled by --max-print 0.\n";
+                } else {
+                    std::cout << "No valid seeds found in this range.\n";
+                }
             }
             return 0;
         }
